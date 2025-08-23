@@ -7,7 +7,10 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 class AdaptiveWorldModel:
-    def __init__(self, interactive=False):
+    def __init__(self, robot_interface, interactive=False):
+        # Store the robot interface
+        self.robot = robot_interface
+        
         # Core components
         self.image_encoder = ImageEncoder()
         self.image_decoder = ImageDecoder()
@@ -26,12 +29,8 @@ class AdaptiveWorldModel:
         self.fig = None
         self.axes = None
         
-        # Action space (initially low-level) - cross product of motor actions
-        motor_values = [-1, 0, +1]
-        self.base_actions = []
-        for m1 in motor_values:
-            for m2 in motor_values:
-                self.base_actions.append({'motor_1': m1, 'motor_2': m2})
+        # The action space is now retrieved from the robot interface
+        self.base_actions = self.robot.action_space
         
         # History buffers
         self.frame_features_history = []
@@ -40,8 +39,10 @@ class AdaptiveWorldModel:
         
     def main_loop(self):
         while True:
-            # Step 1: Capture and encode current frame
-            current_frame = capture_image()
+            # Step 1: Capture and encode current frame using the interface
+            current_frame = self.robot.get_observation()
+            if current_frame is None:
+                continue  # Skip this iteration if observation failed
             current_features = self.image_encoder(current_frame)
             
             # Step 2: Validate image encoding quality
@@ -86,8 +87,8 @@ class AdaptiveWorldModel:
             else:
                 action_to_execute = best_action
             
-            # Step 5: Take action and make predictions
-            execute_action(action_to_execute)
+            # Step 5: Take action and make predictions using the interface
+            self.robot.execute_action(action_to_execute)
             self.make_predictions(current_features, action_to_execute)
             
             # Step 6: Update history buffers
@@ -487,19 +488,7 @@ def calculate_loss(predicted, actual):
         # For non-array types, return random loss
         return np.random.rand()
 
-def capture_image():
-    """Get current frame from robot camera"""
-    # Return dummy 224x224x3 image with some pattern
-    image = np.random.rand(224, 224, 3)
-    # Add some visual pattern for better visualization
-    image[50:150, 50:150] = [0.8, 0.2, 0.2]  # Red square
-    return image
-
-def execute_action(action):
-    """Send motor commands to robot"""
-    # Stub action execution
-    print(f"Executing action: {action}")
-    time.sleep(0.1)  # Simulate action duration
+# Robot interface functions removed - now handled by RobotInterface
 
 def create_masked_versions(image, num_masks=5):
     """Create multiple masked versions for training"""
@@ -518,11 +507,42 @@ def current_time():
     """Get current timestamp"""
     return time.time()
 
-# Example usage
+# Example usage with stub robot for testing
+class StubRobot:
+    """Stub robot implementation for testing the world model"""
+    def __init__(self):
+        motor_values = [-0.15, 0, 0.15]
+        duration = 0.1  # Fixed duration in seconds
+        self.action_space = []
+        for left in motor_values:
+            for right in motor_values:
+                self.action_space.append({
+                    'motor_left': left, 
+                    'motor_right': right,
+                    'duration': duration
+                })
+    
+    def get_observation(self):
+        # Return dummy 224x224x3 image with some pattern
+        image = np.random.rand(224, 224, 3)
+        # Add some visual pattern for better visualization
+        image[50:150, 50:150] = [0.8, 0.2, 0.2]  # Red square
+        return image
+    
+    def execute_action(self, action):
+        print(f"Executing action: {action}")
+        time.sleep(0.1)  # Simulate action duration
+        return True
+    
+    def cleanup(self):
+        pass
+
 if __name__ == "__main__":
-    # Interactive mode
-    model = AdaptiveWorldModel(interactive=True)
+    # Interactive mode with stub robot
+    stub_robot = StubRobot()
+    model = AdaptiveWorldModel(stub_robot, interactive=True)
     try:
         model.main_loop()
     except KeyboardInterrupt:
         print("\nStopped by user")
+        stub_robot.cleanup()
