@@ -1,2 +1,4 @@
 .claude/
 CLAUDE.md
+.ipynb_checkpoints
+__pycache__

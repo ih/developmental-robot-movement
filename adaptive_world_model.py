@@ -5,6 +5,8 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+import torch
+from models import MaskedAutoencoderViT
 
 class AdaptiveWorldModel:
     def __init__(self, robot_interface, interactive=False):
@@ -12,8 +14,7 @@ class AdaptiveWorldModel:
         self.robot = robot_interface
         
         # Core components
-        self.image_encoder = ImageEncoder()
-        self.image_decoder = ImageDecoder()
+        self.autoencoder = MaskedAutoencoderViT()
         self.predictors = [ActionConditionedPredictor(level=0)]  # Start with one predictor
         self.action_encoders = []  # For future hierarchical actions
         self.action_decoders = []
@@ -43,16 +44,27 @@ class AdaptiveWorldModel:
             current_frame = self.robot.get_observation()
             if current_frame is None:
                 continue  # Skip this iteration if observation failed
-            current_features = self.image_encoder(current_frame)
+            
+            # Convert numpy image to torch tensor [1, 3, H, W]
+            frame_tensor = torch.from_numpy(current_frame.transpose(2, 0, 1)).unsqueeze(0).float()
+            current_features = self.autoencoder.encode(frame_tensor)
             
             # Step 2: Validate image encoding quality
-            decoded_frame = self.image_decoder(current_features)
+            decoded_tensor = self.autoencoder.decode(current_features)
+            decoded_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().numpy()
+            decoded_frame = np.clip(decoded_frame, 0, 1)  # Clip to valid range for display
             reconstruction_loss = calculate_loss(decoded_frame, current_frame)
             
-            threshold = 0.5  # Define threshold locally
+            threshold = 0.9  # Define threshold locally
             if reconstruction_loss > threshold:
-                # Train encoder/decoder if reconstruction is poor
-                self.train_image_autoencoder(current_frame)
+                # Train autoencoder if reconstruction is poor
+                train_loss = self.train_autoencoder(current_frame)
+                print(f"Autoencoder training loss: {train_loss:.4f}")
+                
+                # Show current and reconstructed frames while training
+                self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
+                
+                continue  # Skip action execution until reconstruction improves
             
             # Step 3: Check past predictions accuracy (if any)
             prediction_errors = []
@@ -61,16 +73,20 @@ class AdaptiveWorldModel:
                 
                 if all(error < threshold for error in prediction_errors):
                     # All predictions accurate - increase lookahead
-                    self.lookahead += 1
+                    ## comment out for now
+                    print("Low prediction error, Ready to create higher level abstraction")
+                    # self.lookahead += 1
                     
-                    # Check if we need a new hierarchical level
-                    if self.lookahead > self.get_max_predictor_lookahead() + self.max_lookahead_margin:
-                        self.create_new_hierarchy_level()
+                    # # Check if we need a new hierarchical level
+                    # if self.lookahead > self.get_max_predictor_lookahead() + self.max_lookahead_margin:
+                    #     self.create_new_hierarchy_level()
                 else:
                     # Train predictors that had errors
                     for level, error in enumerate(prediction_errors):
                         if error > threshold:
-                            self.train_predictor(level, current_features)
+                            # TODO remove print statement and uncomment train_predictor after autoencoder is tested and image reconstruction is working
+                            print("Train the predictor")
+                            # self.train_predictor(level, current_features)
                     
                     # Adjust lookahead based on accuracy horizon
                     self.lookahead = self.find_accurate_prediction_horizon()
@@ -87,7 +103,7 @@ class AdaptiveWorldModel:
             else:
                 action_to_execute = best_action
             
-            # Step 5: Take action and make predictions using the interface
+            # Step 5: Take action and make predictions using the interface (only if reconstruction is good)
             self.robot.execute_action(action_to_execute)
             self.make_predictions(current_features, action_to_execute)
             
@@ -209,6 +225,35 @@ class AdaptiveWorldModel:
         self.fig.canvas.flush_events()
         plt.pause(0.01)  # Small pause to ensure rendering
     
+    def display_reconstruction_training(self, current_frame, decoded_frame, reconstruction_loss):
+        """Display current and reconstructed frames during autoencoder training"""
+        # Create training figure if it doesn't exist
+        if not hasattr(self, 'training_fig'):
+            self.training_fig, self.training_axes = plt.subplots(1, 2, figsize=(8, 4))
+            self.training_axes[0].set_title("Current Frame")
+            self.training_axes[1].set_title("Reconstructed Frame")
+            for ax in self.training_axes:
+                ax.axis('off')
+            plt.ion()
+            plt.show(block=False)
+        
+        # Clear and update axes
+        for ax in self.training_axes:
+            ax.clear()
+            ax.axis('off')
+        
+        # Display frames
+        self.training_axes[0].imshow(current_frame)
+        self.training_axes[0].set_title(f"Current Frame")
+        
+        self.training_axes[1].imshow(decoded_frame)
+        self.training_axes[1].set_title(f"Reconstructed (Loss: {reconstruction_loss:.4f})")
+        
+        plt.tight_layout()
+        self.training_fig.canvas.draw()
+        self.training_fig.canvas.flush_events()
+        plt.pause(0.01)
+    
     def select_action_by_uncertainty(self, current_features):
         """Choose action with most uncertain outcome (highest entropy)"""
         max_uncertainty = -float('inf')
@@ -224,15 +269,21 @@ class AdaptiveWorldModel:
             prediction_frames = []
             
             for predictor in self.predictors:
-                next_state = predictor.predict(
+                next_state = predictor.forward(
                     history_features, 
-                    history_actions + [action],
-                    self.lookahead
+                    history_actions + [action]
                 )
                 predictions.append(next_state)
                 
                 # Generate frame for this prediction
-                pred_frame = self.image_decoder(next_state)
+                # Convert features to tensor for decoding
+                if isinstance(next_state, np.ndarray):
+                    features_tensor = torch.from_numpy(next_state).unsqueeze(0).float()
+                else:
+                    features_tensor = next_state.unsqueeze(0) if len(next_state.shape) == 1 else next_state
+                decoded_tensor = self.autoencoder.decode(features_tensor)
+                pred_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().numpy()
+                pred_frame = np.clip(pred_frame, 0, 1)  # Clip to valid range for display
                 prediction_frames.append({
                     'frame': pred_frame,
                     'level': predictor.level,
@@ -256,42 +307,72 @@ class AdaptiveWorldModel:
         return best_action, all_action_predictions
     
     def train_predictor(self, level, current_features):
-        """Train predictor at specified level"""
+        """Train neural predictor at specified level (gradients flow to autoencoder automatically)"""
         predictor = self.predictors[level]
+        
+        # Initialize predictor optimizer if not exists
+        if not hasattr(predictor, 'optimizer'):
+            predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-4)
         
         # Get appropriate history window
         history_features, history_actions = self.get_prediction_context()
         
-        # Calculate loss between prediction and actual
-        predicted = self.prediction_buffer[level]['prediction']
-        actual = current_features
-        loss = calculate_loss(predicted, actual)
+        # Convert to tensors
+        if isinstance(current_features, np.ndarray):
+            actual_tensor = torch.from_numpy(current_features).float()
+        else:
+            actual_tensor = current_features
         
-        # Backpropagate through predictor and encoders
-        predictor.update_weights()
+        # Zero gradients
+        predictor.optimizer.zero_grad()
         
-        # Also update image encoder/decoder if needed
-        high_threshold = 1.0
-        if loss > high_threshold:
-            self.image_encoder.update_weights()
-            self.image_decoder.update_weights()
+        # Forward pass through predictor
+        predicted_tensor = predictor.forward(history_features, history_actions)
+        
+        # Calculate prediction loss
+        prediction_loss = torch.nn.functional.mse_loss(predicted_tensor, actual_tensor)
+        
+        # Backward pass - this will automatically train autoencoder encoder too!
+        prediction_loss.backward()
+        predictor.optimizer.step()
+        
+        print(f"Predictor {level} training loss: {prediction_loss.item():.4f}")
     
-    def train_image_autoencoder(self, ground_truth_frame):
-        """Train using masked autoencoding"""
-        # Create multiple masked versions
-        masked_frames = create_masked_versions(ground_truth_frame)
+    def train_autoencoder(self, ground_truth_frame):
+        """Train only the autoencoder with masked reconstruction"""
+        # Convert to tensor and move to device
+        frame_tensor = torch.from_numpy(ground_truth_frame.transpose(2, 0, 1)).unsqueeze(0).float()
         
-        for masked_frame in masked_frames:
-            # Encode masked version
-            features = self.image_encoder(masked_frame)
-            
-            # Decode and calculate loss
-            reconstructed = self.image_decoder(features)
-            loss = calculate_loss(reconstructed, ground_truth_frame)
-            
-            # Single update step
-            self.image_encoder.update_weights()
-            self.image_decoder.update_weights()
+        # Initialize optimizer if not exists
+        if not hasattr(self, 'autoencoder_optimizer'):
+            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=1e-4)
+        
+        # Zero gradients
+        self.autoencoder_optimizer.zero_grad()
+        
+        # Forward pass with masking for reconstruction loss
+        pred_patches, latent = self.autoencoder(frame_tensor, mask_ratio=0.75)
+        
+        # Calculate reconstruction loss
+        target_patches = self.patchify(frame_tensor)
+        reconstruction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches)
+        
+        # Backward pass and optimization
+        reconstruction_loss.backward()
+        self.autoencoder_optimizer.step()
+        
+        return reconstruction_loss.item()
+
+    def patchify(self, imgs):
+        """Convert images to patches (helper for training)"""
+        patch_size = 16  # Should match autoencoder patch_size
+        B, C, H, W = imgs.shape
+        h = H // patch_size
+        w = W // patch_size
+        x = imgs.reshape(B, C, h, patch_size, w, patch_size)
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(B, h * w, patch_size**2 * C)
+        return x
     
     def create_new_hierarchy_level(self):
         """Create new predictor for higher-level actions"""
@@ -371,10 +452,9 @@ class AdaptiveWorldModel:
         history_actions.append(action)
         
         for predictor in self.predictors:
-            prediction = predictor.predict(
+            prediction = predictor.forward(
                 history_features,
-                history_actions, 
-                self.lookahead
+                history_actions
             )
             self.prediction_buffer.append({
                 'prediction': prediction,
@@ -411,25 +491,6 @@ class AdaptiveWorldModel:
 
 # Supporting functions and classes (stub implementations)
 
-class ImageEncoder:
-    """Transformer-based encoder using masked token training"""
-    def __call__(self, image): 
-        # Return dummy features vector
-        return np.random.randn(512)
-    
-    def update_weights(self): 
-        # Stub weight update
-        pass
-
-class ImageDecoder:
-    """Reconstructs images from encoded features"""
-    def __call__(self, features): 
-        # Return dummy image (224x224x3)
-        return np.random.rand(224, 224, 3)
-    
-    def update_weights(self): 
-        # Stub weight update
-        pass
 
 class ActionConditionedPredictor:
     """Predicts future states given past states and actions"""
@@ -438,13 +499,13 @@ class ActionConditionedPredictor:
         self.action_space = action_space
         self.max_lookahead = 10  # Default max lookahead
     
-    def predict(self, feature_history, action_history, lookahead): 
-        # Return dummy prediction
-        return np.random.randn(512)
+    def forward(self, feature_history, action_history):
+        # Stub forward method for neural network interface
+        return torch.randn(256)  # Match autoencoder embed_dim
     
-    def update_weights(self): 
-        # Stub weight update
-        pass
+    def parameters(self):
+        # Stub parameters method for optimizer
+        return []
 
 class ActionEncoder:
     """Encodes sequences of actions into abstract actions"""
