@@ -27,12 +27,20 @@ This repository contains research code for developmental robot movement with a m
 ### Adaptive World Model
 - **Dependency injection**: Takes RobotInterface in constructor for modularity
 - **Main loop architecture**: Continuous cycle of perception → prediction → action selection → execution
+- **Neural vision system**: MaskedAutoencoderViT for visual encoding/decoding with joint training
+- **Quality gating**: Robot only acts when visual reconstruction quality meets threshold
 - **Hierarchical predictors**: Multiple levels of action abstraction with automatic level creation
 - **Uncertainty-based exploration**: Selects actions with highest prediction uncertainty (entropy)
+- **Real-time training visualization**: Shows current vs reconstructed frames during autoencoder training
 - **Interactive visualization**: Real-time display of current frame, decoded frame, and predictions for all motor combinations
-- **Stubbed ML components**: All neural network functionality is placeholder for testing main loop logic
 
 ## Key Components
+
+### Neural Vision System
+- **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
+- **Joint training architecture**: Autoencoder reconstruction loss + action predictor gradient flow
+- **Quality gating**: Robot stops acting when reconstruction loss > threshold, focuses on vision training
+- **Real-time visualization**: Training progress display showing current vs reconstructed frames
 
 ### Action Space
 - **Duration-based actions**: Motor commands with automatic stopping after specified duration
@@ -78,7 +86,8 @@ Required Python packages:
 - rpyc (robot communication)
 - opencv-python (computer vision)
 - numpy, matplotlib (data processing and visualization)
-- torchvision, PIL (image processing)
+- torch, torchvision, timm (neural networks and vision transformers)
+- PIL (image processing)
 - ipywidgets, IPython (notebook compatibility)
 - tqdm (progress bars)
 
@@ -87,7 +96,8 @@ Required Python packages:
 - `robot_interface.py`: Abstract base class defining robot interaction contract
 - `jetbot_interface.py`: JetBot implementation of RobotInterface with duration-based actions
 - `jetbot_remote_client.py`: Low-level JetBot RPyC client with live feed capability
-- `adaptive_world_model.py`: Main world model implementation with dependency injection (stubbed ML)
+- `models.py`: Neural network architectures including MaskedAutoencoderViT
+- `adaptive_world_model.py`: Main world model implementation with neural vision system
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
 - `config.py`: Shared configuration and image transforms
 - `.gitignore`: Excludes `.claude/` directory, `CLAUDE.md`, and common Python artifacts
