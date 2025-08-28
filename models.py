@@ -176,3 +176,10 @@ class MaskedAutoencoderViT(nn.Module):
         x = torch.einsum('nhwpqc->nchpwq', x)
         imgs = x.reshape(x.shape[0], 3, h * patch_size, w * patch_size)
         return imgs
+
+    def reconstruct(self, imgs):
+        """Full reconstruction using forward pass with no masking"""
+        with torch.no_grad():
+            pred_patches, _ = self.forward(imgs, mask_ratio=0.0)
+            decoded_tensor = self.unpatchify(pred_patches)
+            return decoded_tensor

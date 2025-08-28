@@ -40,6 +40,15 @@ class AdaptiveWorldModel:
         
         # Training visualization counter
         self.training_step = 0
+    
+    def to_model_tensor(self, frame_np):
+        """Convert frame to properly scaled tensor for model input"""
+        # frame_np is HxWx3 RGB, uint8 or float
+        if frame_np.dtype == np.uint8:
+            img = frame_np.astype(np.float32) / 255.0
+        else:
+            img = np.clip(frame_np.astype(np.float32), 0.0, 1.0)
+        return torch.from_numpy(img.transpose(2,0,1)).unsqueeze(0)  # [1,3,H,W]
         
     def main_loop(self):
         while True:
@@ -48,17 +57,23 @@ class AdaptiveWorldModel:
             if current_frame is None:
                 continue  # Skip this iteration if observation failed
             
-            # Convert numpy image to torch tensor [1, 3, H, W]
-            frame_tensor = torch.from_numpy(current_frame.transpose(2, 0, 1)).unsqueeze(0).float()
+            # Convert to properly scaled tensor [1, 3, H, W]
+            frame_tensor = self.to_model_tensor(current_frame)
             current_features = self.autoencoder.encode(frame_tensor)
             
-            # Step 2: Validate image encoding quality
-            decoded_tensor = self.autoencoder.decode(current_features)
+            # Step 2: Validate image encoding quality using proper reconstruction
+            # Use the same path as training (forward + unpatchify) for consistent metrics
+            decoded_tensor = self.autoencoder.reconstruct(frame_tensor)
             decoded_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().numpy()
             decoded_frame = np.clip(decoded_frame, 0, 1)  # Clip to valid range for display
-            reconstruction_loss = calculate_loss(decoded_frame, current_frame)
             
-            threshold = 0.9  # Define threshold locally
+            # Calculate reconstruction loss in patch space (same as training)
+            with torch.no_grad():
+                pred_patches, _ = self.autoencoder(frame_tensor, mask_ratio=0.0)
+                target_patches = self.patchify(frame_tensor)
+                reconstruction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches).item()
+            
+            threshold = 0.03  # Appropriate threshold for patch-MSE on [0,1] scale
             if reconstruction_loss > threshold:
                 # Train autoencoder if reconstruction is poor
                 train_loss = self.train_autoencoder(current_frame)
@@ -345,8 +360,8 @@ class AdaptiveWorldModel:
     
     def train_autoencoder(self, ground_truth_frame):
         """Train only the autoencoder with masked reconstruction"""
-        # Convert to tensor and move to device
-        frame_tensor = torch.from_numpy(ground_truth_frame.transpose(2, 0, 1)).unsqueeze(0).float()
+        # Convert to properly scaled tensor
+        frame_tensor = self.to_model_tensor(ground_truth_frame)
         
         # Initialize optimizer if not exists
         if not hasattr(self, 'autoencoder_optimizer'):
@@ -370,7 +385,7 @@ class AdaptiveWorldModel:
 
     def patchify(self, imgs):
         """Convert images to patches (helper for training)"""
-        patch_size = 16  # Should match autoencoder patch_size
+        patch_size = int(self.autoencoder.patch_embed.patch_size[0])
         B, C, H, W = imgs.shape
         h = H // patch_size
         w = W // patch_size
@@ -547,12 +562,14 @@ def calculate_entropy(predictions):
 
 def calculate_loss(predicted, actual):
     """Compute prediction error"""
-    # Simple MSE loss
+    import numpy as np, torch
+    if isinstance(predicted, torch.Tensor): 
+        predicted = predicted.detach().cpu().numpy()
+    if isinstance(actual, torch.Tensor): 
+        actual = actual.detach().cpu().numpy()
     if isinstance(predicted, np.ndarray) and isinstance(actual, np.ndarray):
-        return np.mean((predicted - actual) ** 2)
-    else:
-        # For non-array types, return random loss
-        return np.random.rand()
+        return float(np.mean((predicted - actual) ** 2))
+    return 0.0  # Return 0 for non-compatible types rather than random
 
 # Robot interface functions removed - now handled by RobotInterface
 
