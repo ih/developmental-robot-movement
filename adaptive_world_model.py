@@ -38,6 +38,9 @@ class AdaptiveWorldModel:
         self.action_history = []
         self.prediction_buffer = []
         
+        # Training visualization counter
+        self.training_step = 0
+        
     def main_loop(self):
         while True:
             # Step 1: Capture and encode current frame using the interface
@@ -61,8 +64,10 @@ class AdaptiveWorldModel:
                 train_loss = self.train_autoencoder(current_frame)
                 print(f"Autoencoder training loss: {train_loss:.4f}")
                 
-                # Show current and reconstructed frames while training
-                self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
+                # Show current and reconstructed frames while training (every 10th step)
+                if self.training_step % 10 == 0:
+                    self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
+                self.training_step += 1
                 
                 continue  # Skip action execution until reconstruction improves
             

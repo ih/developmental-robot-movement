@@ -21,6 +21,7 @@ class MaskedAutoencoderViT(nn.Module):
         # This part remains the same as before.
         self.patch_embed = timm.models.vision_transformer.PatchEmbed(image_size, patch_size, 3, embed_dim)
         num_patches = self.patch_embed.num_patches
+        self.grid_size = image_size // patch_size
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)
         self.blocks = nn.ModuleList([
@@ -42,6 +43,61 @@ class MaskedAutoencoderViT(nn.Module):
             nn.Linear(decoder_embed_dim, patch_size**2 * 3) # Predict the RGB values for each patch
         )
         # --------------------------------------------------------------------------
+
+        # Initialize fixed 2D sin-cos positional embeddings for encoder/decoder
+        self._init_positional_embeddings()
+
+    # ----------------------------------------------------------------------
+    # Positional embedding utilities (fixed 2D sin-cos, as in MAE)
+    # ----------------------------------------------------------------------
+    def _init_positional_embeddings(self):
+        device = self.pos_embed.device
+        # Encoder
+        enc_pos = self._build_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.grid_size, device=device)
+        # Decoder
+        dec_pos = self._build_2d_sincos_pos_embed(self.decoder_pos_embed.shape[-1], self.grid_size, device=device)
+        with torch.no_grad():
+            self.pos_embed.copy_(enc_pos)
+            self.decoder_pos_embed.copy_(dec_pos)
+
+    def _build_2d_sincos_pos_embed(self, embed_dim: int, grid_size: int, device=None):
+        """
+        Create 2D sin-cos positional embeddings with a [CLS] token at the start.
+        Returns a tensor of shape [1, grid_size*grid_size + 1, embed_dim].
+        """
+        assert embed_dim % 2 == 0, "embed_dim must be even for 2D sin-cos embeddings"
+        # Positions along each axis
+        grid_h = torch.arange(grid_size, dtype=torch.float32, device=device)
+        grid_w = torch.arange(grid_size, dtype=torch.float32, device=device)
+        # Normalize to [0, 1]
+        grid_h = grid_h / (grid_size - 1 if grid_size > 1 else 1)
+        grid_w = grid_w / (grid_size - 1 if grid_size > 1 else 1)
+        # Meshgrid: [H, W]
+        gh, gw = torch.meshgrid(grid_h, grid_w, indexing='ij') if hasattr(torch, 'meshgrid') else torch.meshgrid(grid_h, grid_w)
+        # Flatten to [N]
+        gh = gh.reshape(-1)
+        gw = gw.reshape(-1)
+        # Half-dim for each axis
+        dim_half = embed_dim // 2
+        pos_h = self._get_1d_sincos_pos_embed(dim_half, gh)  # [N, dim_half]
+        pos_w = self._get_1d_sincos_pos_embed(dim_half, gw)  # [N, dim_half]
+        pos = torch.cat([pos_h, pos_w], dim=1)  # [N, embed_dim]
+        # Add cls token pos (zeros) at the beginning
+        cls_pos = torch.zeros(1, 1, embed_dim, dtype=pos.dtype, device=pos.device)
+        pos = pos.unsqueeze(0)  # [1, N, D]
+        pos = torch.cat([cls_pos, pos], dim=1)  # [1, N+1, D]
+        return pos
+
+    def _get_1d_sincos_pos_embed(self, embed_dim: int, positions: torch.Tensor):
+        """Generate 1D sin-cos positional embeddings for given positions [N]."""
+        assert embed_dim % 2 == 0, "1D embed_dim should be even"
+        # Compute frequencies
+        dim_t = torch.arange(embed_dim // 2, dtype=torch.float32, device=positions.device)
+        dim_t = 1.0 / (10000 ** (dim_t / (embed_dim // 2)))  # [D/2]
+        # Outer product: [N, D/2]
+        out = positions.unsqueeze(1) * dim_t.unsqueeze(0)
+        emb = torch.cat([torch.sin(out), torch.cos(out)], dim=1)  # [N, D]
+        return emb
 
     def forward_encoder(self, x, mask_ratio=0.75):
         # (This function remains exactly the same)
