@@ -13,7 +13,7 @@ class MaskedAutoencoderViT(nn.Module):
     with a POWERFUL encoder and a LIGHTWEIGHT MLP decoder.
     """
     def __init__(self, image_size=224, patch_size=16, embed_dim=256,
-                 decoder_embed_dim=128, depth=4, num_heads=4, mlp_ratio=4.):
+                 decoder_embed_dim=128, depth=5, num_heads=4, mlp_ratio=4.):
         super().__init__()
 
         # --------------------------------------------------------------------------

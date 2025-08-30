@@ -6,15 +6,35 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import torch
+import wandb
 from models import MaskedAutoencoderViT
 
 class AdaptiveWorldModel:
-    def __init__(self, robot_interface, interactive=False):
+    def __init__(self, robot_interface, interactive=False, wandb_project=None):
         # Store the robot interface
         self.robot = robot_interface
         
+        # Device setup - use GPU if available
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        # Initialize wandb if project name is provided
+        if wandb_project:
+            wandb.init(project=wandb_project, config={
+                "device": str(self.device),
+                "interactive": interactive,
+                "lookahead": 1,
+                "max_lookahead_margin": 5,
+                "prediction_history_size": 10,
+                "uncertainty_threshold": 0.7,
+                "reconstruction_threshold": 0.001
+            })
+            self.wandb_enabled = True
+        else:
+            self.wandb_enabled = False
+        
         # Core components
-        self.autoencoder = MaskedAutoencoderViT()
+        self.autoencoder = MaskedAutoencoderViT().to(self.device)
         self.predictors = [ActionConditionedPredictor(level=0)]  # Start with one predictor
         self.action_encoders = []  # For future hierarchical actions
         self.action_decoders = []
@@ -48,7 +68,7 @@ class AdaptiveWorldModel:
             img = frame_np.astype(np.float32) / 255.0
         else:
             img = np.clip(frame_np.astype(np.float32), 0.0, 1.0)
-        return torch.from_numpy(img.transpose(2,0,1)).unsqueeze(0)  # [1,3,H,W]
+        return torch.from_numpy(img.transpose(2,0,1)).unsqueeze(0).to(self.device)  # [1,3,H,W]
         
     def main_loop(self):
         while True:
@@ -64,7 +84,7 @@ class AdaptiveWorldModel:
             # Step 2: Validate image encoding quality using proper reconstruction
             # Use the same path as training (forward + unpatchify) for consistent metrics
             decoded_tensor = self.autoencoder.reconstruct(frame_tensor)
-            decoded_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().numpy()
+            decoded_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
             decoded_frame = np.clip(decoded_frame, 0, 1)  # Clip to valid range for display
             
             # Calculate reconstruction loss in patch space (same as training)
@@ -73,11 +93,17 @@ class AdaptiveWorldModel:
                 target_patches = self.patchify(frame_tensor)
                 reconstruction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches).item()
             
-            threshold = 0.03  # Appropriate threshold for patch-MSE on [0,1] scale
+            # Log reconstruction loss to wandb
+            if self.wandb_enabled:
+                wandb.log({
+                    "reconstruction_loss": reconstruction_loss,
+                    "step": self.training_step
+                })
+            
+            threshold = 0.001  # Appropriate threshold for patch-MSE on [0,1] scale
             if reconstruction_loss > threshold:
                 # Train autoencoder if reconstruction is poor
                 train_loss = self.train_autoencoder(current_frame)
-                print(f"Autoencoder training loss: {train_loss:.4f}")
                 
                 # Show current and reconstructed frames while training (every 10th step)
                 if self.training_step % 10 == 0:
@@ -114,6 +140,12 @@ class AdaptiveWorldModel:
             # Step 4: Select action based on uncertainty maximization
             best_action, all_action_predictions = self.select_action_by_uncertainty(current_features)
             
+            # Display frames for visual feedback (always)
+            try:
+                self.display_frames(current_frame, decoded_frame, all_action_predictions)
+            except Exception as e:
+                print(f"Warning: Could not display frames: {e}", flush=True)
+            
             # Interactive mode: show information and get user input
             if self.interactive:
                 action_to_execute = self.interactive_prompt(
@@ -149,11 +181,6 @@ class AdaptiveWorldModel:
         print(f"Current Lookahead: {self.lookahead}", flush=True)
         print(f"History Size: {len(self.frame_features_history)}", flush=True)
         
-        # Display frames (non-blocking)
-        try:
-            self.display_frames(current_frame, decoded_frame, all_action_predictions)
-        except Exception as e:
-            print(f"Warning: Could not display frames: {e}", flush=True)
         
         # Get user input
         while True:
@@ -298,11 +325,11 @@ class AdaptiveWorldModel:
                 # Generate frame for this prediction
                 # Convert features to tensor for decoding
                 if isinstance(next_state, np.ndarray):
-                    features_tensor = torch.from_numpy(next_state).unsqueeze(0).float()
+                    features_tensor = torch.from_numpy(next_state).unsqueeze(0).float().to(self.device)
                 else:
-                    features_tensor = next_state.unsqueeze(0) if len(next_state.shape) == 1 else next_state
+                    features_tensor = next_state.unsqueeze(0).to(self.device) if len(next_state.shape) == 1 else next_state.to(self.device)
                 decoded_tensor = self.autoencoder.decode(features_tensor)
-                pred_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().numpy()
+                pred_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
                 pred_frame = np.clip(pred_frame, 0, 1)  # Clip to valid range for display
                 prediction_frames.append({
                     'frame': pred_frame,
@@ -339,9 +366,9 @@ class AdaptiveWorldModel:
         
         # Convert to tensors
         if isinstance(current_features, np.ndarray):
-            actual_tensor = torch.from_numpy(current_features).float()
+            actual_tensor = torch.from_numpy(current_features).float().to(self.device)
         else:
-            actual_tensor = current_features
+            actual_tensor = current_features.to(self.device)
         
         # Zero gradients
         predictor.optimizer.zero_grad()
@@ -381,7 +408,16 @@ class AdaptiveWorldModel:
         reconstruction_loss.backward()
         self.autoencoder_optimizer.step()
         
-        return reconstruction_loss.item()
+        train_loss_value = reconstruction_loss.item()
+        
+        # Log training loss to wandb
+        if self.wandb_enabled:
+            wandb.log({
+                "autoencoder_training_loss": train_loss_value,
+                "training_step": self.training_step
+            })
+        
+        return train_loss_value
 
     def patchify(self, imgs):
         """Convert images to patches (helper for training)"""
@@ -521,7 +557,7 @@ class ActionConditionedPredictor:
     
     def forward(self, feature_history, action_history):
         # Stub forward method for neural network interface
-        return torch.randn(256)  # Match autoencoder embed_dim
+        return torch.randn(256).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))  # Match autoencoder embed_dim
     
     def parameters(self):
         # Stub parameters method for optimizer
@@ -623,9 +659,13 @@ class StubRobot:
 if __name__ == "__main__":
     # Interactive mode with stub robot
     stub_robot = StubRobot()
-    model = AdaptiveWorldModel(stub_robot, interactive=True)
+    # Enable wandb logging by providing a project name, or set to None to disable
+    model = AdaptiveWorldModel(stub_robot, interactive=True, wandb_project="adaptive-world-model-test")
     try:
         model.main_loop()
     except KeyboardInterrupt:
         print("\nStopped by user")
         stub_robot.cleanup()
+        # Clean up wandb run
+        if model.wandb_enabled:
+            wandb.finish()

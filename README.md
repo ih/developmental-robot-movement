@@ -41,6 +41,7 @@ This repository contains research code for developmental robot movement with a m
 - **Joint training architecture**: Autoencoder reconstruction loss + action predictor gradient flow
 - **Quality gating**: Robot stops acting when reconstruction loss > threshold, focuses on vision training
 - **Real-time visualization**: Training progress display showing current vs reconstructed frames
+- **Experiment tracking**: Optional Weights & Biases (wandb) integration for logging training metrics
 
 ### Action Space
 - **Duration-based actions**: Motor commands with automatic stopping after specified duration
@@ -82,6 +83,11 @@ python adaptive_world_model.py
 
 ## Dependencies
 
+Install the required dependencies:
+```bash
+pip install -r requirements.txt
+```
+
 Required Python packages:
 - rpyc (robot communication)
 - opencv-python (computer vision)
@@ -90,6 +96,7 @@ Required Python packages:
 - PIL (image processing)
 - ipywidgets, IPython (notebook compatibility)
 - tqdm (progress bars)
+- wandb (experiment tracking and logging)
 
 ## File Structure
 
@@ -100,6 +107,7 @@ Required Python packages:
 - `adaptive_world_model.py`: Main world model implementation with neural vision system
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
 - `config.py`: Shared configuration and image transforms
+- `requirements.txt`: Python package dependencies
 - `.gitignore`: Excludes `.claude/` directory, `CLAUDE.md`, and common Python artifacts
 
 ## Implementation Notes
@@ -116,3 +124,33 @@ To add support for a new robot:
 - Actions must be dictionaries
 - Include any parameters your robot needs (motor speeds, duration, etc.)
 - The world model will learn about all parameters in the action space
+
+## Experiment Tracking with Weights & Biases
+
+The system includes optional integration with [Weights & Biases](https://wandb.ai/) for experiment tracking and visualization.
+
+### Enabling wandb Logging
+
+To enable wandb logging, provide a project name when creating the AdaptiveWorldModel:
+
+```python
+# With wandb logging enabled
+model = AdaptiveWorldModel(robot_interface, wandb_project="my-robot-experiment")
+
+# Without wandb logging (default)
+model = AdaptiveWorldModel(robot_interface)
+```
+
+### Logged Metrics
+
+The following metrics are automatically logged when wandb is enabled:
+
+- **`reconstruction_loss`**: Quality of visual reconstruction (lower is better)
+- **`autoencoder_training_loss`**: Training loss during autoencoder updates
+- **`step`** and **`training_step`**: Timestep counters for tracking progress
+
+### Setup
+
+1. Install wandb: `pip install wandb` (included in requirements.txt)
+2. Login to wandb: `wandb login`
+3. Run with project name parameter to enable logging

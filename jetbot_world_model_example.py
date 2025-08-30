@@ -7,6 +7,7 @@ using the RobotInterface abstraction.
 from jetbot_interface import JetBotInterface
 from adaptive_world_model import AdaptiveWorldModel
 import logging
+import wandb
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -25,9 +26,9 @@ def main():
     logger.info("Connecting to JetBot...")
     jetbot = JetBotInterface(JETBOT_IP)
     
-    # Create world model with JetBot interface
+    # Create world model with JetBot interface (with wandb logging)
     logger.info("Initializing AdaptiveWorldModel...")
-    world_model = AdaptiveWorldModel(jetbot, interactive=False)
+    world_model = AdaptiveWorldModel(jetbot, interactive=False, wandb_project="jetbot-world-model")
     
     try:
         logger.info("Starting world model main loop...")
@@ -40,6 +41,9 @@ def main():
     finally:
         logger.info("Cleaning up...")
         jetbot.cleanup()
+        # Clean up wandb run
+        if world_model.wandb_enabled:
+            wandb.finish()
 
 if __name__ == "__main__":
     main()

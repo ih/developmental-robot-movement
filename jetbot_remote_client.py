@@ -24,7 +24,7 @@ from tqdm.auto import tqdm
 
 
 # --- Setup Logging ---
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger('JetBotClient')
 
 # --- Image Transformation ---

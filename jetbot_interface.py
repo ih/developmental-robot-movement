@@ -7,6 +7,7 @@ from robot_interface import RobotInterface
 from jetbot_remote_client import RemoteJetBot
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
 
 class JetBotInterface(RobotInterface):
     """Concrete implementation of RobotInterface for JetBot robots."""

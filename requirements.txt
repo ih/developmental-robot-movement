@@ -1,0 +1,12 @@
+rpyc
+opencv-python
+numpy
+matplotlib
+torch
+torchvision
+timm
+pillow
+ipywidgets
+ipython
+tqdm
+wandb
