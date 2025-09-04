@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import torch
 import wandb
-from models import MaskedAutoencoderViT
+from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
 
 class AdaptiveWorldModel:
     def __init__(self, robot_interface, interactive=False, wandb_project=None):
@@ -35,7 +35,7 @@ class AdaptiveWorldModel:
         
         # Core components
         self.autoencoder = MaskedAutoencoderViT().to(self.device)
-        self.predictors = [ActionConditionedPredictor(level=0)]  # Start with one predictor
+        self.predictors = [TransformerActionConditionedPredictor().to(self.device)]  # Start with one predictor
         self.action_encoders = []  # For future hierarchical actions
         self.action_decoders = []
         
@@ -60,6 +60,10 @@ class AdaptiveWorldModel:
         
         # Training visualization counter
         self.training_step = 0
+        
+        # Action timing tracking
+        self.last_action_time = None
+        self.action_count = 0
     
     def to_model_tensor(self, frame_np):
         """Convert frame to properly scaled tensor for model input"""
@@ -83,9 +87,10 @@ class AdaptiveWorldModel:
             
             # Step 2: Validate image encoding quality using proper reconstruction
             # Use the same path as training (forward + unpatchify) for consistent metrics
-            decoded_tensor = self.autoencoder.reconstruct(frame_tensor)
-            decoded_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
-            decoded_frame = np.clip(decoded_frame, 0, 1)  # Clip to valid range for display
+            with torch.no_grad():  # No gradients needed for display decoding
+                decoded_tensor = self.autoencoder.reconstruct(frame_tensor)
+                decoded_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+                decoded_frame = np.clip(decoded_frame, 0, 1)  # Clip to valid range for display
             
             # Calculate reconstruction loss in patch space (same as training)
             with torch.no_grad():
@@ -100,7 +105,7 @@ class AdaptiveWorldModel:
                     "step": self.training_step
                 })
             
-            threshold = 0.001  # Appropriate threshold for patch-MSE on [0,1] scale
+            threshold = 0.0025  # Appropriate threshold for patch-MSE on [0,1] scale
             if reconstruction_loss > threshold:
                 # Train autoencoder if reconstruction is poor
                 train_loss = self.train_autoencoder(current_frame)
@@ -115,7 +120,7 @@ class AdaptiveWorldModel:
             # Step 3: Check past predictions accuracy (if any)
             prediction_errors = []
             if self.prediction_buffer:
-                prediction_errors = self.evaluate_predictions(current_features)
+                prediction_errors = self.evaluate_predictions(frame_tensor)
                 
                 if all(error < threshold for error in prediction_errors):
                     # All predictions accurate - increase lookahead
@@ -130,9 +135,7 @@ class AdaptiveWorldModel:
                     # Train predictors that had errors
                     for level, error in enumerate(prediction_errors):
                         if error > threshold:
-                            # TODO remove print statement and uncomment train_predictor after autoencoder is tested and image reconstruction is working
-                            print("Train the predictor")
-                            # self.train_predictor(level, current_features)
+                            self.train_predictor(level, frame_tensor)
                     
                     # Adjust lookahead based on accuracy horizon
                     self.lookahead = self.find_accurate_prediction_horizon()
@@ -156,11 +159,25 @@ class AdaptiveWorldModel:
                 action_to_execute = best_action
             
             # Step 5: Take action and make predictions using the interface (only if reconstruction is good)
+            current_time = time.time()
+            
+            # Calculate time between actions and log to wandb
+            if self.last_action_time is not None:
+                time_between_actions = current_time - self.last_action_time
+                if self.wandb_enabled:
+                    wandb.log({
+                        "time_between_actions": time_between_actions,
+                        "action_count": self.action_count,
+                        "step": self.training_step
+                    })
+            
             self.robot.execute_action(action_to_execute)
+            self.last_action_time = current_time
+            self.action_count += 1
             self.make_predictions(current_features, action_to_execute)
             
             # Step 6: Update history buffers
-            self.frame_features_history.append(current_features)
+            self.frame_features_history.append(current_features.detach())
             self.action_history.append(action_to_execute)
             self.maintain_history_window()
     
@@ -310,50 +327,59 @@ class AdaptiveWorldModel:
         # Get relevant history for prediction
         history_features, history_actions = self.get_prediction_context()
         
-        for action in self.get_available_actions():
-            # Predict next states for this action
-            predictions = []
-            prediction_frames = []
-            
-            for predictor in self.predictors:
-                next_state = predictor.forward(
-                    history_features, 
-                    history_actions + [action]
-                )
-                predictions.append(next_state)
+        with torch.no_grad():  # No gradients needed for action scoring and frame previews
+            for action in self.get_available_actions():
+                # Predict next states for this action
+                predictions = []
+                prediction_frames = []
                 
-                # Generate frame for this prediction
-                # Convert features to tensor for decoding
-                if isinstance(next_state, np.ndarray):
-                    features_tensor = torch.from_numpy(next_state).unsqueeze(0).float().to(self.device)
-                else:
-                    features_tensor = next_state.unsqueeze(0).to(self.device) if len(next_state.shape) == 1 else next_state.to(self.device)
-                decoded_tensor = self.autoencoder.decode(features_tensor)
-                pred_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
-                pred_frame = np.clip(pred_frame, 0, 1)  # Clip to valid range for display
-                prediction_frames.append({
-                    'frame': pred_frame,
-                    'level': predictor.level,
-                    'features': next_state
+                for predictor in self.predictors:
+                    next_state = predictor.forward(
+                        history_features, 
+                        history_actions + [action]
+                    )
+                    predictions.append(next_state)
+                    
+                    # Generate frame for this prediction
+                    # Convert features to tensor and use forward_decoder
+                    if isinstance(next_state, np.ndarray):
+                        features_tensor = torch.from_numpy(next_state).unsqueeze(0).float().to(self.device)
+                    else:
+                        features_tensor = next_state.unsqueeze(0).to(self.device) if len(next_state.shape) == 1 else next_state.to(self.device)
+                    
+                    # Create identity ids_restore for unmasked features
+                    B, seq_len, _ = features_tensor.shape
+                    L = seq_len - 1  # Remove CLS token count
+                    ids_restore = torch.arange(L, device=features_tensor.device).unsqueeze(0).repeat(B, 1)
+                    
+                    # Use forward_decoder to get patches then unpatchify
+                    pred_patches = self.autoencoder.forward_decoder(features_tensor, ids_restore)
+                    decoded_tensor = self.autoencoder.unpatchify(pred_patches)
+                    pred_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+                    pred_frame = np.clip(pred_frame, 0, 1)  # Clip to valid range for display
+                    prediction_frames.append({
+                        'frame': pred_frame,
+                        'level': predictor.level,
+                        'features': next_state
+                    })
+                
+                # Calculate uncertainty (entropy) over predictions
+                uncertainty = calculate_entropy(predictions)
+                
+                # Store all prediction data for this action
+                all_action_predictions.append({
+                    'action': action,
+                    'uncertainty': uncertainty,
+                    'predictions': prediction_frames
                 })
-            
-            # Calculate uncertainty (entropy) over predictions
-            uncertainty = calculate_entropy(predictions)
-            
-            # Store all prediction data for this action
-            all_action_predictions.append({
-                'action': action,
-                'uncertainty': uncertainty,
-                'predictions': prediction_frames
-            })
-            
-            if uncertainty > max_uncertainty:
-                max_uncertainty = uncertainty
-                best_action = action
+                
+                if uncertainty > max_uncertainty:
+                    max_uncertainty = uncertainty
+                    best_action = action
         
         return best_action, all_action_predictions
     
-    def train_predictor(self, level, current_features):
+    def train_predictor(self, level, current_frame_tensor):
         """Train neural predictor at specified level (gradients flow to autoencoder automatically)"""
         predictor = self.predictors[level]
         
@@ -361,17 +387,20 @@ class AdaptiveWorldModel:
         if not hasattr(predictor, 'optimizer'):
             predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-4)
         
+        # Initialize autoencoder optimizer for joint training
+        if not hasattr(self, 'autoencoder_optimizer'):
+            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=1e-4)
+        
         # Get appropriate history window
         history_features, history_actions = self.get_prediction_context()
+        history_features = [f.detach() for f in history_features]  # Detach history to prevent backprop through old encoder graphs
         
-        # Convert to tensors
-        if isinstance(current_features, np.ndarray):
-            actual_tensor = torch.from_numpy(current_features).float().to(self.device)
-        else:
-            actual_tensor = current_features.to(self.device)
+        # Get fresh target features from current frame (this creates a new computational graph)
+        actual_tensor, _ = self.autoencoder.forward_encoder(current_frame_tensor, mask_ratio=0.0)
         
-        # Zero gradients
+        # Zero gradients for both predictor and autoencoder
         predictor.optimizer.zero_grad()
+        self.autoencoder_optimizer.zero_grad()
         
         # Forward pass through predictor
         predicted_tensor = predictor.forward(history_features, history_actions)
@@ -379,11 +408,23 @@ class AdaptiveWorldModel:
         # Calculate prediction loss
         prediction_loss = torch.nn.functional.mse_loss(predicted_tensor, actual_tensor)
         
-        # Backward pass - this will automatically train autoencoder encoder too!
+        # Backward pass - this will train both predictor and autoencoder!
         prediction_loss.backward()
         predictor.optimizer.step()
+        self.autoencoder_optimizer.step()
         
         print(f"Predictor {level} training loss: {prediction_loss.item():.4f}")
+        
+        # Log predictor training metrics to wandb
+        if self.wandb_enabled:
+            wandb.log({
+                "predictor_training_loss": prediction_loss.item(),
+                "predictor_level": level,
+                "predictor_training_step": getattr(self, 'predictor_training_step', 0),
+                "step": self.training_step
+            })
+            # Increment predictor training step counter
+            self.predictor_training_step = getattr(self, 'predictor_training_step', 0) + 1
     
     def train_autoencoder(self, ground_truth_frame):
         """Train only the autoencoder with masked reconstruction"""
@@ -511,21 +552,36 @@ class AdaptiveWorldModel:
             prediction = predictor.forward(
                 history_features,
                 history_actions
-            )
+            ).detach()
             self.prediction_buffer.append({
                 'prediction': prediction,
                 'level': predictor.level,
                 'timestamp': current_time()
             })
     
-    def evaluate_predictions(self, actual_features):
-        """Compare past predictions with actual outcome"""
+    def evaluate_predictions(self, actual_frame_tensor):
+        """Compare past predictions with actual outcome using patch space reconstruction loss"""
         errors = []
         
+        # Calculate target patches from actual frame (same as main loop step 2)
+        target_patches = self.patchify(actual_frame_tensor)
+        
         for pred_data in self.prediction_buffer:
-            prediction = pred_data['prediction']
-            error = calculate_loss(prediction, actual_features)
-            errors.append(error)
+            predicted_features = pred_data['prediction']
+            
+            # Convert predicted features back to patches using decoder
+            with torch.no_grad():
+                # Create identity ids_restore since we're working with unmasked features
+                B, seq_len, _ = predicted_features.shape
+                L = seq_len - 1  # Remove CLS token count
+                ids_restore = torch.arange(L, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
+                
+                # Use decoder to convert features to patches
+                pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
+                
+                # Calculate reconstruction loss in patch space (same as training)
+                reconstruction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches).item()
+                errors.append(reconstruction_loss)
             
         return errors
     
@@ -589,12 +645,18 @@ class ActionDecoder:
 
 def calculate_entropy(predictions):
     """Calculate uncertainty/entropy over predicted distributions"""
-    # Higher entropy = more uncertainty = more interesting to explore
     if not predictions:
         return 0.0
-    # Simple variance-based uncertainty measure
-    predictions_array = np.array([p.flatten() if hasattr(p, 'flatten') else [p] for p in predictions])
-    return np.var(predictions_array)
+    
+    # Stack predictions and calculate variance on GPU
+    if predictions and hasattr(predictions[0], 'device'):
+        # PyTorch tensors - keep on GPU
+        predictions_tensor = torch.stack([p.flatten() for p in predictions])
+        return torch.var(predictions_tensor).item()
+    else:
+        # Fallback for numpy arrays
+        predictions_array = np.array([p.flatten() if hasattr(p, 'flatten') else [p] for p in predictions])
+        return np.var(predictions_array)
 
 def calculate_loss(predicted, actual):
     """Compute prediction error"""

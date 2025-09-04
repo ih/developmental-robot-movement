@@ -1,5 +1,5 @@
 """
-Neural network models for the developmental robot movement system.
+Masked Autoencoder Vision Transformer for visual encoding/decoding.
 """
 
 import torch
@@ -100,19 +100,28 @@ class MaskedAutoencoderViT(nn.Module):
         return emb
 
     def forward_encoder(self, x, mask_ratio=0.75):
-        # (This function remains exactly the same)
         x = self.patch_embed(x)
         x = x + self.pos_embed[:, 1:, :]
         B, L, D = x.shape
-        len_keep = int(L * (1 - mask_ratio))
-        noise = torch.rand(B, L, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-        ids_keep = ids_shuffle[:, :len_keep]
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-        cls_token = self.cls_token + self.pos_embed[:, :1, :]
-        cls_tokens = cls_token.expand(x_masked.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x_masked), dim=1)
+        
+        # Skip masking/shuffling when mask_ratio=0 for consistent ordering
+        if mask_ratio == 0.0:
+            cls_token = self.cls_token + self.pos_embed[:, :1, :]
+            cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+            # Create identity ids_restore (no shuffling occurred)
+            ids_restore = torch.arange(L, device=x.device).unsqueeze(0).repeat(B, 1)
+        else:
+            len_keep = int(L * (1 - mask_ratio))
+            noise = torch.rand(B, L, device=x.device)
+            ids_shuffle = torch.argsort(noise, dim=1)
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+            ids_keep = ids_shuffle[:, :len_keep]
+            x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+            cls_token = self.cls_token + self.pos_embed[:, :1, :]
+            cls_tokens = cls_token.expand(x_masked.shape[0], -1, -1)
+            x = torch.cat((cls_tokens, x_masked), dim=1)
+        
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
@@ -145,8 +154,8 @@ class MaskedAutoencoderViT(nn.Module):
     def encode(self, imgs):
         """Encode images to latent features (for use in world model)"""
         latent, _ = self.forward_encoder(imgs, mask_ratio=0.0)  # No masking for inference
-        # Return cls token as the image representation
-        return latent[:, 0, :]  # Shape: [batch_size, embed_dim]
+        # Return all features including cls token and patch tokens
+        return latent  # Shape: [batch_size, num_patches + 1, embed_dim]
 
     def decode(self, latent_features):
         """Decode latent features back to images (for visualization)"""

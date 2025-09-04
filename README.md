@@ -38,10 +38,12 @@ This repository contains research code for developmental robot movement with a m
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
-- **Joint training architecture**: Autoencoder reconstruction loss + action predictor gradient flow
+- **TransformerActionConditionedPredictor**: Causal transformer that interleaves visual features with action tokens
+- **Joint training architecture**: Autoencoder reconstruction loss + action predictor gradient flow with shared encoder
+- **Sequence length management**: Handles long histories (4096 token capacity with clipping for GPU safety)
 - **Quality gating**: Robot stops acting when reconstruction loss > threshold, focuses on vision training
 - **Real-time visualization**: Training progress display showing current vs reconstructed frames
-- **Experiment tracking**: Optional Weights & Biases (wandb) integration for logging training metrics
+- **Comprehensive experiment tracking**: Weights & Biases integration for reconstruction, predictor training, and timing metrics
 
 ### Action Space
 - **Duration-based actions**: Motor commands with automatic stopping after specified duration
@@ -103,12 +105,15 @@ Required Python packages:
 - `robot_interface.py`: Abstract base class defining robot interaction contract
 - `jetbot_interface.py`: JetBot implementation of RobotInterface with duration-based actions
 - `jetbot_remote_client.py`: Low-level JetBot RPyC client with live feed capability
-- `models.py`: Neural network architectures including MaskedAutoencoderViT
-- `adaptive_world_model.py`: Main world model implementation with neural vision system
+- `models/`: Neural network architectures directory
+  - `models/__init__.py`: Module exports for clean imports
+  - `models/autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
+  - `models/predictor.py`: TransformerActionConditionedPredictor with sequence length management
+- `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
 - `config.py`: Shared configuration and image transforms
 - `requirements.txt`: Python package dependencies
-- `.gitignore`: Excludes `.claude/` directory, `CLAUDE.md`, and common Python artifacts
+- `.gitignore`: Excludes `.claude/` directory, `CLAUDE.md`, wandb logs, and common Python artifacts
 
 ## Implementation Notes
 
@@ -145,9 +150,19 @@ model = AdaptiveWorldModel(robot_interface)
 
 The following metrics are automatically logged when wandb is enabled:
 
+**Vision System:**
 - **`reconstruction_loss`**: Quality of visual reconstruction (lower is better)
 - **`autoencoder_training_loss`**: Training loss during autoencoder updates
-- **`step`** and **`training_step`**: Timestep counters for tracking progress
+
+**Prediction System:**
+- **`predictor_training_loss`**: MSE loss between predicted and actual features
+- **`predictor_level`**: Which predictor level is being trained
+- **`predictor_training_step`**: Dedicated counter for predictor training iterations
+
+**Performance Metrics:**
+- **`time_between_actions`**: Duration in seconds between consecutive actions
+- **`action_count`**: Total number of actions taken
+- **`step`** and **`training_step`**: Overall timestep counters for tracking progress
 
 ### Setup
 
