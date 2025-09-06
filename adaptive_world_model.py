@@ -10,6 +10,7 @@ import wandb
 import os
 import pickle
 from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
+from config import AdaptiveWorldModelConfig
 
 class AdaptiveWorldModel:
     def __init__(self, robot_interface, interactive=False, wandb_project=None, checkpoint_dir="checkpoints"):
@@ -18,7 +19,7 @@ class AdaptiveWorldModel:
         
         # Checkpoint management
         self.checkpoint_dir = checkpoint_dir
-        self.save_interval = 10  # Save every 50 training steps
+        self.save_interval = AdaptiveWorldModelConfig.CHECKPOINT_SAVE_INTERVAL
         
         # Device setup - use GPU if available
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -29,11 +30,13 @@ class AdaptiveWorldModel:
             wandb.init(project=wandb_project, config={
                 "device": str(self.device),
                 "interactive": interactive,
-                "lookahead": 1,
-                "max_lookahead_margin": 5,
-                "prediction_history_size": 10,
-                "uncertainty_threshold": 0.7,
-                "reconstruction_threshold": 0.001
+                "lookahead": AdaptiveWorldModelConfig.LOOKAHEAD,
+                "max_lookahead_margin": AdaptiveWorldModelConfig.MAX_LOOKAHEAD_MARGIN,
+                "prediction_history_size": AdaptiveWorldModelConfig.PREDICTION_HISTORY_SIZE,
+                "uncertainty_threshold": AdaptiveWorldModelConfig.UNCERTAINTY_THRESHOLD,
+                "reconstruction_threshold": AdaptiveWorldModelConfig.RECONSTRUCTION_THRESHOLD,
+                "log_interval": AdaptiveWorldModelConfig.LOG_INTERVAL,
+                "visualization_upload_interval": AdaptiveWorldModelConfig.VISUALIZATION_UPLOAD_INTERVAL
             })
             self.wandb_enabled = True
         else:
@@ -45,11 +48,11 @@ class AdaptiveWorldModel:
         self.action_encoders = []  # For future hierarchical actions
         self.action_decoders = []
         
-        # Parameters
-        self.lookahead = 1  # Start with 1-step lookahead
-        self.max_lookahead_margin = 5  # Buffer before creating new level
-        self.prediction_history_size = 10  # Fixed lookback window
-        self.uncertainty_threshold = 0.7
+        # Parameters from config
+        self.lookahead = AdaptiveWorldModelConfig.LOOKAHEAD
+        self.max_lookahead_margin = AdaptiveWorldModelConfig.MAX_LOOKAHEAD_MARGIN
+        self.prediction_history_size = AdaptiveWorldModelConfig.PREDICTION_HISTORY_SIZE
+        self.uncertainty_threshold = AdaptiveWorldModelConfig.UNCERTAINTY_THRESHOLD
         self.interactive = interactive
         
         # Matplotlib figure for persistent display
@@ -93,7 +96,7 @@ class AdaptiveWorldModel:
             }, os.path.join(self.checkpoint_dir, f'predictor_{i}.pth'))
         
         # Save learning progress and history (keep only recent history to avoid huge files)
-        history_limit = 100
+        history_limit = AdaptiveWorldModelConfig.CHECKPOINT_HISTORY_LIMIT
         state = {
             'training_step': self.training_step,
             'predictor_training_step': getattr(self, 'predictor_training_step', 0),
@@ -198,20 +201,20 @@ class AdaptiveWorldModel:
                 target_patches = self.patchify(frame_tensor)
                 reconstruction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches).item()
             
-            # Log reconstruction loss to wandb
-            if self.wandb_enabled:
+            # Log reconstruction loss to wandb (periodically)
+            if self.wandb_enabled and self.training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
                 wandb.log({
                     "reconstruction_loss": reconstruction_loss,
                     "step": self.training_step
                 })
             
-            threshold = 0.0022  # Appropriate threshold for patch-MSE on [0,1] scale
+            threshold = AdaptiveWorldModelConfig.RECONSTRUCTION_THRESHOLD
             if reconstruction_loss > threshold:
                 # Train autoencoder if reconstruction is poor
                 train_loss = self.train_autoencoder(current_frame)
                 
-                # Show current and reconstructed frames while training (every 10th step)
-                if self.training_step % 10 == 0:
+                # Show current and reconstructed frames while training (periodically)
+                if self.training_step % AdaptiveWorldModelConfig.DISPLAY_TRAINING_INTERVAL == 0:
                     self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
                 self.training_step += 1
                 
@@ -262,10 +265,10 @@ class AdaptiveWorldModel:
             # Step 5: Take action and make predictions using the interface (only if reconstruction is good)
             current_time = time.time()
             
-            # Calculate time between actions and log to wandb
+            # Calculate time between actions and log to wandb (periodically)
             if self.last_action_time is not None:
                 time_between_actions = current_time - self.last_action_time
-                if self.wandb_enabled:
+                if self.wandb_enabled and self.action_count % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
                     wandb.log({
                         "time_between_actions": time_between_actions,
                         "action_count": self.action_count,
@@ -277,7 +280,11 @@ class AdaptiveWorldModel:
             self.action_count += 1
             self.make_predictions(current_features, action_to_execute)
             
-            # Step 6: Update history buffers
+            # Step 6: Upload visualizations periodically
+            if self.wandb_enabled and self.action_count % AdaptiveWorldModelConfig.VISUALIZATION_UPLOAD_INTERVAL == 0:
+                self.upload_visualizations_to_wandb(current_frame, decoded_frame, all_action_predictions)
+            
+            # Step 7: Update history buffers
             self.frame_features_history.append(current_features.detach())
             self.action_history.append(action_to_execute)
             self.maintain_history_window()
@@ -335,29 +342,36 @@ class AdaptiveWorldModel:
             if self.fig is not None:
                 plt.close(self.fig)
             
-            self.fig, self.axes = plt.subplots(1, num_cols, figsize=(3*num_cols, 4))
-            
-            if num_cols == 1:
-                self.axes = [self.axes]
+            self.fig, self.axes, _ = self._create_prediction_visualization_figure(current_frame, decoded_frame, all_action_predictions)
             
             plt.ion()  # Turn on interactive mode
             plt.show(block=False)
+        else:
+            # Update existing figure using helper
+            self._populate_prediction_visualization_axes(self.axes, current_frame, decoded_frame, all_action_predictions)
+            plt.tight_layout()
         
-        # Clear previous content
-        for ax in self.axes:
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.01)  # Small pause to ensure rendering
+    
+    def _populate_prediction_visualization_axes(self, axes, current_frame, decoded_frame, all_action_predictions):
+        """Helper function to populate axes with prediction visualization content"""
+        # Clear axes
+        for ax in axes:
             ax.clear()
             ax.axis('off')
         
         col_idx = 0
         
         # Current frame
-        self.axes[col_idx].imshow(current_frame)
-        self.axes[col_idx].set_title("Current Frame", fontsize=10)
+        axes[col_idx].imshow(current_frame)
+        axes[col_idx].set_title("Current Frame", fontsize=10)
         col_idx += 1
         
         # Decoded frame
-        self.axes[col_idx].imshow(decoded_frame)
-        self.axes[col_idx].set_title("Decoded Frame", fontsize=10)
+        axes[col_idx].imshow(decoded_frame)
+        axes[col_idx].set_title("Decoded Frame", fontsize=10)
         col_idx += 1
         
         # Predictions for each action
@@ -367,28 +381,63 @@ class AdaptiveWorldModel:
             predictions = action_data['predictions']
             
             for level, pred_data in enumerate(predictions):
-                if col_idx < len(self.axes):
+                if col_idx < len(axes):
                     pred_frame = pred_data['frame']
                     predictor_level = pred_data['level']
                     
-                    self.axes[col_idx].imshow(pred_frame)
+                    axes[col_idx].imshow(pred_frame)
                     
                     # Multi-line title with action, level, and uncertainty
                     title = f"Action: {action}\nLevel {predictor_level}\nUncertainty: {uncertainty:.3f}"
-                    self.axes[col_idx].set_title(title, fontsize=8)
+                    axes[col_idx].set_title(title, fontsize=8)
                     
                     # Add border color based on uncertainty (higher = more red)
                     border_color = plt.cm.Reds(min(uncertainty, 1.0))
-                    for spine in self.axes[col_idx].spines.values():
+                    for spine in axes[col_idx].spines.values():
                         spine.set_edgecolor(border_color)
                         spine.set_linewidth(2)
                     
                     col_idx += 1
+    
+    def _create_prediction_visualization_figure(self, current_frame, decoded_frame, all_action_predictions):
+        """Helper function to create a figure with current frame, decoded frame, and predictions"""
+        # Calculate grid layout: current + decoded + all action predictions
+        total_predictions = sum(len(pred_data['predictions']) for pred_data in all_action_predictions)
+        num_cols = 2 + total_predictions  # current + decoded + all predictions
+        
+        # Create figure
+        fig, axes = plt.subplots(1, num_cols, figsize=(3*num_cols, 4))
+        
+        if num_cols == 1:
+            axes = [axes]
+        
+        # Populate axes using helper
+        self._populate_prediction_visualization_axes(axes, current_frame, decoded_frame, all_action_predictions)
         
         plt.tight_layout()
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-        plt.pause(0.01)  # Small pause to ensure rendering
+        return fig, axes, num_cols
+    
+    def upload_visualizations_to_wandb(self, current_frame, decoded_frame, all_action_predictions):
+        """Upload current visualizations to wandb for remote monitoring"""
+        if not self.wandb_enabled:
+            return
+        
+        try:
+            # Create visualization figure using helper
+            fig, axes, num_cols = self._create_prediction_visualization_figure(current_frame, decoded_frame, all_action_predictions)
+            
+            # Upload to wandb
+            wandb.log({
+                "predictions_visualization": wandb.Image(fig),
+                "action_count": self.action_count,
+                "step": self.training_step
+            })
+            
+            # Close the figure to free memory
+            plt.close(fig)
+            
+        except Exception as e:
+            print(f"Warning: Could not upload visualization to wandb: {e}")
     
     def display_reconstruction_training(self, current_frame, decoded_frame, reconstruction_loss):
         """Display current and reconstructed frames during autoencoder training"""
@@ -486,11 +535,11 @@ class AdaptiveWorldModel:
         
         # Initialize predictor optimizer if not exists
         if not hasattr(predictor, 'optimizer'):
-            predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-4)
+            predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=AdaptiveWorldModelConfig.PREDICTOR_LR)
         
         # Initialize autoencoder optimizer for joint training
         if not hasattr(self, 'autoencoder_optimizer'):
-            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=1e-4)
+            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=AdaptiveWorldModelConfig.AUTOENCODER_LR)
         
         # Get appropriate history window
         history_features, history_actions = self.get_prediction_context()
@@ -513,9 +562,7 @@ class AdaptiveWorldModel:
         prediction_loss.backward()
         predictor.optimizer.step()
         self.autoencoder_optimizer.step()
-        
-        print(f"Predictor {level} training loss: {prediction_loss.item():.4f}")
-        
+                
         # Log predictor training metrics to wandb
         if self.wandb_enabled:
             wandb.log({
@@ -539,13 +586,13 @@ class AdaptiveWorldModel:
         
         # Initialize optimizer if not exists
         if not hasattr(self, 'autoencoder_optimizer'):
-            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=1e-4)
+            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=AdaptiveWorldModelConfig.AUTOENCODER_LR)
         
         # Zero gradients
         self.autoencoder_optimizer.zero_grad()
         
         # Forward pass with masking for reconstruction loss
-        pred_patches, latent = self.autoencoder(frame_tensor, mask_ratio=0.75)
+        pred_patches, latent = self.autoencoder(frame_tensor, mask_ratio=AdaptiveWorldModelConfig.MASK_RATIO)
         
         # Calculate reconstruction loss
         target_patches = self.patchify(frame_tensor)
@@ -641,7 +688,7 @@ class AdaptiveWorldModel:
     
     def maintain_history_window(self):
         """Keep history buffers at reasonable size"""
-        max_history = 1000  # Configurable
+        max_history = AdaptiveWorldModelConfig.MAX_HISTORY_SIZE
         
         if len(self.frame_features_history) > max_history:
             self.frame_features_history = self.frame_features_history[-max_history:]

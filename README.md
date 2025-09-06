@@ -53,7 +53,9 @@ This repository contains research code for developmental robot movement with a m
 - **Automatic stopping**: Motors automatically set to 0 after duration expires
 
 ### Configuration
-- **config.py**: Contains image transforms and constants
+- **config.py**: Contains image transforms, constants, and adaptive world model parameters
+- **AdaptiveWorldModelConfig class**: Centralized configuration for all model parameters
+- **Configurable intervals**: Logging frequency, visualization uploads, checkpoint saving, and display intervals
 - **IP addresses**: JetBot connection IPs specified in integration example (modify as needed)
 
 ## Running the Code
@@ -124,7 +126,7 @@ Required Python packages:
 - `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
 - `test_jetbot_actions.ipynb`: Interactive Jupyter notebook for JetBot action space testing
-- `config.py`: Shared configuration and image transforms
+- `config.py`: Shared configuration, image transforms, and adaptive world model parameters
 - `requirements.txt`: Python package dependencies
 - `.gitignore`: Excludes `.claude/` directory, `CLAUDE.md`, wandb logs, checkpoints, and common Python artifacts
 
@@ -162,12 +164,23 @@ model = AdaptiveWorldModel(robot_interface, checkpoint_dir="checkpoints")
 model = AdaptiveWorldModel(robot_interface)
 ```
 
+### Logging and Visualization Features
+
+**Efficient Logging:**
+- **Periodic logging**: Metrics logged every 10 steps (configurable) instead of every step to reduce noise
+- **Configurable intervals**: Adjust `LOG_INTERVAL` in config.py to control logging frequency
+
+**Visual Monitoring:**
+- **Prediction visualizations**: Complete visualization grids uploaded to wandb periodically
+- **Remote monitoring**: View current frame, decoded frame, and all action predictions via wandb interface
+- **Upload frequency**: Visualizations uploaded every 10 steps (configurable via `VISUALIZATION_UPLOAD_INTERVAL`)
+
 ### Logged Metrics
 
 The following metrics are automatically logged when wandb is enabled:
 
 **Vision System:**
-- **`reconstruction_loss`**: Quality of visual reconstruction (lower is better)
+- **`reconstruction_loss`**: Quality of visual reconstruction (lower is better, logged periodically)
 - **`autoencoder_training_loss`**: Training loss during autoencoder updates
 
 **Prediction System:**
@@ -176,9 +189,12 @@ The following metrics are automatically logged when wandb is enabled:
 - **`predictor_training_step`**: Dedicated counter for predictor training iterations
 
 **Performance Metrics:**
-- **`time_between_actions`**: Duration in seconds between consecutive actions
+- **`time_between_actions`**: Duration in seconds between consecutive actions (logged periodically)
 - **`action_count`**: Total number of actions taken
 - **`step`** and **`training_step`**: Overall timestep counters for tracking progress
+
+**Visual Data:**
+- **`predictions_visualization`**: Complete visualization showing current frame, decoded frame, and predictions for all actions
 
 ### Setup
 
