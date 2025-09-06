@@ -21,17 +21,16 @@ class JetBotInterface(RobotInterface):
         """
         self.jetbot = RemoteJetBot(ip_address, port)
         
-        # Define action space (cross product of motor values with fixed duration)
-        motor_values = [-0.15, 0, 0.15]
+        # Define action space (single motor only for simplified learning)
+        motor_values = [-0.2, 0, 0.2]
         duration = 0.1  # Fixed duration in seconds
         self._action_space = []
         for left in motor_values:
-            for right in motor_values:
-                self._action_space.append({
-                    'motor_left': left, 
-                    'motor_right': right,
-                    'duration': duration
-                })
+            self._action_space.append({
+                'motor_left': left, 
+                'motor_right': 0,  # Keep right motor at 0
+                'duration': duration
+            })
     
     def get_observation(self) -> Optional[np.ndarray]:
         """Capture current frame from JetBot camera.

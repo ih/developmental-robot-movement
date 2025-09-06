@@ -44,11 +44,12 @@ This repository contains research code for developmental robot movement with a m
 - **Quality gating**: Robot stops acting when reconstruction loss > threshold, focuses on vision training
 - **Real-time visualization**: Training progress display showing current vs reconstructed frames
 - **Comprehensive experiment tracking**: Weights & Biases integration for reconstruction, predictor training, and timing metrics
+- **Learning progress persistence**: Automatic save/load of model weights, training progress, and history buffers
 
 ### Action Space
 - **Duration-based actions**: Motor commands with automatic stopping after specified duration
-- **Motor combinations**: Cross product of motor_left and motor_right values {-0.15, 0, 0.15} = 9 total motor combinations
-- **Format**: `{'motor_left': value, 'motor_right': value, 'duration': 0.1}`
+- **Simplified action space**: Single motor control with motor_left values {-0.2, 0, 0.2} = 3 total actions (motor_right always 0)
+- **Format**: `{'motor_left': value, 'motor_right': 0, 'duration': 0.1}`
 - **Automatic stopping**: Motors automatically set to 0 after duration expires
 
 ### Configuration
@@ -73,6 +74,8 @@ python jetbot_world_model_example.py
 - Requires JetBot running RPyC server
 - Interactive mode with real robot control
 - Press Enter to continue with proposed action, type custom action dict, or 'stop' to exit
+- **Automatic checkpoint saving**: Learning progress saved every 10 predictor training steps
+- **Resume learning**: Automatically loads previous training progress on restart
 
 ### World Model Testing (No Robot)
 ```bash
@@ -82,6 +85,15 @@ python adaptive_world_model.py
 - Shows visualization of predictions for all actions
 - All ML components are stubs - only tests main loop logic
 - No physical robot required
+
+### Interactive JetBot Testing
+```bash
+jupyter notebook test_jetbot_actions.ipynb
+```
+- Interactive testing of JetBot action space in Jupyter notebook
+- Test individual actions with visual feedback
+- Capture before/after frames and analyze differences
+- Useful for validating robot behavior and camera setup
 
 ## Dependencies
 
@@ -111,9 +123,10 @@ Required Python packages:
   - `models/predictor.py`: TransformerActionConditionedPredictor with sequence length management
 - `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
+- `test_jetbot_actions.ipynb`: Interactive Jupyter notebook for JetBot action space testing
 - `config.py`: Shared configuration and image transforms
 - `requirements.txt`: Python package dependencies
-- `.gitignore`: Excludes `.claude/` directory, `CLAUDE.md`, wandb logs, and common Python artifacts
+- `.gitignore`: Excludes `.claude/` directory, `CLAUDE.md`, wandb logs, checkpoints, and common Python artifacts
 
 ## Implementation Notes
 
@@ -139,10 +152,13 @@ The system includes optional integration with [Weights & Biases](https://wandb.a
 To enable wandb logging, provide a project name when creating the AdaptiveWorldModel:
 
 ```python
-# With wandb logging enabled
-model = AdaptiveWorldModel(robot_interface, wandb_project="my-robot-experiment")
+# With wandb logging and checkpoints enabled
+model = AdaptiveWorldModel(robot_interface, wandb_project="my-robot-experiment", checkpoint_dir="my_checkpoints")
 
-# Without wandb logging (default)
+# Without wandb logging but with checkpoints (default)
+model = AdaptiveWorldModel(robot_interface, checkpoint_dir="checkpoints")
+
+# Minimal setup (no wandb, default checkpoint directory)
 model = AdaptiveWorldModel(robot_interface)
 ```
 
@@ -169,3 +185,34 @@ The following metrics are automatically logged when wandb is enabled:
 1. Install wandb: `pip install wandb` (included in requirements.txt)
 2. Login to wandb: `wandb login`
 3. Run with project name parameter to enable logging
+
+## Learning Progress Persistence
+
+The system automatically saves and loads learning progress to enable continuous training across sessions.
+
+### Features
+
+- **Automatic checkpointing**: Model weights, optimizers, and training progress saved periodically
+- **Resume training**: Automatically loads existing checkpoints on startup
+- **Configurable directory**: Set checkpoint location via `checkpoint_dir` parameter
+- **Periodic saves**: Checkpoints saved every 10 predictor training steps
+- **Final save**: Checkpoint automatically saved when program exits
+
+### Saved Components
+
+- Neural network weights (autoencoder, predictors)
+- Optimizer states for continued training
+- Training step counters and learning progress
+- Recent history buffers (last 100 entries)
+
+### Usage
+
+```python
+# Custom checkpoint directory
+model = AdaptiveWorldModel(robot_interface, checkpoint_dir="jetbot_checkpoints")
+
+# Default directory ("checkpoints")
+model = AdaptiveWorldModel(robot_interface)
+```
+
+Checkpoints are excluded from git via `.gitignore` to avoid committing large model files.

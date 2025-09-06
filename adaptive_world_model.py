@@ -7,12 +7,18 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import torch
 import wandb
+import os
+import pickle
 from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
 
 class AdaptiveWorldModel:
-    def __init__(self, robot_interface, interactive=False, wandb_project=None):
+    def __init__(self, robot_interface, interactive=False, wandb_project=None, checkpoint_dir="checkpoints"):
         # Store the robot interface
         self.robot = robot_interface
+        
+        # Checkpoint management
+        self.checkpoint_dir = checkpoint_dir
+        self.save_interval = 10  # Save every 50 training steps
         
         # Device setup - use GPU if available
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -64,6 +70,100 @@ class AdaptiveWorldModel:
         # Action timing tracking
         self.last_action_time = None
         self.action_count = 0
+        
+        # Load checkpoint if it exists
+        self.load_checkpoint()
+    
+    def save_checkpoint(self):
+        """Save current learning progress to disk"""
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # Save autoencoder model and optimizer
+        torch.save({
+            'model_state_dict': self.autoencoder.state_dict(),
+            'optimizer_state_dict': getattr(self, 'autoencoder_optimizer', {}).state_dict() if hasattr(self, 'autoencoder_optimizer') else None,
+        }, os.path.join(self.checkpoint_dir, 'autoencoder.pth'))
+        
+        # Save predictors
+        for i, predictor in enumerate(self.predictors):
+            torch.save({
+                'model_state_dict': predictor.state_dict() if hasattr(predictor, 'state_dict') else {},
+                'optimizer_state_dict': getattr(predictor, 'optimizer', {}).state_dict() if hasattr(predictor, 'optimizer') else None,
+                'level': predictor.level,
+            }, os.path.join(self.checkpoint_dir, f'predictor_{i}.pth'))
+        
+        # Save learning progress and history (keep only recent history to avoid huge files)
+        history_limit = 100
+        state = {
+            'training_step': self.training_step,
+            'predictor_training_step': getattr(self, 'predictor_training_step', 0),
+            'action_count': self.action_count,
+            'lookahead': self.lookahead,
+            'frame_features_history': self.frame_features_history[-history_limit:] if self.frame_features_history else [],
+            'action_history': self.action_history[-history_limit:] if self.action_history else [],
+            'prediction_buffer': self.prediction_buffer,
+            'last_action_time': self.last_action_time,
+        }
+        
+        with open(os.path.join(self.checkpoint_dir, 'state.pkl'), 'wb') as f:
+            pickle.dump(state, f)
+        
+        print(f"Checkpoint saved at step {self.training_step}")
+    
+    def load_checkpoint(self):
+        """Load learning progress from disk if checkpoint exists"""
+        if not os.path.exists(self.checkpoint_dir):
+            print("No checkpoint directory found, starting fresh")
+            return
+        
+        # Load autoencoder
+        autoencoder_path = os.path.join(self.checkpoint_dir, 'autoencoder.pth')
+        if os.path.exists(autoencoder_path):
+            checkpoint = torch.load(autoencoder_path, map_location=self.device)
+            self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Restore optimizer if it was saved
+            if checkpoint['optimizer_state_dict'] is not None:
+                if not hasattr(self, 'autoencoder_optimizer'):
+                    self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=1e-4)
+                self.autoencoder_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("Autoencoder checkpoint loaded")
+        
+        # Load predictors
+        predictor_files = [f for f in os.listdir(self.checkpoint_dir) if f.startswith('predictor_') and f.endswith('.pth')]
+        for predictor_file in sorted(predictor_files):
+            predictor_path = os.path.join(self.checkpoint_dir, predictor_file)
+            checkpoint = torch.load(predictor_path, map_location=self.device)
+            
+            # Find or create corresponding predictor
+            predictor_idx = int(predictor_file.split('_')[1].split('.')[0])
+            if predictor_idx < len(self.predictors):
+                predictor = self.predictors[predictor_idx]
+                if hasattr(predictor, 'load_state_dict') and checkpoint['model_state_dict']:
+                    predictor.load_state_dict(checkpoint['model_state_dict'])
+                
+                # Restore optimizer if it was saved
+                if checkpoint['optimizer_state_dict'] is not None:
+                    if not hasattr(predictor, 'optimizer'):
+                        predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-4)
+                    predictor.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Load learning progress and history
+        state_path = os.path.join(self.checkpoint_dir, 'state.pkl')
+        if os.path.exists(state_path):
+            with open(state_path, 'rb') as f:
+                state = pickle.load(f)
+            
+            self.training_step = state.get('training_step', 0)
+            self.predictor_training_step = state.get('predictor_training_step', 0)
+            self.action_count = state.get('action_count', 0)
+            self.lookahead = state.get('lookahead', 1)
+            self.frame_features_history = state.get('frame_features_history', [])
+            self.action_history = state.get('action_history', [])
+            self.prediction_buffer = state.get('prediction_buffer', [])
+            self.last_action_time = state.get('last_action_time', None)
+            
+            print(f"Learning progress loaded: {self.training_step} training steps, {self.action_count} actions")
     
     def to_model_tensor(self, frame_np):
         """Convert frame to properly scaled tensor for model input"""
@@ -105,7 +205,7 @@ class AdaptiveWorldModel:
                     "step": self.training_step
                 })
             
-            threshold = 0.0025  # Appropriate threshold for patch-MSE on [0,1] scale
+            threshold = 0.0022  # Appropriate threshold for patch-MSE on [0,1] scale
             if reconstruction_loss > threshold:
                 # Train autoencoder if reconstruction is poor
                 train_loss = self.train_autoencoder(current_frame)
@@ -114,6 +214,7 @@ class AdaptiveWorldModel:
                 if self.training_step % 10 == 0:
                     self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
                 self.training_step += 1
+                
                 
                 continue  # Skip action execution until reconstruction improves
             
@@ -423,8 +524,13 @@ class AdaptiveWorldModel:
                 "predictor_training_step": getattr(self, 'predictor_training_step', 0),
                 "step": self.training_step
             })
-            # Increment predictor training step counter
-            self.predictor_training_step = getattr(self, 'predictor_training_step', 0) + 1
+            
+        # Increment predictor training step counter
+        self.predictor_training_step = getattr(self, 'predictor_training_step', 0) + 1
+        
+        # Save checkpoint periodically based on predictor training steps
+        if self.predictor_training_step % self.save_interval == 0:
+            self.save_checkpoint()
     
     def train_autoencoder(self, ground_truth_frame):
         """Train only the autoencoder with masked reconstruction"""
