@@ -9,6 +9,7 @@ import torch
 import wandb
 import os
 import pickle
+import random
 from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
 from config import AdaptiveWorldModelConfig
 
@@ -545,18 +546,27 @@ class AdaptiveWorldModel:
         history_features, history_actions = self.get_prediction_context()
         history_features = [f.detach() for f in history_features]  # Detach history to prevent backprop through old encoder graphs
         
-        # Get fresh target features from current frame (this creates a new computational graph)
-        actual_tensor, _ = self.autoencoder.forward_encoder(current_frame_tensor, mask_ratio=0.0)
+        # Calculate target patches from actual frame (same as evaluation)
+        target_patches = self.patchify(current_frame_tensor)
         
         # Zero gradients for both predictor and autoencoder
         predictor.optimizer.zero_grad()
         self.autoencoder_optimizer.zero_grad()
         
         # Forward pass through predictor
-        predicted_tensor = predictor.forward(history_features, history_actions)
+        predicted_features = predictor.forward(history_features, history_actions)
         
-        # Calculate prediction loss
-        prediction_loss = torch.nn.functional.mse_loss(predicted_tensor, actual_tensor)
+        # Convert predicted features back to patches using decoder (same as evaluation)
+        # Create identity ids_restore since we're working with unmasked features
+        B, seq_len, _ = predicted_features.shape
+        L = seq_len - 1  # Remove CLS token count
+        ids_restore = torch.arange(L, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
+        
+        # Use decoder to convert features to patches
+        pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
+        
+        # Calculate prediction loss in patch space (same as evaluation)
+        prediction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches)
         
         # Backward pass - this will train both predictor and autoencoder!
         prediction_loss.backward()
@@ -591,8 +601,9 @@ class AdaptiveWorldModel:
         # Zero gradients
         self.autoencoder_optimizer.zero_grad()
         
-        # Forward pass with masking for reconstruction loss
-        pred_patches, latent = self.autoencoder(frame_tensor, mask_ratio=AdaptiveWorldModelConfig.MASK_RATIO)
+        # Forward pass with masking for reconstruction loss (randomized mask ratio)
+        mask_ratio = random.uniform(AdaptiveWorldModelConfig.MASK_RATIO_MIN, AdaptiveWorldModelConfig.MASK_RATIO_MAX)
+        pred_patches, latent = self.autoencoder(frame_tensor, mask_ratio=mask_ratio)
         
         # Calculate reconstruction loss
         target_patches = self.patchify(frame_tensor)
@@ -608,6 +619,7 @@ class AdaptiveWorldModel:
         if self.wandb_enabled:
             wandb.log({
                 "autoencoder_training_loss": train_loss_value,
+                "mask_ratio": mask_ratio,
                 "training_step": self.training_step
             })
         

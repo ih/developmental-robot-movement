@@ -19,7 +19,8 @@ class AdaptiveWorldModelConfig:
     # Training parameters
     AUTOENCODER_LR = 1e-4
     PREDICTOR_LR = 1e-4
-    MASK_RATIO = 0.75
+    MASK_RATIO_MIN = 0.3  # Minimum mask ratio for randomized masking
+    MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking
     
     # Logging and checkpointing
     LOG_INTERVAL = 10  # Log every N steps

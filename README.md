@@ -38,7 +38,9 @@ This repository contains research code for developmental robot movement with a m
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
+- **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for improved generalization
 - **TransformerActionConditionedPredictor**: Causal transformer that interleaves visual features with action tokens
+- **Reconstruction-based predictor training**: Predictor loss based on visual reconstruction quality, ensuring meaningful predictions
 - **Joint training architecture**: Autoencoder reconstruction loss + action predictor gradient flow with shared encoder
 - **Sequence length management**: Handles long histories (4096 token capacity with clipping for GPU safety)
 - **Quality gating**: Robot stops acting when reconstruction loss > threshold, focuses on vision training
@@ -182,9 +184,10 @@ The following metrics are automatically logged when wandb is enabled:
 **Vision System:**
 - **`reconstruction_loss`**: Quality of visual reconstruction (lower is better, logged periodically)
 - **`autoencoder_training_loss`**: Training loss during autoencoder updates
+- **`mask_ratio`**: Dynamic mask ratio used during autoencoder training (0.3-0.85 range)
 
 **Prediction System:**
-- **`predictor_training_loss`**: MSE loss between predicted and actual features
+- **`predictor_training_loss`**: Reconstruction loss based on predicted vs actual frame quality (patch-space MSE)
 - **`predictor_level`**: Which predictor level is being trained
 - **`predictor_training_step`**: Dedicated counter for predictor training iterations
 
