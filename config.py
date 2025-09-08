@@ -23,10 +23,11 @@ class AdaptiveWorldModelConfig:
     MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking
     
     # Logging and checkpointing
-    LOG_INTERVAL = 10  # Log every N steps
-    VISUALIZATION_UPLOAD_INTERVAL = 10  # Upload visualizations every N steps
-    CHECKPOINT_SAVE_INTERVAL = 10  # Save every N predictor training steps
-    DISPLAY_TRAINING_INTERVAL = 10  # Show training visualization every N steps
+    LOG_INTERVAL = 100  # Log every N steps
+    VISUALIZATION_UPLOAD_INTERVAL = 500  # Upload visualizations every N steps
+    CHECKPOINT_SAVE_INTERVAL = 100  # Save every N predictor training steps
+    DISPLAY_TRAINING_INTERVAL = 100  # Show training visualization every N steps
+    DISPLAY_INTERVAL = 10  # Update display every N main loop iterations
     
     # History management
     MAX_HISTORY_SIZE = 1000

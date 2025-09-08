@@ -75,6 +75,9 @@ class AdaptiveWorldModel:
         self.last_action_time = None
         self.action_count = 0
         
+        # Display counter for interval-based display updates
+        self.display_counter = 0
+        
         # Load checkpoint if it exists
         self.load_checkpoint()
     
@@ -102,6 +105,7 @@ class AdaptiveWorldModel:
             'training_step': self.training_step,
             'predictor_training_step': getattr(self, 'predictor_training_step', 0),
             'action_count': self.action_count,
+            'display_counter': self.display_counter,
             'lookahead': self.lookahead,
             'frame_features_history': self.frame_features_history[-history_limit:] if self.frame_features_history else [],
             'action_history': self.action_history[-history_limit:] if self.action_history else [],
@@ -161,6 +165,7 @@ class AdaptiveWorldModel:
             self.training_step = state.get('training_step', 0)
             self.predictor_training_step = state.get('predictor_training_step', 0)
             self.action_count = state.get('action_count', 0)
+            self.display_counter = state.get('display_counter', 0)
             self.lookahead = state.get('lookahead', 1)
             self.frame_features_history = state.get('frame_features_history', [])
             self.action_history = state.get('action_history', [])
@@ -215,8 +220,8 @@ class AdaptiveWorldModel:
                 train_loss = self.train_autoencoder(current_frame)
                 
                 # Show current and reconstructed frames while training (periodically)
-                if self.training_step % AdaptiveWorldModelConfig.DISPLAY_TRAINING_INTERVAL == 0:
-                    self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
+                # if self.training_step % AdaptiveWorldModelConfig.DISPLAY_TRAINING_INTERVAL == 0:
+                #     self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
                 self.training_step += 1
                 
                 
@@ -248,11 +253,14 @@ class AdaptiveWorldModel:
             # Step 4: Select action based on uncertainty maximization
             best_action, all_action_predictions = self.select_action_by_uncertainty(current_features)
             
-            # Display frames for visual feedback (always)
-            try:
-                self.display_frames(current_frame, decoded_frame, all_action_predictions)
-            except Exception as e:
-                print(f"Warning: Could not display frames: {e}", flush=True)
+            # Display frames for visual feedback (on interval, or always in interactive mode)
+            self.display_counter += 1
+            should_display = (self.display_counter % AdaptiveWorldModelConfig.DISPLAY_INTERVAL == 0) or self.interactive
+            if should_display:
+                try:
+                    self.display_frames(current_frame, decoded_frame, all_action_predictions, prediction_errors, reconstruction_loss)
+                except Exception as e:
+                    print(f"Warning: Could not display frames: {e}", flush=True)
             
             # Interactive mode: show information and get user input
             if self.interactive:
@@ -283,7 +291,7 @@ class AdaptiveWorldModel:
             
             # Step 6: Upload visualizations periodically
             if self.wandb_enabled and self.action_count % AdaptiveWorldModelConfig.VISUALIZATION_UPLOAD_INTERVAL == 0:
-                self.upload_visualizations_to_wandb(current_frame, decoded_frame, all_action_predictions)
+                self.upload_visualizations_to_wandb(current_frame, decoded_frame, all_action_predictions, prediction_errors, reconstruction_loss)
             
             # Step 7: Update history buffers
             self.frame_features_history.append(current_features.detach())
@@ -332,31 +340,32 @@ class AdaptiveWorldModel:
                 except:
                     print("Invalid input. Please try again.")
     
-    def display_frames(self, current_frame, decoded_frame, all_action_predictions):
-        """Display current frame, decoded frame, and predictions for all actions"""
-        # Calculate grid layout: current + decoded + all action predictions
+    def display_frames(self, current_frame, decoded_frame, all_action_predictions, prediction_errors=None, reconstruction_loss=None):
+        """Display current frame, decoded frame, last prediction, and all action predictions"""
+        # Calculate grid layout: current + decoded + last predicted (if available) + all action predictions
         total_predictions = sum(len(pred_data['predictions']) for pred_data in all_action_predictions)
-        num_cols = 2 + total_predictions  # current + decoded + all predictions
+        last_pred_cols = 1 if hasattr(self, 'last_predicted_frame') and self.last_predicted_frame is not None else 0
+        num_cols = 2 + last_pred_cols + total_predictions  # current + decoded + last pred + predictions
         
         # Create figure on first call or if layout changed
         if self.fig is None or len(self.axes) != num_cols:
             if self.fig is not None:
                 plt.close(self.fig)
             
-            self.fig, self.axes, _ = self._create_prediction_visualization_figure(current_frame, decoded_frame, all_action_predictions)
+            self.fig, self.axes, _ = self._create_prediction_visualization_figure(current_frame, decoded_frame, all_action_predictions, prediction_errors, reconstruction_loss)
             
             plt.ion()  # Turn on interactive mode
             plt.show(block=False)
         else:
             # Update existing figure using helper
-            self._populate_prediction_visualization_axes(self.axes, current_frame, decoded_frame, all_action_predictions)
+            self._populate_prediction_visualization_axes(self.axes, current_frame, decoded_frame, all_action_predictions, prediction_errors, reconstruction_loss)
             plt.tight_layout()
         
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
         plt.pause(0.01)  # Small pause to ensure rendering
     
-    def _populate_prediction_visualization_axes(self, axes, current_frame, decoded_frame, all_action_predictions):
+    def _populate_prediction_visualization_axes(self, axes, current_frame, decoded_frame, all_action_predictions, prediction_errors=None, reconstruction_loss=None):
         """Helper function to populate axes with prediction visualization content"""
         # Clear axes
         for ax in axes:
@@ -370,10 +379,29 @@ class AdaptiveWorldModel:
         axes[col_idx].set_title("Current Frame", fontsize=10)
         col_idx += 1
         
-        # Decoded frame
+        # Decoded frame with reconstruction loss above it
         axes[col_idx].imshow(decoded_frame)
-        axes[col_idx].set_title("Decoded Frame", fontsize=10)
+        if reconstruction_loss is not None:
+            title = f"Decoded Frame\nReconstruction Loss: {reconstruction_loss:.4f}"
+        else:
+            title = "Decoded Frame"
+        axes[col_idx].set_title(title, fontsize=10)
         col_idx += 1
+        
+        # Show last predicted frame with prediction error above it if available
+        if hasattr(self, 'last_predicted_frame') and self.last_predicted_frame is not None and col_idx < len(axes):
+            axes[col_idx].imshow(self.last_predicted_frame)
+            action_str = str(getattr(self, 'last_action', 'Unknown'))
+            
+            # Calculate prediction error for display
+            if prediction_errors and len(prediction_errors) > 0:
+                avg_error = np.mean(prediction_errors)
+                title = f"Last Prediction\n{action_str}\nPrediction Error: {avg_error:.4f}"
+            else:
+                title = f"Last Prediction\n{action_str}"
+            
+            axes[col_idx].set_title(title, fontsize=10)
+            col_idx += 1
         
         # Predictions for each action
         for action_data in all_action_predictions:
@@ -400,11 +428,12 @@ class AdaptiveWorldModel:
                     
                     col_idx += 1
     
-    def _create_prediction_visualization_figure(self, current_frame, decoded_frame, all_action_predictions):
+    def _create_prediction_visualization_figure(self, current_frame, decoded_frame, all_action_predictions, prediction_errors=None, reconstruction_loss=None):
         """Helper function to create a figure with current frame, decoded frame, and predictions"""
-        # Calculate grid layout: current + decoded + all action predictions
+        # Calculate grid layout: current + decoded + last predicted (if available) + all action predictions
         total_predictions = sum(len(pred_data['predictions']) for pred_data in all_action_predictions)
-        num_cols = 2 + total_predictions  # current + decoded + all predictions
+        last_pred_cols = 1 if hasattr(self, 'last_predicted_frame') and self.last_predicted_frame is not None else 0
+        num_cols = 2 + last_pred_cols + total_predictions  # current + decoded + last pred + predictions
         
         # Create figure
         fig, axes = plt.subplots(1, num_cols, figsize=(3*num_cols, 4))
@@ -413,19 +442,19 @@ class AdaptiveWorldModel:
             axes = [axes]
         
         # Populate axes using helper
-        self._populate_prediction_visualization_axes(axes, current_frame, decoded_frame, all_action_predictions)
+        self._populate_prediction_visualization_axes(axes, current_frame, decoded_frame, all_action_predictions, prediction_errors, reconstruction_loss)
         
         plt.tight_layout()
         return fig, axes, num_cols
     
-    def upload_visualizations_to_wandb(self, current_frame, decoded_frame, all_action_predictions):
+    def upload_visualizations_to_wandb(self, current_frame, decoded_frame, all_action_predictions, prediction_errors=None, reconstruction_loss=None):
         """Upload current visualizations to wandb for remote monitoring"""
         if not self.wandb_enabled:
             return
         
         try:
             # Create visualization figure using helper
-            fig, axes, num_cols = self._create_prediction_visualization_figure(current_frame, decoded_frame, all_action_predictions)
+            fig, axes, num_cols = self._create_prediction_visualization_figure(current_frame, decoded_frame, all_action_predictions, prediction_errors, reconstruction_loss)
             
             # Upload to wandb
             wandb.log({
@@ -713,11 +742,36 @@ class AdaptiveWorldModel:
         history_features, history_actions = self.get_prediction_context()
         history_actions.append(action)
         
-        for predictor in self.predictors:
+        # Store the predicted frame for the first predictor (level 0) for visualization
+        self.last_predicted_frame = None
+        self.last_action = action
+        
+        for level, predictor in enumerate(self.predictors):
             prediction = predictor.forward(
                 history_features,
                 history_actions
             ).detach()
+            
+            # Generate predicted frame for visualization (store the first predictor's prediction)
+            if level == 0:
+                with torch.no_grad():
+                    # Convert features to tensor and use forward_decoder
+                    if isinstance(prediction, np.ndarray):
+                        features_tensor = torch.from_numpy(prediction).unsqueeze(0).float().to(self.device)
+                    else:
+                        features_tensor = prediction.unsqueeze(0).to(self.device) if len(prediction.shape) == 1 else prediction.to(self.device)
+                    
+                    # Create identity ids_restore for unmasked features
+                    B, seq_len, _ = features_tensor.shape
+                    L = seq_len - 1  # Remove CLS token count
+                    ids_restore = torch.arange(L, device=features_tensor.device).unsqueeze(0).repeat(B, 1)
+                    
+                    # Use forward_decoder to get patches then unpatchify
+                    pred_patches = self.autoencoder.forward_decoder(features_tensor, ids_restore)
+                    decoded_tensor = self.autoencoder.unpatchify(pred_patches)
+                    pred_frame = decoded_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+                    self.last_predicted_frame = np.clip(pred_frame, 0, 1)  # Clip to valid range for display
+            
             self.prediction_buffer.append({
                 'prediction': prediction,
                 'level': predictor.level,
