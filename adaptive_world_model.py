@@ -289,6 +289,9 @@ class AdaptiveWorldModel:
             self.action_count += 1
             self.make_predictions(current_features, action_to_execute)
             
+            # Add delay between actions
+            time.sleep(AdaptiveWorldModelConfig.ACTION_DELAY)
+            
             # Step 6: Upload visualizations periodically
             if self.wandb_enabled and self.action_count % AdaptiveWorldModelConfig.VISUALIZATION_UPLOAD_INTERVAL == 0:
                 self.upload_visualizations_to_wandb(current_frame, decoded_frame, all_action_predictions, prediction_errors, reconstruction_loss)

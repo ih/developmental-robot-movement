@@ -24,12 +24,15 @@ class AdaptiveWorldModelConfig:
     
     # Logging and checkpointing
     LOG_INTERVAL = 100  # Log every N steps
-    VISUALIZATION_UPLOAD_INTERVAL = 500  # Upload visualizations every N steps
-    CHECKPOINT_SAVE_INTERVAL = 100  # Save every N predictor training steps
-    DISPLAY_TRAINING_INTERVAL = 100  # Show training visualization every N steps
+    VISUALIZATION_UPLOAD_INTERVAL = 1000  # Upload visualizations every N steps
+    CHECKPOINT_SAVE_INTERVAL = 500  # Save every N predictor training steps
+    DISPLAY_TRAINING_INTERVAL = 200  # Show training visualization every N steps
     DISPLAY_INTERVAL = 10  # Update display every N main loop iterations
     
     # History management
     MAX_HISTORY_SIZE = 1000
     CHECKPOINT_HISTORY_LIMIT = 100
+    
+    # Action execution
+    ACTION_DELAY = 0.1  # Delay in seconds between actions
 

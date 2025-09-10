@@ -58,6 +58,7 @@ This repository contains research code for developmental robot movement with a m
 - **config.py**: Contains image transforms, constants, and adaptive world model parameters
 - **AdaptiveWorldModelConfig class**: Centralized configuration for all model parameters
 - **Configurable intervals**: Logging frequency, visualization uploads, checkpoint saving, and display intervals
+- **Action timing**: Configurable delay between actions via `ACTION_DELAY` parameter (default 0.1 seconds)
 - **IP addresses**: JetBot connection IPs specified in integration example (modify as needed)
 
 ## Running the Code
