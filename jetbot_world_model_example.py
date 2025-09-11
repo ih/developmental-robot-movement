@@ -29,7 +29,8 @@ def main():
     
     # Create world model with JetBot interface (with wandb logging and checkpoints)
     logger.info("Initializing AdaptiveWorldModel...")
-    world_model = AdaptiveWorldModel(jetbot, interactive=False, wandb_project="jetbot-developmental-movement", checkpoint_dir=CHECKPOINT_DIR)
+    # jetbot-developmental-movement
+    world_model = AdaptiveWorldModel(jetbot, interactive=False, wandb_project="", checkpoint_dir=CHECKPOINT_DIR)
     
     try:
         logger.info("Starting world model main loop...")
@@ -40,8 +41,8 @@ def main():
         logger.info("Stopped by user")
     
     finally:
-        logger.info("Saving final checkpoint...")
-        world_model.save_checkpoint()
+        logger.info("Saving final checkpoint (manual save)...")
+        world_model.save_checkpoint(manual_save=True)
         logger.info("Cleaning up...")
         jetbot.cleanup()
         # Clean up wandb run

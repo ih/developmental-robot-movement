@@ -10,6 +10,7 @@ import wandb
 import os
 import pickle
 import random
+import signal
 from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
 from config import AdaptiveWorldModelConfig
 
@@ -81,15 +82,18 @@ class AdaptiveWorldModel:
         # Load checkpoint if it exists
         self.load_checkpoint()
     
-    def save_checkpoint(self):
+    def save_checkpoint(self, manual_save=False):
         """Save current learning progress to disk"""
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # Use different file names for manual saves
+        suffix = "_manual" if manual_save else ""
         
         # Save autoencoder model and optimizer
         torch.save({
             'model_state_dict': self.autoencoder.state_dict(),
             'optimizer_state_dict': getattr(self, 'autoencoder_optimizer', {}).state_dict() if hasattr(self, 'autoencoder_optimizer') else None,
-        }, os.path.join(self.checkpoint_dir, 'autoencoder.pth'))
+        }, os.path.join(self.checkpoint_dir, f'autoencoder{suffix}.pth'))
         
         # Save predictors
         for i, predictor in enumerate(self.predictors):
@@ -97,7 +101,7 @@ class AdaptiveWorldModel:
                 'model_state_dict': predictor.state_dict() if hasattr(predictor, 'state_dict') else {},
                 'optimizer_state_dict': getattr(predictor, 'optimizer', {}).state_dict() if hasattr(predictor, 'optimizer') else None,
                 'level': predictor.level,
-            }, os.path.join(self.checkpoint_dir, f'predictor_{i}.pth'))
+            }, os.path.join(self.checkpoint_dir, f'predictor_{i}{suffix}.pth'))
         
         # Save learning progress and history (keep only recent history to avoid huge files)
         history_limit = AdaptiveWorldModelConfig.CHECKPOINT_HISTORY_LIMIT
@@ -113,10 +117,11 @@ class AdaptiveWorldModel:
             'last_action_time': self.last_action_time,
         }
         
-        with open(os.path.join(self.checkpoint_dir, 'state.pkl'), 'wb') as f:
+        with open(os.path.join(self.checkpoint_dir, f'state{suffix}.pkl'), 'wb') as f:
             pickle.dump(state, f)
         
-        print(f"Checkpoint saved at step {self.training_step}")
+        save_type = "manual" if manual_save else "auto"
+        print(f"Checkpoint saved ({save_type}) at step {self.training_step}")
     
     def load_checkpoint(self):
         """Load learning progress from disk if checkpoint exists"""
@@ -124,8 +129,23 @@ class AdaptiveWorldModel:
             print("No checkpoint directory found, starting fresh")
             return
         
+        # Check for manual save files first, then fall back to auto saves
+        manual_autoencoder_path = os.path.join(self.checkpoint_dir, 'autoencoder_manual.pth')
+        auto_autoencoder_path = os.path.join(self.checkpoint_dir, 'autoencoder.pth')
+        
+        if os.path.exists(manual_autoencoder_path):
+            autoencoder_path = manual_autoencoder_path
+            suffix = "_manual"
+            print("Loading from manual save files...")
+        elif os.path.exists(auto_autoencoder_path):
+            autoencoder_path = auto_autoencoder_path
+            suffix = ""
+            print("Loading from auto save files...")
+        else:
+            print("No autoencoder checkpoint found")
+            return
+        
         # Load autoencoder
-        autoencoder_path = os.path.join(self.checkpoint_dir, 'autoencoder.pth')
         if os.path.exists(autoencoder_path):
             checkpoint = torch.load(autoencoder_path, map_location=self.device)
             self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
@@ -137,14 +157,17 @@ class AdaptiveWorldModel:
                 self.autoencoder_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print("Autoencoder checkpoint loaded")
         
-        # Load predictors
-        predictor_files = [f for f in os.listdir(self.checkpoint_dir) if f.startswith('predictor_') and f.endswith('.pth')]
+        # Load predictors (using the same suffix as autoencoder)
+        predictor_pattern = f'predictor_*{suffix}.pth'
+        predictor_files = [f for f in os.listdir(self.checkpoint_dir) if f.startswith('predictor_') and f.endswith(f'{suffix}.pth')]
         for predictor_file in sorted(predictor_files):
             predictor_path = os.path.join(self.checkpoint_dir, predictor_file)
             checkpoint = torch.load(predictor_path, map_location=self.device)
             
             # Find or create corresponding predictor
-            predictor_idx = int(predictor_file.split('_')[1].split('.')[0])
+            # Extract index from filename like 'predictor_0_manual.pth' or 'predictor_0.pth'
+            file_parts = predictor_file.replace(suffix, '').split('_')
+            predictor_idx = int(file_parts[1].split('.')[0])
             if predictor_idx < len(self.predictors):
                 predictor = self.predictors[predictor_idx]
                 if hasattr(predictor, 'load_state_dict') and checkpoint['model_state_dict']:
@@ -156,8 +179,8 @@ class AdaptiveWorldModel:
                         predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-4)
                     predictor.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
-        # Load learning progress and history
-        state_path = os.path.join(self.checkpoint_dir, 'state.pkl')
+        # Load learning progress and history (using the same suffix)
+        state_path = os.path.join(self.checkpoint_dir, f'state{suffix}.pkl')
         if os.path.exists(state_path):
             with open(state_path, 'rb') as f:
                 state = pickle.load(f)

@@ -208,15 +208,22 @@ The following metrics are automatically logged when wandb is enabled:
 
 ## Learning Progress Persistence
 
-The system automatically saves and loads learning progress to enable continuous training across sessions.
+The system automatically saves and loads learning progress to enable continuous training across sessions with a dual save system for maximum reliability.
 
 ### Features
 
-- **Automatic checkpointing**: Model weights, optimizers, and training progress saved periodically
-- **Resume training**: Automatically loads existing checkpoints on startup
+- **Dual save system**: Automatic periodic saves during training + manual saves on program exit
+- **Automatic checkpointing**: Model weights, optimizers, and training progress saved periodically with standard filenames
+- **Manual saves**: On program exit (Ctrl+C), saves to files with `_manual` suffix for safe restart
+- **Smart loading**: On startup, prioritizes manual save files over automatic saves for best recovery
+- **Resume training**: Automatically loads existing checkpoints on startup (manual saves first, then auto saves)
 - **Configurable directory**: Set checkpoint location via `checkpoint_dir` parameter
-- **Periodic saves**: Checkpoints saved every 10 predictor training steps
-- **Final save**: Checkpoint automatically saved when program exits
+- **Periodic saves**: Checkpoints saved every 500 predictor training steps (configurable)
+
+### File Naming Convention
+
+- **Auto saves**: `autoencoder.pth`, `predictor_0.pth`, `state.pkl`
+- **Manual saves**: `autoencoder_manual.pth`, `predictor_0_manual.pth`, `state_manual.pkl`
 
 ### Saved Components
 
