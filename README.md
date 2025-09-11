@@ -50,9 +50,11 @@ This repository contains research code for developmental robot movement with a m
 
 ### Action Space
 - **Duration-based actions**: Motor commands with automatic stopping after specified duration
-- **Simplified action space**: Single motor control with motor_left values {-0.2, 0, 0.2} = 3 total actions (motor_right always 0)
-- **Format**: `{'motor_left': value, 'motor_right': 0, 'duration': 0.1}`
-- **Automatic stopping**: Motors automatically set to 0 after duration expires
+- **Simplified action space**: Single motor control with motor_right values {0, 0.1} = 2 total actions (motor_left always 0)
+- **Forward-only movement**: Gentler gearbox operation with stop and forward-only commands
+- **Format**: `{'motor_left': 0, 'motor_right': value, 'duration': 0.2}`
+- **Smooth ramping**: Gradual acceleration/deceleration for gearbox protection
+- **Automatic stopping**: Motors automatically ramp down to 0 after duration expires
 
 ### Configuration
 - **config.py**: Contains image transforms, constants, and adaptive world model parameters

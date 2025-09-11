@@ -29,8 +29,8 @@ def main():
     
     # Create world model with JetBot interface (with wandb logging and checkpoints)
     logger.info("Initializing AdaptiveWorldModel...")
-    # jetbot-developmental-movement
-    world_model = AdaptiveWorldModel(jetbot, interactive=False, wandb_project="", checkpoint_dir=CHECKPOINT_DIR)
+    
+    world_model = AdaptiveWorldModel(jetbot, interactive=False, wandb_project="jetbot-developmental-movement", checkpoint_dir=CHECKPOINT_DIR)
     
     try:
         logger.info("Starting world model main loop...")

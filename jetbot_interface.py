@@ -21,14 +21,19 @@ class JetBotInterface(RobotInterface):
         """
         self.jetbot = RemoteJetBot(ip_address, port)
         
+        # Track current motor speeds for smooth ramping
+        self.current_left_speed = 0.0
+        self.current_right_speed = 0.0
+        
         # Define action space (single motor only for simplified learning)
-        motor_values = [-0.2, 0, 0.2]
-        duration = 0.1  # Fixed duration in seconds
+        # Forward-only movement for gentler gearbox operation
+        motor_values = [0, 0.1]  # Stop and forward only
+        duration = 0.2  # Increased duration for smoother motion
         self._action_space = []
-        for left in motor_values:
+        for right in motor_values:
             self._action_space.append({
-                'motor_left': left, 
-                'motor_right': 0,  # Keep right motor at 0
+                'motor_left': 0,  # Keep left motor at 0
+                'motor_right': right,
                 'duration': duration
             })
     
@@ -49,8 +54,30 @@ class JetBotInterface(RobotInterface):
             logger.error(f"Failed to get observation: {e}")
             return None
     
+    def _ramp_motors(self, target_left: float, target_right: float, steps: int = 4, step_delay: float = 0.015) -> None:
+        """Gradually ramp motors from current speeds to target speeds.
+        
+        Args:
+            target_left: Target speed for left motor (-1.0 to 1.0)
+            target_right: Target speed for right motor (-1.0 to 1.0)
+            steps: Number of intermediate steps for ramping
+            step_delay: Delay between each step in seconds
+        """
+        for i in range(1, steps + 1):
+            # Calculate intermediate speeds using linear interpolation
+            intermediate_left = self.current_left_speed + (target_left - self.current_left_speed) * (i / steps)
+            intermediate_right = self.current_right_speed + (target_right - self.current_right_speed) * (i / steps)
+            
+            # Set motors to intermediate speeds
+            self.jetbot.set_motors(intermediate_left, intermediate_right)
+            time.sleep(step_delay)
+        
+        # Update current speeds
+        self.current_left_speed = target_left
+        self.current_right_speed = target_right
+    
     def execute_action(self, action: Dict[str, Any]) -> bool:
-        """Execute motor action on JetBot with duration.
+        """Execute motor action on JetBot with smooth ramping for gearbox protection.
         
         Args:
             action: Dictionary with 'motor_left', 'motor_right', and 'duration' keys
@@ -59,19 +86,23 @@ class JetBotInterface(RobotInterface):
             bool: True if action executed successfully, False otherwise
         """
         try:
-            left_speed = action.get('motor_left', 0)
-            right_speed = action.get('motor_right', 0)
-            duration = action.get('duration', 0.1)
+            target_left = action.get('motor_left', 0)
+            target_right = action.get('motor_right', 0)
+            duration = action.get('duration', 0.2)
             
-            # Set motors to specified speeds
-            self.jetbot.set_motors(left_speed, right_speed)
-            logger.debug(f"Executing action {action}: left={left_speed}, right={right_speed} for {duration}s")
+            logger.debug(f"Executing action {action}: left={target_left}, right={target_right} for {duration}s")
             
-            # Wait for specified duration
-            time.sleep(duration)
+            # Gradually ramp to target speeds (gearbox-friendly)
+            self._ramp_motors(target_left, target_right)
             
-            # Stop motors
-            self.jetbot.set_motors(0, 0)
+            # Hold at target speeds for remaining duration
+            # (subtract ramping time: 4 steps * 0.015s = 0.06s)
+            hold_duration = max(0, duration - 0.06)
+            if hold_duration > 0:
+                time.sleep(hold_duration)
+            
+            # Gradually ramp down to stop (gearbox-friendly)
+            self._ramp_motors(0, 0)
             
             return True
             
@@ -85,12 +116,16 @@ class JetBotInterface(RobotInterface):
         
         Returns:
             List of action dictionaries with 'motor_left' and 'motor_right' keys
+            (motor_left always 0, motor_right values: 0=stop, 0.1=forward)
+            Total actions: 2 (stop, forward)
         """
         return self._action_space.copy()
     
     def cleanup(self) -> None:
-        """Clean up JetBot connection and stop motors."""
+        """Clean up JetBot connection and stop motors gently."""
         try:
+            # Gently stop motors with ramping
+            self._ramp_motors(0, 0)
             self.jetbot.cleanup()
             logger.info("JetBot interface cleaned up successfully")
         except Exception as e:
