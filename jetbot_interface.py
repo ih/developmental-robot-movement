@@ -27,7 +27,7 @@ class JetBotInterface(RobotInterface):
         
         # Define action space (single motor only for simplified learning)
         # Forward-only movement for gentler gearbox operation
-        motor_values = [0, 0.1]  # Stop and forward only
+        motor_values = [0, 0.12]  # Stop and forward only
         duration = 0.2  # Increased duration for smoother motion
         self._action_space = []
         for right in motor_values:

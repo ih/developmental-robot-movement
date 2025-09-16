@@ -28,7 +28,10 @@ class TransformerActionConditionedPredictor(nn.Module):
         self.position_embedding = nn.Embedding(max_sequence_length, embed_dim)
         
         # Token type embeddings (to distinguish encoder features from action tokens)
-        self.token_type_embedding = nn.Embedding(2, embed_dim)  # 0: encoder features, 1: Action
+        self.token_type_embedding = nn.Embedding(3, embed_dim)  # 0: encoder features, 1: Action, 2: future query
+        
+        # Future query slots for predicting next frame
+        self.future_query = nn.Parameter(torch.randn(1, 1, embed_dim) * 1e-2)
         
         # Transformer layers with causal attention
         self.transformer_layers = nn.ModuleList([
@@ -113,6 +116,12 @@ class TransformerActionConditionedPredictor(nn.Module):
                 sequence.append(action_embeds)
                 token_types.append(1)  # Action token type
         
+        # Add future query slots after the last action
+        future_slots = self.future_query.expand(batch_size, num_patches_plus_one, -1)
+        for j in range(num_patches_plus_one):
+            sequence.append(future_slots[:, j, :])
+            token_types.append(2)  # Future query token type
+        
         # Stack into sequence tensor
         sequence_tensor = torch.stack(sequence, dim=1)  # [B, seq_len, D]
         seq_len = sequence_tensor.shape[1]
@@ -146,9 +155,9 @@ class TransformerActionConditionedPredictor(nn.Module):
         
         x = self.layer_norm(x)
         
-        # Predict next encoder features from the last num_patches_plus_one positions
-        last_features = x[:, -num_patches_plus_one:, :]  # [batch_size, num_patches+1, embed_dim]
-        predicted_features = self.output_head(last_features)
+        # Get predictions from the future query slots (the final N positions)
+        pred_tokens = x[:, -num_patches_plus_one:, :]  # [batch_size, num_patches+1, embed_dim]
+        predicted_features = self.output_head(pred_tokens)
         
         return predicted_features
     

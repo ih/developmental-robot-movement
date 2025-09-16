@@ -50,7 +50,7 @@ This repository contains research code for developmental robot movement with a m
 
 ### Action Space
 - **Duration-based actions**: Motor commands with automatic stopping after specified duration
-- **Simplified action space**: Single motor control with motor_right values {0, 0.1} = 2 total actions (motor_left always 0)
+- **Simplified action space**: Single motor control with motor_right values {0, 0.12} = 2 total actions (motor_left always 0)
 - **Forward-only movement**: Gentler gearbox operation with stop and forward-only commands
 - **Format**: `{'motor_left': 0, 'motor_right': value, 'duration': 0.2}`
 - **Smooth ramping**: Gradual acceleration/deceleration for gearbox protection
@@ -83,6 +83,7 @@ python jetbot_world_model_example.py
 - Press Enter to continue with proposed action, type custom action dict, or 'stop' to exit
 - **Automatic checkpoint saving**: Learning progress saved every 10 predictor training steps
 - **Resume learning**: Automatically loads previous training progress on restart
+- **Connection error handling**: Gracefully quits with error message if JetBot becomes unreachable (e.g., battery runs out)
 
 ### World Model Testing (No Robot)
 ```bash
@@ -193,6 +194,10 @@ The following metrics are automatically logged when wandb is enabled:
 - **`predictor_training_loss`**: Reconstruction loss based on predicted vs actual frame quality (patch-space MSE)
 - **`predictor_level`**: Which predictor level is being trained
 - **`predictor_training_step`**: Dedicated counter for predictor training iterations
+- **`predictor_grad_norm`**: Gradient norm for monitoring training dynamics
+- **`predictor_lr`**: Current learning rate of the predictor optimizer
+- **`predictor_update_to_weight_ratio`**: Ratio of update magnitude to parameter magnitude for stability monitoring
+- **`history_length`**: Size of the frame features history buffer
 
 **Performance Metrics:**
 - **`time_between_actions`**: Duration in seconds between consecutive actions (logged periodically)

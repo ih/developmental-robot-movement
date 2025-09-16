@@ -209,9 +209,13 @@ class AdaptiveWorldModel:
     def main_loop(self):
         while True:
             # Step 1: Capture and encode current frame using the interface
-            current_frame = self.robot.get_observation()
-            if current_frame is None:
-                continue  # Skip this iteration if observation failed
+            try:
+                current_frame = self.robot.get_observation()
+                if current_frame is None:
+                    continue  # Skip this iteration if observation failed
+            except Exception as e:
+                print(f"Problem connecting to JetBot, quitting: {e}")
+                break
             
             # Convert to properly scaled tensor [1, 3, H, W]
             frame_tensor = self.to_model_tensor(current_frame)
@@ -307,7 +311,11 @@ class AdaptiveWorldModel:
                         "step": self.training_step
                     })
             
-            self.robot.execute_action(action_to_execute)
+            try:
+                self.robot.execute_action(action_to_execute)
+            except Exception as e:
+                print(f"Problem connecting to JetBot, quitting: {e}")
+                break
             self.last_action_time = current_time
             self.action_count += 1
             self.make_predictions(current_features, action_to_execute)
@@ -625,16 +633,41 @@ class AdaptiveWorldModel:
         
         # Backward pass - this will train both predictor and autoencoder!
         prediction_loss.backward()
+
+        # Log gradient norms
+        grad_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), float('inf'))
+
+        # Calculate update-to-weight ratio before stepping
+        total_param_norm = 0.0
+        total_update_norm = 0.0
+        for param in predictor.parameters():
+            if param.grad is not None:
+                param_norm = param.data.norm().item()
+                grad_norm_param = param.grad.data.norm().item()
+                lr = predictor.optimizer.param_groups[0]['lr']
+                update_norm = lr * grad_norm_param
+
+                total_param_norm += param_norm ** 2
+                total_update_norm += update_norm ** 2
+
+        total_param_norm = total_param_norm ** 0.5
+        total_update_norm = total_update_norm ** 0.5
+        update_to_weight_ratio = total_update_norm / (total_param_norm + 1e-8)
+
         predictor.optimizer.step()
         self.autoencoder_optimizer.step()
-                
+
         # Log predictor training metrics to wandb
         if self.wandb_enabled:
             wandb.log({
                 "predictor_training_loss": prediction_loss.item(),
                 "predictor_level": level,
                 "predictor_training_step": getattr(self, 'predictor_training_step', 0),
-                "step": self.training_step
+                "step": self.training_step,
+                "predictor_grad_norm": grad_norm,
+                "predictor_lr": predictor.optimizer.param_groups[0]['lr'],
+                "history_length": len(self.frame_features_history),
+                "predictor_update_to_weight_ratio": update_to_weight_ratio,
             })
             
         # Increment predictor training step counter
