@@ -39,20 +39,16 @@ class JetBotInterface(RobotInterface):
     
     def get_observation(self) -> Optional[np.ndarray]:
         """Capture current frame from JetBot camera.
-        
+
         Returns:
             np.ndarray: Camera frame in RGB format (H, W, 3) or None if capture fails
         """
-        try:
-            frame = self.jetbot.get_frame()
-            if frame is not None:
-                # Convert BGR to RGB for consistency with world model
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                return frame_rgb
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get observation: {e}")
-            return None
+        frame = self.jetbot.get_frame()
+        if frame is not None:
+            # Convert BGR to RGB for consistency with world model
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return frame_rgb
+        return None
     
     def _ramp_motors(self, target_left: float, target_right: float, steps: int = 4, step_delay: float = 0.015) -> None:
         """Gradually ramp motors from current speeds to target speeds.

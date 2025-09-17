@@ -75,7 +75,7 @@ class RemoteJetBot:
 
         except Exception as e:
             logger.error(f"Error getting frame: {str(e)}")
-            return None
+            raise
 
     def set_motors(self, left_speed, right_speed):
         try:

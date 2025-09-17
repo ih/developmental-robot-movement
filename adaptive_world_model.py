@@ -15,13 +15,17 @@ from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
 from config import AdaptiveWorldModelConfig
 
 class AdaptiveWorldModel:
-    def __init__(self, robot_interface, interactive=False, wandb_project=None, checkpoint_dir="checkpoints"):
+    def __init__(self, robot_interface, interactive=False, wandb_project=None, checkpoint_dir="checkpoints", autoencoder_lr=None, predictor_lr=None):
         # Store the robot interface
         self.robot = robot_interface
-        
+
         # Checkpoint management
         self.checkpoint_dir = checkpoint_dir
         self.save_interval = AdaptiveWorldModelConfig.CHECKPOINT_SAVE_INTERVAL
+
+        # Store explicit learning rates for potential override
+        self.explicit_autoencoder_lr = autoencoder_lr
+        self.explicit_predictor_lr = predictor_lr
         
         # Device setup - use GPU if available
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -81,6 +85,22 @@ class AdaptiveWorldModel:
         
         # Load checkpoint if it exists
         self.load_checkpoint()
+
+    def _get_autoencoder_lr(self):
+        """Get autoencoder learning rate using hierarchy: explicit > saved optimizer > config"""
+        if self.explicit_autoencoder_lr is not None:
+            return self.explicit_autoencoder_lr
+        elif hasattr(self, 'autoencoder_optimizer') and self.autoencoder_optimizer is not None:
+            return self.autoencoder_optimizer.param_groups[0]['lr']
+        else:
+            return AdaptiveWorldModelConfig.AUTOENCODER_LR
+
+    def _get_predictor_lr(self):
+        """Get predictor learning rate using hierarchy: explicit > saved optimizer > config"""
+        if self.explicit_predictor_lr is not None:
+            return self.explicit_predictor_lr
+        else:
+            return AdaptiveWorldModelConfig.PREDICTOR_LR
     
     def save_checkpoint(self, manual_save=False):
         """Save current learning progress to disk"""
@@ -150,11 +170,20 @@ class AdaptiveWorldModel:
             checkpoint = torch.load(autoencoder_path, map_location=self.device)
             self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
             
-            # Restore optimizer if it was saved
+            # Restore optimizer (respecting explicit learning rate overrides)
             if checkpoint['optimizer_state_dict'] is not None:
                 if not hasattr(self, 'autoencoder_optimizer'):
-                    self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=1e-4)
-                self.autoencoder_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    lr = self._get_autoencoder_lr()
+                    self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=lr)
+
+                if self.explicit_autoencoder_lr is None:
+                    # Use saved optimizer state if no explicit override
+                    self.autoencoder_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                else:
+                    # Override learning rate but keep other optimizer state
+                    print(f"Overriding autoencoder learning rate to {self.explicit_autoencoder_lr}")
+                    for param_group in self.autoencoder_optimizer.param_groups:
+                        param_group['lr'] = self.explicit_autoencoder_lr
             print("Autoencoder checkpoint loaded")
         
         # Load predictors (using the same suffix as autoencoder)
@@ -173,11 +202,20 @@ class AdaptiveWorldModel:
                 if hasattr(predictor, 'load_state_dict') and checkpoint['model_state_dict']:
                     predictor.load_state_dict(checkpoint['model_state_dict'])
                 
-                # Restore optimizer if it was saved
+                # Restore optimizer (respecting explicit learning rate overrides)
                 if checkpoint['optimizer_state_dict'] is not None:
                     if not hasattr(predictor, 'optimizer'):
-                        predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-4)
-                    predictor.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        lr = self._get_predictor_lr()
+                        predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=lr)
+
+                    if self.explicit_predictor_lr is None:
+                        # Use saved optimizer state if no explicit override
+                        predictor.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    else:
+                        # Override learning rate but keep other optimizer state
+                        print(f"Overriding predictor learning rate to {self.explicit_predictor_lr}")
+                        for param_group in predictor.optimizer.param_groups:
+                            param_group['lr'] = self.explicit_predictor_lr
         
         # Load learning progress and history (using the same suffix)
         state_path = os.path.join(self.checkpoint_dir, f'state{suffix}.pkl')
@@ -209,13 +247,9 @@ class AdaptiveWorldModel:
     def main_loop(self):
         while True:
             # Step 1: Capture and encode current frame using the interface
-            try:
-                current_frame = self.robot.get_observation()
-                if current_frame is None:
-                    continue  # Skip this iteration if observation failed
-            except Exception as e:
-                print(f"Problem connecting to JetBot, quitting: {e}")
-                break
+            current_frame = self.robot.get_observation()
+            if current_frame is None:
+                continue  # Skip this iteration if observation failed
             
             # Convert to properly scaled tensor [1, 3, H, W]
             frame_tensor = self.to_model_tensor(current_frame)
@@ -311,11 +345,7 @@ class AdaptiveWorldModel:
                         "step": self.training_step
                     })
             
-            try:
-                self.robot.execute_action(action_to_execute)
-            except Exception as e:
-                print(f"Problem connecting to JetBot, quitting: {e}")
-                break
+            self.robot.execute_action(action_to_execute)
             self.last_action_time = current_time
             self.action_count += 1
             self.make_predictions(current_features, action_to_execute)
@@ -599,11 +629,11 @@ class AdaptiveWorldModel:
         
         # Initialize predictor optimizer if not exists
         if not hasattr(predictor, 'optimizer'):
-            predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=AdaptiveWorldModelConfig.PREDICTOR_LR)
-        
+            predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=self._get_predictor_lr())
+
         # Initialize autoencoder optimizer for joint training
         if not hasattr(self, 'autoencoder_optimizer'):
-            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=AdaptiveWorldModelConfig.AUTOENCODER_LR)
+            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=self._get_autoencoder_lr())
         
         # Get appropriate history window
         history_features, history_actions = self.get_prediction_context()
@@ -634,32 +664,60 @@ class AdaptiveWorldModel:
         # Backward pass - this will train both predictor and autoencoder!
         prediction_loss.backward()
 
-        # Log gradient norms
+        # Log gradient norms (global and per-layer)
         grad_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), float('inf'))
 
-        # Calculate update-to-weight ratio before stepping
-        total_param_norm = 0.0
-        total_update_norm = 0.0
-        for param in predictor.parameters():
+        # Per-layer gradient norms for better insight
+        layer_grad_stats = {}
+        for name, param in predictor.named_parameters():
             if param.grad is not None:
-                param_norm = param.data.norm().item()
-                grad_norm_param = param.grad.data.norm().item()
-                lr = predictor.optimizer.param_groups[0]['lr']
-                update_norm = lr * grad_norm_param
+                grad_norms = param.grad.data.abs().flatten()
+                layer_name = name.split('.')[0]  # Get base layer name (e.g., 'transformer_layers' from 'transformer_layers.0.weight')
 
-                total_param_norm += param_norm ** 2
-                total_update_norm += update_norm ** 2
+                if layer_name not in layer_grad_stats:
+                    layer_grad_stats[layer_name] = []
+                layer_grad_stats[layer_name].extend(grad_norms.tolist())
 
-        total_param_norm = total_param_norm ** 0.5
-        total_update_norm = total_update_norm ** 0.5
-        update_to_weight_ratio = total_update_norm / (total_param_norm + 1e-8)
+        # Calculate median and mean for each layer
+        layer_medians = {}
+        layer_means = {}
+        for layer_name, grad_values in layer_grad_stats.items():
+            if grad_values:
+                grad_tensor = torch.tensor(grad_values)
+                layer_medians[f"grad_norms/median/{layer_name}"] = grad_tensor.median().item()
+                layer_means[f"grad_norms/mean/{layer_name}"] = grad_tensor.mean().item()
+
+        # Capture weights before step for better UWR calculation
+        weights_before = {}
+        for name, param in predictor.named_parameters():
+            if param.grad is not None:
+                weights_before[name] = param.data.clone()
 
         predictor.optimizer.step()
         self.autoencoder_optimizer.step()
 
+        # Calculate per-parameter update-to-weight ratios using actual Adam steps
+        param_uwrs = []
+        for name, param in predictor.named_parameters():
+            if name in weights_before:
+                weight_before = weights_before[name]
+                actual_update = torch.abs(param.data - weight_before)
+                weight_magnitude = torch.abs(weight_before) + 1e-8
+                param_uwr = actual_update / weight_magnitude
+                param_uwrs.extend(param_uwr.flatten().tolist())
+
+        # Calculate median and 95th percentile UWR across all parameters
+        if param_uwrs:
+            param_uwrs_tensor = torch.tensor(param_uwrs)
+            uwr_median = param_uwrs_tensor.median().item()
+            uwr_95th = torch.quantile(param_uwrs_tensor, 0.95).item()
+        else:
+            uwr_median = 0.0
+            uwr_95th = 0.0
+
         # Log predictor training metrics to wandb
         if self.wandb_enabled:
-            wandb.log({
+            log_dict = {
                 "predictor_training_loss": prediction_loss.item(),
                 "predictor_level": level,
                 "predictor_training_step": getattr(self, 'predictor_training_step', 0),
@@ -667,8 +725,14 @@ class AdaptiveWorldModel:
                 "predictor_grad_norm": grad_norm,
                 "predictor_lr": predictor.optimizer.param_groups[0]['lr'],
                 "history_length": len(self.frame_features_history),
-                "predictor_update_to_weight_ratio": update_to_weight_ratio,
-            })
+                "predictor_uwr_median": uwr_median,
+                "predictor_uwr_95th": uwr_95th,
+            }
+            # Add per-layer gradient statistics
+            log_dict.update(layer_medians)
+            log_dict.update(layer_means)
+
+            wandb.log(log_dict)
             
         # Increment predictor training step counter
         self.predictor_training_step = getattr(self, 'predictor_training_step', 0) + 1
@@ -684,7 +748,7 @@ class AdaptiveWorldModel:
         
         # Initialize optimizer if not exists
         if not hasattr(self, 'autoencoder_optimizer'):
-            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=AdaptiveWorldModelConfig.AUTOENCODER_LR)
+            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=self._get_autoencoder_lr())
         
         # Zero gradients
         self.autoencoder_optimizer.zero_grad()

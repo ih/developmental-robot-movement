@@ -22,15 +22,35 @@ def main():
     # Configuration
     JETBOT_IP = '192.168.68.51'  # Replace with your JetBot's IP address
     CHECKPOINT_DIR = "jetbot_checkpoints"  # Directory to save learning progress
-    
+
+    # Optional: Override learning rates (leave as None to use saved optimizer rates or config defaults)
+    # AUTOENCODER_LR = 1e-4  # Uncomment to override autoencoder learning rate
+    PREDICTOR_LR = 3e-4    # Uncomment to override predictor learning rate
+    AUTOENCODER_LR = None    # Use saved optimizer rate or config default
+    # PREDICTOR_LR = None      # Use saved optimizer rate or config default
+
     # Create JetBot interface
     logger.info("Connecting to JetBot...")
-    jetbot = JetBotInterface(JETBOT_IP)
-    
+    try:
+        jetbot = JetBotInterface(JETBOT_IP)
+        # Test initial connection
+        if jetbot.get_observation() is None:
+            raise ConnectionError("Failed to get initial observation")
+    except Exception as e:
+        logger.error("Problem connecting to JetBot, quitting")
+        sys.exit(1)
+
     # Create world model with JetBot interface (with wandb logging and checkpoints)
     logger.info("Initializing AdaptiveWorldModel...")
-    
-    world_model = AdaptiveWorldModel(jetbot, interactive=False, wandb_project="jetbot-developmental-movement", checkpoint_dir=CHECKPOINT_DIR)
+
+    world_model = AdaptiveWorldModel(
+        jetbot,
+        interactive=False,
+        wandb_project="jetbot-developmental-movement",
+        checkpoint_dir=CHECKPOINT_DIR,
+        autoencoder_lr=AUTOENCODER_LR,
+        predictor_lr=PREDICTOR_LR
+    )
     
     try:
         logger.info("Starting world model main loop...")

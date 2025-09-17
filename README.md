@@ -83,7 +83,7 @@ python jetbot_world_model_example.py
 - Press Enter to continue with proposed action, type custom action dict, or 'stop' to exit
 - **Automatic checkpoint saving**: Learning progress saved every 10 predictor training steps
 - **Resume learning**: Automatically loads previous training progress on restart
-- **Connection error handling**: Gracefully quits with error message if JetBot becomes unreachable (e.g., battery runs out)
+- **Connection error handling**: Automatically terminates when JetBot becomes unreachable (e.g., battery runs out, network disconnection)
 
 ### World Model Testing (No Robot)
 ```bash
@@ -194,9 +194,14 @@ The following metrics are automatically logged when wandb is enabled:
 - **`predictor_training_loss`**: Reconstruction loss based on predicted vs actual frame quality (patch-space MSE)
 - **`predictor_level`**: Which predictor level is being trained
 - **`predictor_training_step`**: Dedicated counter for predictor training iterations
-- **`predictor_grad_norm`**: Gradient norm for monitoring training dynamics
-- **`predictor_lr`**: Current learning rate of the predictor optimizer
-- **`predictor_update_to_weight_ratio`**: Ratio of update magnitude to parameter magnitude for stability monitoring
+- **`predictor_grad_norm`**: Global gradient norm for monitoring training dynamics
+- **`predictor_grad_norm_layer_median`**: Median gradient norm across layers for detecting frozen/active blocks
+- **`predictor_grad_norm_layer_mean`**: Mean gradient norm across layers for overall gradient health
+- **`predictor_lr`**: Current learning rate of the predictor optimizer (default: 3e-4)
+- **`predictor_uwr_median`**: Median update-to-weight ratio using actual Adam steps (target range: 1e-5 to 1e-3)
+- **`predictor_uwr_95th`**: 95th percentile update-to-weight ratio for detecting large parameter updates
+- **`grad_norms/median/{layer_name}`**: Per-layer median gradient norms grouped for easy comparison
+- **`grad_norms/mean/{layer_name}`**: Per-layer mean gradient norms grouped for easy comparison
 - **`history_length`**: Size of the frame features history buffer
 
 **Performance Metrics:**
@@ -245,8 +250,21 @@ The system automatically saves and loads learning progress to enable continuous 
 # Custom checkpoint directory
 model = AdaptiveWorldModel(robot_interface, checkpoint_dir="jetbot_checkpoints")
 
-# Default directory ("checkpoints")
+# Override learning rates (useful for experimentation)
+model = AdaptiveWorldModel(robot_interface, autoencoder_lr=1e-4, predictor_lr=5e-4)
+
+# Default directory ("checkpoints") with config learning rates
 model = AdaptiveWorldModel(robot_interface)
 ```
+
+### Learning Rate Management
+
+The system uses a hierarchy for determining learning rates:
+
+1. **Explicit parameters** (e.g., `predictor_lr=1e-3`) - Override everything
+2. **Saved optimizer state** - Used when resuming from checkpoint and no explicit override
+3. **Config defaults** - Used when starting fresh and no explicit override
+
+This allows for flexible experimentation while respecting existing training state.
 
 Checkpoints are excluded from git via `.gitignore` to avoid committing large model files.
