@@ -15,16 +15,16 @@ class AdaptiveWorldModelConfig:
     PREDICTION_HISTORY_SIZE = 10
     UNCERTAINTY_THRESHOLD = 0.7
     RECONSTRUCTION_THRESHOLD = 0.0022
-    
+
     # Training parameters
     AUTOENCODER_LR = 1e-4
     PREDICTOR_LR = 3e-4
     MASK_RATIO_MIN = 0.3  # Minimum mask ratio for randomized masking
     MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking
-    
+
     # Logging and checkpointing
-    LOG_INTERVAL = 100  # Log every N steps
-    VISUALIZATION_UPLOAD_INTERVAL = 2500  # Upload visualizations every N steps
+    LOG_INTERVAL = 20  # Log every N steps
+    VISUALIZATION_UPLOAD_INTERVAL = 1000  # Upload visualizations every N steps
     CHECKPOINT_SAVE_INTERVAL = 500  # Save every N predictor training steps
     DISPLAY_TRAINING_INTERVAL = 25  # Show training visualization every N steps
     DISPLAY_INTERVAL = 10  # Update display every N main loop iterations

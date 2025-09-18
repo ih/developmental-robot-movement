@@ -313,7 +313,7 @@ class AdaptiveWorldModel:
             
             # Step 4: Select action based on uncertainty maximization
             best_action, all_action_predictions = self.select_action_by_uncertainty(current_features)
-            
+
             # Display frames for visual feedback (on interval, or always in interactive mode)
             self.display_counter += 1
             should_display = (self.display_counter % AdaptiveWorldModelConfig.DISPLAY_INTERVAL == 0) or self.interactive
@@ -660,79 +660,145 @@ class AdaptiveWorldModel:
         
         # Calculate prediction loss in patch space (same as evaluation)
         prediction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches)
-        
+
+        # Calculate explained variance (R²) in patch space - scale-invariant predictor quality metric
+        with torch.no_grad():
+            resid = pred_patches - target_patches
+            var_y = target_patches.var(unbiased=False)
+            var_resid = resid.var(unbiased=False)
+            explained_variance = 1.0 - (var_resid / (var_y + 1e-12))  # R^2 in [−∞, 1]
+
         # Backward pass - this will train both predictor and autoencoder!
         prediction_loss.backward()
 
-        # Log gradient norms (global and per-layer)
+        # Log gradient norms (global and per-layer) - throttled
         grad_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), float('inf'))
+        layer_grad_metrics = {}
 
-        # Per-layer gradient norms for better insight
-        layer_grad_stats = {}
-        for name, param in predictor.named_parameters():
-            if param.grad is not None:
-                grad_norms = param.grad.data.abs().flatten()
-                layer_name = name.split('.')[0]  # Get base layer name (e.g., 'transformer_layers' from 'transformer_layers.0.weight')
+        # Only calculate detailed gradient metrics periodically to reduce overhead
+        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+            # Detailed per-layer gradient norms for transformer layers
+            transformer_layer_grad_stats = {}
+            other_layer_grad_stats = {}
 
-                if layer_name not in layer_grad_stats:
-                    layer_grad_stats[layer_name] = []
-                layer_grad_stats[layer_name].extend(grad_norms.tolist())
+            for name, param in predictor.named_parameters():
+                if param.grad is not None:
+                    grad_norms = param.grad.data.abs().flatten()
 
-        # Calculate median and mean for each layer
-        layer_medians = {}
-        layer_means = {}
-        for layer_name, grad_values in layer_grad_stats.items():
-            if grad_values:
-                grad_tensor = torch.tensor(grad_values)
-                layer_medians[f"grad_norms/median/{layer_name}"] = grad_tensor.median().item()
-                layer_means[f"grad_norms/mean/{layer_name}"] = grad_tensor.mean().item()
+                    # Parse layer name for more detailed tracking
+                    if 'transformer_layers' in name:
+                        # Extract layer index for transformer layers (e.g., 'transformer_layers.0.self_attn.in_proj_weight')
+                        parts = name.split('.')
+                        if len(parts) >= 3:
+                            layer_idx = parts[1]  # Get layer index
+                            sublayer = '.'.join(parts[2:4])  # Get sublayer type (e.g., 'self_attn.in_proj_weight')
+                            layer_key = f"transformer_layer_{layer_idx}_{sublayer}"
+                        else:
+                            layer_key = f"transformer_layer_{parts[1] if len(parts) > 1 else 'unknown'}"
 
-        # Capture weights before step for better UWR calculation
+                        if layer_key not in transformer_layer_grad_stats:
+                            transformer_layer_grad_stats[layer_key] = []
+                        transformer_layer_grad_stats[layer_key].extend(grad_norms.tolist())
+                    else:
+                        # Group other layers by base name
+                        layer_name = name.split('.')[0]
+                        if layer_name not in other_layer_grad_stats:
+                            other_layer_grad_stats[layer_name] = []
+                        other_layer_grad_stats[layer_name].extend(grad_norms.tolist())
+
+            # Process transformer layers
+            for layer_key, grad_values in transformer_layer_grad_stats.items():
+                if grad_values:
+                    grad_tensor = torch.tensor(grad_values)
+                    layer_grad_metrics[f"grad_norms/transformer/{layer_key}"] = grad_tensor.median().item()
+
+            # Process other layers
+            for layer_name, grad_values in other_layer_grad_stats.items():
+                if grad_values:
+                    grad_tensor = torch.tensor(grad_values)
+                    layer_grad_metrics[f"grad_norms/{layer_name}"] = grad_tensor.median().item()
+
+        # Capture weights before step for UWR calculation (throttled)
         weights_before = {}
-        for name, param in predictor.named_parameters():
-            if param.grad is not None:
-                weights_before[name] = param.data.clone()
+        layer_uwr_metrics = {}
+        uwr_95th = 0.0
+
+        # Only calculate detailed UWR metrics periodically to reduce overhead
+        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+            for name, param in predictor.named_parameters():
+                if param.grad is not None:
+                    weights_before[name] = param.data.clone()
 
         predictor.optimizer.step()
         self.autoencoder_optimizer.step()
 
-        # Calculate per-parameter update-to-weight ratios using actual Adam steps
-        param_uwrs = []
-        for name, param in predictor.named_parameters():
-            if name in weights_before:
-                weight_before = weights_before[name]
-                actual_update = torch.abs(param.data - weight_before)
-                weight_magnitude = torch.abs(weight_before) + 1e-8
-                param_uwr = actual_update / weight_magnitude
-                param_uwrs.extend(param_uwr.flatten().tolist())
+        # Calculate per-layer update-to-weight ratios using actual Adam steps (throttled)
+        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0 and weights_before:
+            transformer_layer_uwrs = {}
+            other_layer_uwrs = {}
+            all_param_uwrs = []
 
-        # Calculate median and 95th percentile UWR across all parameters
-        if param_uwrs:
-            param_uwrs_tensor = torch.tensor(param_uwrs)
-            uwr_median = param_uwrs_tensor.median().item()
-            uwr_95th = torch.quantile(param_uwrs_tensor, 0.95).item()
-        else:
-            uwr_median = 0.0
-            uwr_95th = 0.0
+            for name, param in predictor.named_parameters():
+                if name in weights_before:
+                    weight_before = weights_before[name]
+                    actual_update = torch.abs(param.data - weight_before)
+                    weight_magnitude = torch.abs(weight_before) + 1e-8
+                    param_uwr = actual_update / weight_magnitude
+                    param_uwr_values = param_uwr.flatten().tolist()
+                    all_param_uwrs.extend(param_uwr_values)
 
-        # Log predictor training metrics to wandb
-        if self.wandb_enabled:
-            log_dict = {
-                "predictor_training_loss": prediction_loss.item(),
-                "predictor_level": level,
-                "predictor_training_step": getattr(self, 'predictor_training_step', 0),
-                "step": self.training_step,
-                "predictor_grad_norm": grad_norm,
-                "predictor_lr": predictor.optimizer.param_groups[0]['lr'],
-                "history_length": len(self.frame_features_history),
-                "predictor_uwr_median": uwr_median,
-                "predictor_uwr_95th": uwr_95th,
-            }
-            # Add per-layer gradient statistics
-            log_dict.update(layer_medians)
-            log_dict.update(layer_means)
+                    # Group by layer type for detailed tracking
+                    if 'transformer_layers' in name:
+                        parts = name.split('.')
+                        if len(parts) >= 3:
+                            layer_idx = parts[1]
+                            sublayer = '.'.join(parts[2:4])
+                            layer_key = f"transformer_layer_{layer_idx}_{sublayer}"
+                        else:
+                            layer_key = f"transformer_layer_{parts[1] if len(parts) > 1 else 'unknown'}"
 
-            wandb.log(log_dict)
+                        if layer_key not in transformer_layer_uwrs:
+                            transformer_layer_uwrs[layer_key] = []
+                        transformer_layer_uwrs[layer_key].extend(param_uwr_values)
+                    else:
+                        layer_name = name.split('.')[0]
+                        if layer_name not in other_layer_uwrs:
+                            other_layer_uwrs[layer_name] = []
+                        other_layer_uwrs[layer_name].extend(param_uwr_values)
+
+            # Process transformer layer UWRs
+            for layer_key, uwr_values in transformer_layer_uwrs.items():
+                if uwr_values:
+                    uwr_tensor = torch.tensor(uwr_values)
+                    layer_uwr_metrics[f"uwr/transformer/{layer_key}"] = uwr_tensor.median().item()
+
+            # Process other layer UWRs
+            for layer_name, uwr_values in other_layer_uwrs.items():
+                if uwr_values:
+                    uwr_tensor = torch.tensor(uwr_values)
+                    layer_uwr_metrics[f"uwr/{layer_name}"] = uwr_tensor.median().item()
+
+            # Calculate global UWR 95th percentile
+            if all_param_uwrs:
+                param_uwrs_tensor = torch.tensor(all_param_uwrs)
+                uwr_95th = torch.quantile(param_uwrs_tensor, 0.95).item()
+
+            # Log predictor training metrics to wandb (inside throttled block)
+            if self.wandb_enabled:
+                log_dict = {
+                    "predictor_training_loss": prediction_loss.item(),
+                    "predictor_explained_variance": explained_variance.item(),
+                    "predictor_training_step": getattr(self, 'predictor_training_step', 0),
+                    "step": self.training_step,
+                    "predictor_grad_norm": grad_norm,
+                    "predictor_lr": predictor.optimizer.param_groups[0]['lr'],
+                    "predictor_uwr_95th": uwr_95th,
+                }
+                # Add per-layer gradient and UWR statistics
+                log_dict.update(layer_grad_metrics)
+                log_dict.update(layer_uwr_metrics)
+
+                wandb.log(log_dict)
             
         # Increment predictor training step counter
         self.predictor_training_step = getattr(self, 'predictor_training_step', 0) + 1

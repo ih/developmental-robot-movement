@@ -173,7 +173,8 @@ model = AdaptiveWorldModel(robot_interface)
 ### Logging and Visualization Features
 
 **Efficient Logging:**
-- **Periodic logging**: Metrics logged every 10 steps (configurable) instead of every step to reduce noise
+- **Throttled logging**: All metrics logged every 100 steps (LOG_INTERVAL) to reduce computational overhead
+- **Optimized calculations**: Detailed gradient norms and update-to-weight ratios calculated only when logging occurs
 - **Configurable intervals**: Adjust `LOG_INTERVAL` in config.py to control logging frequency
 
 **Visual Monitoring:**
@@ -192,17 +193,22 @@ The following metrics are automatically logged when wandb is enabled:
 
 **Prediction System:**
 - **`predictor_training_loss`**: Reconstruction loss based on predicted vs actual frame quality (patch-space MSE)
-- **`predictor_level`**: Which predictor level is being trained
+- **`predictor_explained_variance`**: R² in patch space - scale-invariant predictor quality metric (target: >0.2 indicates meaningful learning)
 - **`predictor_training_step`**: Dedicated counter for predictor training iterations
-- **`predictor_grad_norm`**: Global gradient norm for monitoring training dynamics
-- **`predictor_grad_norm_layer_median`**: Median gradient norm across layers for detecting frozen/active blocks
-- **`predictor_grad_norm_layer_mean`**: Mean gradient norm across layers for overall gradient health
-- **`predictor_lr`**: Current learning rate of the predictor optimizer (default: 3e-4)
-- **`predictor_uwr_median`**: Median update-to-weight ratio using actual Adam steps (target range: 1e-5 to 1e-3)
-- **`predictor_uwr_95th`**: 95th percentile update-to-weight ratio for detecting large parameter updates
-- **`grad_norms/median/{layer_name}`**: Per-layer median gradient norms grouped for easy comparison
-- **`grad_norms/mean/{layer_name}`**: Per-layer mean gradient norms grouped for easy comparison
-- **`history_length`**: Size of the frame features history buffer
+- **`predictor_grad_norm`**: Global gradient norm for predictor parameters
+- **`predictor_lr`**: Current learning rate for predictor optimizer
+- **`predictor_uwr_95th`**: 95th percentile update-to-weight ratio across all predictor parameters
+
+**Detailed Transformer Metrics:**
+- **Per-layer gradient norms**: `grad_norms/transformer/transformer_layer_X_sublayer` (median values)
+- **Per-layer UWR**: `uwr/transformer/transformer_layer_X_sublayer` (median values)
+- **Sublayer tracking**: Separate metrics for self_attn, linear1, linear2, etc. components
+
+**Interpreting Explained Variance (R²):**
+- **≈0.0**: Predictor no better than predicting mean patch values (common early in training)
+- **0.2-0.6**: Materially learning useful structure; should trend upward over training steps
+- **<0**: Worse than baseline (indicates potential data/scale mismatches or unstable updates)
+- **→1.0**: Excellent alignment in patch space (theoretical maximum)
 
 **Performance Metrics:**
 - **`time_between_actions`**: Duration in seconds between consecutive actions (logged periodically)
