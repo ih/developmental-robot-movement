@@ -22,6 +22,10 @@ class AdaptiveWorldModelConfig:
     MASK_RATIO_MIN = 0.3  # Minimum mask ratio for randomized masking
     MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking
 
+    # Prediction loss weights
+    PRED_PATCH_W = 1.0  # Weight for patch-space reconstruction loss
+    PRED_LATENT_W = 0.1  # Weight for latent-space prediction loss
+
     # Logging and checkpointing
     LOG_INTERVAL = 20  # Log every N steps
     VISUALIZATION_UPLOAD_INTERVAL = 1000  # Upload visualizations every N steps

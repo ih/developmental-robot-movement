@@ -641,25 +641,37 @@ class AdaptiveWorldModel:
         
         # Calculate target patches from actual frame (same as evaluation)
         target_patches = self.patchify(current_frame_tensor)
-        
+
         # Zero gradients for both predictor and autoencoder
         predictor.optimizer.zero_grad()
         self.autoencoder_optimizer.zero_grad()
-        
+
         # Forward pass through predictor
         predicted_features = predictor.forward(history_features, history_actions)
-        
+
         # Convert predicted features back to patches using decoder (same as evaluation)
         # Create identity ids_restore since we're working with unmasked features
         B, seq_len, _ = predicted_features.shape
         L = seq_len - 1  # Remove CLS token count
         ids_restore = torch.arange(L, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
-        
+
         # Use decoder to convert features to patches
         pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
-        
-        # Calculate prediction loss in patch space (same as evaluation)
-        prediction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches)
+
+        # Calculate patch-space loss
+        loss_patch = torch.nn.functional.mse_loss(pred_patches, target_patches)
+
+        # Calculate latent-space loss (grad flows into encoder to make it prediction-friendly)
+        target_latent = self.autoencoder.encode(current_frame_tensor)  # No stop-grad!
+        loss_latent = torch.nn.functional.mse_loss(
+            predicted_features[:, 1:, :],  # Exclude CLS token
+            target_latent[:, 1:, :]        # Exclude CLS token
+        )
+
+        # Combine losses with weights
+        w_patch = AdaptiveWorldModelConfig.PRED_PATCH_W
+        w_latent = AdaptiveWorldModelConfig.PRED_LATENT_W
+        prediction_loss = w_patch * loss_patch + w_latent * loss_latent
 
         # Calculate explained variance (R²) in patch space - scale-invariant predictor quality metric
         with torch.no_grad():
@@ -787,6 +799,8 @@ class AdaptiveWorldModel:
             if self.wandb_enabled:
                 log_dict = {
                     "predictor_training_loss": prediction_loss.item(),
+                    "predictor_patch_loss": loss_patch.item(),
+                    "predictor_latent_loss": loss_latent.item(),
                     "predictor_explained_variance": explained_variance.item(),
                     "predictor_training_step": getattr(self, 'predictor_training_step', 0),
                     "step": self.training_step,

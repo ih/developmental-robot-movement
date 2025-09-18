@@ -192,7 +192,9 @@ The following metrics are automatically logged when wandb is enabled:
 - **`mask_ratio`**: Dynamic mask ratio used during autoencoder training (0.3-0.85 range)
 
 **Prediction System:**
-- **`predictor_training_loss`**: Reconstruction loss based on predicted vs actual frame quality (patch-space MSE)
+- **`predictor_training_loss`**: Combined patch + latent loss for predictor training
+- **`predictor_patch_loss`**: Patch-space reconstruction loss (anchors visual quality)
+- **`predictor_latent_loss`**: Latent-space prediction loss (trains encoder for predictability)
 - **`predictor_explained_variance`**: R² in patch space - scale-invariant predictor quality metric (target: >0.2 indicates meaningful learning)
 - **`predictor_training_step`**: Dedicated counter for predictor training iterations
 - **`predictor_grad_norm`**: Global gradient norm for predictor parameters
@@ -203,6 +205,11 @@ The following metrics are automatically logged when wandb is enabled:
 - **Per-layer gradient norms**: `grad_norms/transformer/transformer_layer_X_sublayer` (median values)
 - **Per-layer UWR**: `uwr/transformer/transformer_layer_X_sublayer` (median values)
 - **Sublayer tracking**: Separate metrics for self_attn, linear1, linear2, etc. components
+
+**Dual Loss Training Approach:**
+- **Patch loss (weight=1.0)**: Maintains visual reconstruction quality and prevents representation collapse
+- **Latent loss (weight=0.1)**: Encourages encoder to learn prediction-friendly representations
+- **Combined approach**: Encoder gradients flow from both predictor and reconstruction tasks
 
 **Interpreting Explained Variance (R²):**
 - **≈0.0**: Predictor no better than predicting mean patch values (common early in training)
