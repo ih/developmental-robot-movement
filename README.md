@@ -95,6 +95,20 @@ python adaptive_world_model.py
 - All ML components are stubs - only tests main loop logic
 - No physical robot required
 
+### Recording and Replay System
+```bash
+# Record a session (set MODE = "record" in config.py)
+python jetbot_world_model_example.py
+
+# Replay a recorded session
+python replay_session_example.py
+```
+- **Recording mode**: Captures robot observations and actions with shard rotation for disk space management
+- **Replay mode**: Replays recorded sessions using the exact same main loop, enabling GPU utilization for predictor training
+- **Robot-agnostic replay**: Can replay any robot's recorded sessions regardless of robot type
+- **Checkpoint sharing**: All modes (online, record, replay) share the same checkpoint directory for continuous learning
+- **Shard management**: Automatic cleanup of old recording shards to prevent disk space issues
+
 ### Interactive JetBot Testing
 ```bash
 jupyter notebook test_jetbot_actions.ipynb
@@ -132,6 +146,11 @@ Required Python packages:
   - `models/predictor.py`: TransformerActionConditionedPredictor with sequence length management
 - `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
+- `recording_writer.py`: Recording system with shard rotation for disk space management
+- `recording_reader.py`: Reads recorded sessions with smart observation/action sequencing
+- `replay_robot.py`: Robot interface replacement for replaying recorded sessions
+- `recorded_policy.py`: Action selector factory for recorded action playback
+- `replay_session_example.py`: Robot-agnostic replay script for recorded sessions
 - `test_jetbot_actions.ipynb`: Interactive Jupyter notebook for JetBot action space testing
 - `config.py`: Shared configuration, image transforms, and adaptive world model parameters
 - `requirements.txt`: Python package dependencies
@@ -241,22 +260,22 @@ The following metrics are automatically logged when wandb is enabled:
 
 ## Learning Progress Persistence
 
-The system automatically saves and loads learning progress to enable continuous training across sessions with a dual save system for maximum reliability.
+The system automatically saves and loads learning progress to enable continuous training across sessions with a rolling backup system for maximum reliability.
 
 ### Features
 
-- **Dual save system**: Automatic periodic saves during training + manual saves on program exit
-- **Automatic checkpointing**: Model weights, optimizers, and training progress saved periodically with standard filenames
-- **Manual saves**: On program exit (Ctrl+C), saves to files with `_manual` suffix for safe restart
-- **Smart loading**: On startup, prioritizes manual save files over automatic saves for best recovery
-- **Resume training**: Automatically loads existing checkpoints on startup (manual saves first, then auto saves)
+- **Rolling backup system**: Automatic backup creation before each save for safety
+- **Automatic checkpointing**: Model weights, optimizers, and training progress saved periodically
+- **Predictable behavior**: Every run picks up exactly where the last run finished
+- **Automatic safety net**: One-deep rollback point if new checkpoint gets corrupted
+- **Resume training**: Automatically loads existing checkpoints on startup
 - **Configurable directory**: Set checkpoint location via `checkpoint_dir` parameter
 - **Periodic saves**: Checkpoints saved every 500 predictor training steps (configurable)
 
 ### File Naming Convention
 
-- **Auto saves**: `autoencoder.pth`, `predictor_0.pth`, `state.pkl`
-- **Manual saves**: `autoencoder_manual.pth`, `predictor_0_manual.pth`, `state_manual.pkl`
+- **Primary files**: `autoencoder.pth`, `predictor_0.pth`, `state.pkl`
+- **Backup files**: `autoencoder_backup.pth`, `predictor_0_backup.pth`, `state_backup.pkl`
 
 ### Saved Components
 

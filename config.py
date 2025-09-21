@@ -41,3 +41,21 @@ class AdaptiveWorldModelConfig:
     # Action execution
     ACTION_DELAY = 0  # Delay in seconds between actions
 
+# Root auxiliary directory for checkpoints and recordings
+AUX_DIR = "saved"
+# Recording and Replay Parameters
+MODE = "record"  # "online" | "record" | "replay"
+REPLAY_SESSION_DIR = f"{AUX_DIR}/sessions/session_20250921_142133"
+RECORDING_BASE_DIR = f"{AUX_DIR}/sessions"  # Base directory for new recordings
+
+# Recording Configuration
+RECORDING_SHARD_SIZE = 10  # Number of steps per shard before rotating
+RECORDING_MAX_SHARDS = 3    # Maximum number of shards to keep (older ones deleted)
+RECORDING_SESSION_NAME = None  # Auto-generate if None (timestamp-based)
+
+# Default checkpoint directory
+DEFAULT_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints"
+
+# Interactive mode setting
+INTERACTIVE_MODE = False  # Set to True to enable interactive action selection
+

@@ -15,9 +15,12 @@ from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
 from config import AdaptiveWorldModelConfig
 
 class AdaptiveWorldModel:
-    def __init__(self, robot_interface, interactive=False, wandb_project=None, checkpoint_dir="checkpoints", autoencoder_lr=None, predictor_lr=None):
+    def __init__(self, robot_interface, interactive=False, wandb_project=None, checkpoint_dir="checkpoints", autoencoder_lr=None, predictor_lr=None, action_selector=None):
         # Store the robot interface
         self.robot = robot_interface
+
+        # Store action selector (defaults to internal select_action_by_uncertainty)
+        self.action_selector = action_selector if action_selector is not None else self.select_action_by_uncertainty
 
         # Checkpoint management
         self.checkpoint_dir = checkpoint_dir
@@ -74,7 +77,8 @@ class AdaptiveWorldModel:
         self.prediction_buffer = []
         
         # Training visualization counter
-        self.training_step = 0
+        self.autoencoder_training_step = 0
+        self.predictor_training_step = 0
         
         # Action timing tracking
         self.last_action_time = None
@@ -103,32 +107,32 @@ class AdaptiveWorldModel:
         else:
             return AdaptiveWorldModelConfig.PREDICTOR_LR
     
-    def save_checkpoint(self, manual_save=False):
-        """Save current learning progress to disk"""
+    def save_checkpoint(self):
+        """Save current learning progress to disk with rolling backup"""
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        
-        # Use different file names for manual saves
-        suffix = "_manual" if manual_save else ""
-        
+
+        # Create backup of existing checkpoint files before saving new ones
+        self._backup_existing_checkpoints()
+
         # Save autoencoder model and optimizer
         torch.save({
             'model_state_dict': self.autoencoder.state_dict(),
             'optimizer_state_dict': getattr(self, 'autoencoder_optimizer', {}).state_dict() if hasattr(self, 'autoencoder_optimizer') else None,
-        }, os.path.join(self.checkpoint_dir, f'autoencoder{suffix}.pth'))
-        
+        }, os.path.join(self.checkpoint_dir, 'autoencoder.pth'))
+
         # Save predictors
         for i, predictor in enumerate(self.predictors):
             torch.save({
                 'model_state_dict': predictor.state_dict() if hasattr(predictor, 'state_dict') else {},
                 'optimizer_state_dict': getattr(predictor, 'optimizer', {}).state_dict() if hasattr(predictor, 'optimizer') else None,
                 'level': predictor.level,
-            }, os.path.join(self.checkpoint_dir, f'predictor_{i}{suffix}.pth'))
-        
+            }, os.path.join(self.checkpoint_dir, f'predictor_{i}.pth'))
+
         # Save learning progress and history (keep only recent history to avoid huge files)
         history_limit = AdaptiveWorldModelConfig.CHECKPOINT_HISTORY_LIMIT
         state = {
-            'training_step': self.training_step,
-            'predictor_training_step': getattr(self, 'predictor_training_step', 0),
+            'autoencoder_training_step': self.autoencoder_training_step,
+            'predictor_training_step': self.predictor_training_step,
             'action_count': self.action_count,
             'display_counter': self.display_counter,
             'lookahead': self.lookahead,
@@ -137,31 +141,54 @@ class AdaptiveWorldModel:
             'prediction_buffer': self.prediction_buffer,
             'last_action_time': self.last_action_time,
         }
-        
-        with open(os.path.join(self.checkpoint_dir, f'state{suffix}.pkl'), 'wb') as f:
+
+        with open(os.path.join(self.checkpoint_dir, 'state.pkl'), 'wb') as f:
             pickle.dump(state, f)
-        
-        save_type = "manual" if manual_save else "auto"
-        print(f"Checkpoint saved ({save_type}) at step {self.training_step}")
-    
+
+        print(f"Checkpoint saved at predictor step {self.predictor_training_step}")
+
+    def _backup_existing_checkpoints(self):
+        """Create backup copies of existing checkpoint files before overwriting"""
+        checkpoint_files = [
+            'autoencoder.pth',
+            'state.pkl'
+        ]
+
+        # Add predictor files that exist
+        for i in range(len(self.predictors)):
+            predictor_file = f'predictor_{i}.pth'
+            if os.path.exists(os.path.join(self.checkpoint_dir, predictor_file)):
+                checkpoint_files.append(predictor_file)
+
+        # Create backups by renaming existing files
+        for filename in checkpoint_files:
+            src_path = os.path.join(self.checkpoint_dir, filename)
+            if os.path.exists(src_path):
+                backup_filename = filename.replace('.pth', '_backup.pth').replace('.pkl', '_backup.pkl')
+                backup_path = os.path.join(self.checkpoint_dir, backup_filename)
+                # Remove old backup if it exists
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+                # Rename current file to backup
+                os.rename(src_path, backup_path)
+
     def load_checkpoint(self):
         """Load learning progress from disk if checkpoint exists"""
         if not os.path.exists(self.checkpoint_dir):
             print("No checkpoint directory found, starting fresh")
             return
-        
-        # Check for manual save files first, then fall back to auto saves
-        manual_autoencoder_path = os.path.join(self.checkpoint_dir, 'autoencoder_manual.pth')
-        auto_autoencoder_path = os.path.join(self.checkpoint_dir, 'autoencoder.pth')
-        
-        if os.path.exists(manual_autoencoder_path):
-            autoencoder_path = manual_autoencoder_path
-            suffix = "_manual"
-            print("Loading from manual save files...")
-        elif os.path.exists(auto_autoencoder_path):
-            autoencoder_path = auto_autoencoder_path
-            suffix = ""
-            print("Loading from auto save files...")
+
+        # Try primary checkpoint files first, then backup files
+        autoencoder_path = os.path.join(self.checkpoint_dir, 'autoencoder.pth')
+        backup_autoencoder_path = os.path.join(self.checkpoint_dir, 'autoencoder_backup.pth')
+
+        if os.path.exists(autoencoder_path):
+            use_backup = False
+            print("Loading from primary checkpoint files...")
+        elif os.path.exists(backup_autoencoder_path):
+            use_backup = True
+            autoencoder_path = backup_autoencoder_path
+            print("Primary checkpoint missing, loading from backup files...")
         else:
             print("No autoencoder checkpoint found")
             return
@@ -187,22 +214,22 @@ class AdaptiveWorldModel:
                         param_group['lr'] = self.explicit_autoencoder_lr
             print("Autoencoder checkpoint loaded")
         
-        # Load predictors (using the same suffix as autoencoder)
-        predictor_pattern = f'predictor_*{suffix}.pth'
+        # Load predictors (using backup if needed)
+        suffix = '_backup' if use_backup else ''
         predictor_files = [f for f in os.listdir(self.checkpoint_dir) if f.startswith('predictor_') and f.endswith(f'{suffix}.pth')]
         for predictor_file in sorted(predictor_files):
             predictor_path = os.path.join(self.checkpoint_dir, predictor_file)
             checkpoint = torch.load(predictor_path, map_location=self.device)
-            
+
             # Find or create corresponding predictor
-            # Extract index from filename like 'predictor_0_manual.pth' or 'predictor_0.pth'
+            # Extract index from filename like 'predictor_0_backup.pth' or 'predictor_0.pth'
             file_parts = predictor_file.replace(suffix, '').split('_')
             predictor_idx = int(file_parts[1].split('.')[0])
             if predictor_idx < len(self.predictors):
                 predictor = self.predictors[predictor_idx]
                 if hasattr(predictor, 'load_state_dict') and checkpoint['model_state_dict']:
                     predictor.load_state_dict(checkpoint['model_state_dict'])
-                
+
                 # Restore optimizer (respecting explicit learning rate overrides)
                 if checkpoint['optimizer_state_dict'] is not None:
                     if not hasattr(predictor, 'optimizer'):
@@ -217,14 +244,14 @@ class AdaptiveWorldModel:
                         print(f"Overriding predictor learning rate to {self.explicit_predictor_lr}")
                         for param_group in predictor.optimizer.param_groups:
                             param_group['lr'] = self.explicit_predictor_lr
-        
-        # Load learning progress and history (using the same suffix)
+
+        # Load learning progress and history (using backup if needed)
         state_path = os.path.join(self.checkpoint_dir, f'state{suffix}.pkl')
         if os.path.exists(state_path):
             with open(state_path, 'rb') as f:
                 state = pickle.load(f)
             
-            self.training_step = state.get('training_step', 0)
+            self.autoencoder_training_step = state.get('autoencoder_training_step', state.get('training_step', 0))
             self.predictor_training_step = state.get('predictor_training_step', 0)
             self.action_count = state.get('action_count', 0)
             self.display_counter = state.get('display_counter', 0)
@@ -234,7 +261,7 @@ class AdaptiveWorldModel:
             self.prediction_buffer = state.get('prediction_buffer', [])
             self.last_action_time = state.get('last_action_time', None)
             
-            print(f"Learning progress loaded: {self.training_step} training steps, {self.action_count} actions")
+            print(f"Learning progress loaded: {self.autoencoder_training_step} autoencoder steps, {self.predictor_training_step} predictor steps, {self.action_count} actions")
     
     def to_model_tensor(self, frame_np):
         """Convert frame to properly scaled tensor for model input"""
@@ -270,10 +297,9 @@ class AdaptiveWorldModel:
                 reconstruction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches).item()
             
             # Log reconstruction loss to wandb (periodically)
-            if self.wandb_enabled and self.training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+            if self.wandb_enabled and self.autoencoder_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
                 wandb.log({
-                    "reconstruction_loss": reconstruction_loss,
-                    "step": self.training_step
+                    "reconstruction_loss": reconstruction_loss
                 })
             
             reconstruction_threshold = AdaptiveWorldModelConfig.RECONSTRUCTION_THRESHOLD
@@ -282,9 +308,9 @@ class AdaptiveWorldModel:
                 train_loss = self.train_autoencoder(current_frame)
                 
                 # Show current and reconstructed frames while training (periodically)
-                # if self.training_step % AdaptiveWorldModelConfig.DISPLAY_TRAINING_INTERVAL == 0:
+                # if self.autoencoder_training_step % AdaptiveWorldModelConfig.DISPLAY_TRAINING_INTERVAL == 0:
                 #     self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
-                self.training_step += 1
+                self.autoencoder_training_step += 1
                 
                 
                 continue  # Skip action execution until reconstruction improves
@@ -307,8 +333,8 @@ class AdaptiveWorldModel:
                     prediction_errors = self.evaluate_fresh_predictions(fresh_predictions, frame_tensor)
 
                     # Log prediction errors to wandb (periodically)
-                    if self.wandb_enabled and self.training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
-                        log_dict = {"step": self.training_step}
+                    if self.wandb_enabled and self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+                        log_dict = {}
 
                         # Log individual predictor errors with grouping
                         for level, error in enumerate(prediction_errors):
@@ -335,8 +361,8 @@ class AdaptiveWorldModel:
                 # Adjust lookahead based on accuracy horizon
                 self.lookahead = self.find_accurate_prediction_horizon()
             
-            # Step 4: Select action based on uncertainty maximization
-            best_action, all_action_predictions = self.select_action_by_uncertainty(current_features)
+            # Step 4: Select action based on uncertainty maximization (or recorded action in replay mode)
+            best_action, all_action_predictions = self.action_selector(current_features)
 
             # Display frames for visual feedback (on interval, or always in interactive mode)
             self.display_counter += 1
@@ -374,7 +400,6 @@ class AdaptiveWorldModel:
                             "action_timing/max_interval": np.max(self.action_time_intervals),
                             "action_timing/std_interval": np.std(self.action_time_intervals),
                             "action_count": self.action_count,
-                            "step": self.training_step
                         })
                         # Clear intervals after logging
                         self.action_time_intervals = []
@@ -558,7 +583,6 @@ class AdaptiveWorldModel:
             wandb.log({
                 "predictions_visualization": wandb.Image(fig),
                 "action_count": self.action_count,
-                "step": self.training_step
             })
             
             # Close the figure to free memory
@@ -852,8 +876,7 @@ class AdaptiveWorldModel:
                     "predictor_patch_loss": loss_patch.item(),
                     "predictor_latent_loss": loss_latent.item(),
                     "predictor_explained_variance": detailed_metrics['explained_variance'].item(),
-                    "predictor_training_step": getattr(self, 'predictor_training_step', 0),
-                    "step": self.training_step,
+                    "predictor_training_step": self.predictor_training_step,
                     "predictor_grad_norm": grad_norm,
                     "predictor_lr": predictor.optimizer.param_groups[0]['lr'],
                     "predictor_uwr_95th": detailed_metrics['uwr_95th'],
@@ -866,7 +889,7 @@ class AdaptiveWorldModel:
                 wandb.log(log_dict)
             
         # Increment predictor training step counter
-        self.predictor_training_step = getattr(self, 'predictor_training_step', 0) + 1
+        self.predictor_training_step += 1
         
         # Save checkpoint periodically based on predictor training steps
         if self.predictor_training_step % self.save_interval == 0:
@@ -904,7 +927,7 @@ class AdaptiveWorldModel:
             wandb.log({
                 "autoencoder_training_loss": train_loss_value,
                 "mask_ratio": mask_ratio,
-                "training_step": self.training_step
+                "autoencoder_training_step": self.autoencoder_training_step
             })
         
         return train_loss_value
