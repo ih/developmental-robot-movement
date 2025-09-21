@@ -40,7 +40,8 @@ This repository contains research code for developmental robot movement with a m
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
 - **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for improved generalization
 - **TransformerActionConditionedPredictor**: Causal transformer that interleaves visual features with action tokens
-- **Reconstruction-based predictor training**: Predictor loss based on visual reconstruction quality, ensuring meaningful predictions
+- **Fresh prediction training**: Predictors trained using fresh predictions with consistent loss calculation
+- **Dual loss training**: Combined patch-space reconstruction + latent-space prediction losses for encoder optimization
 - **Joint training architecture**: Autoencoder reconstruction loss + action predictor gradient flow with shared encoder
 - **Sequence length management**: Handles long histories (4096 token capacity with clipping for GPU safety)
 - **Quality gating**: Robot stops acting when reconstruction loss > threshold, focuses on vision training
@@ -217,10 +218,17 @@ The following metrics are automatically logged when wandb is enabled:
 - **<0**: Worse than baseline (indicates potential data/scale mismatches or unstable updates)
 - **→1.0**: Excellent alignment in patch space (theoretical maximum)
 
-**Performance Metrics:**
-- **`time_between_actions`**: Duration in seconds between consecutive actions (logged periodically)
+**Action Timing Statistics:**
+- **`action_timing/mean_interval`**: Average time between actions (logged every 100 actions)
+- **`action_timing/median_interval`**: Median time between actions
+- **`action_timing/min_interval`**: Minimum time between actions
+- **`action_timing/max_interval`**: Maximum time between actions
+- **`action_timing/std_interval`**: Standard deviation of action intervals
 - **`action_count`**: Total number of actions taken
 - **`step`** and **`training_step`**: Overall timestep counters for tracking progress
+
+**Fresh Prediction Quality:**
+- **`prediction_errors/level_X`**: Prediction error for each predictor level (guides training decisions)
 
 **Visual Data:**
 - **`predictions_visualization`**: Complete visualization showing current frame, decoded frame, and predictions for all actions

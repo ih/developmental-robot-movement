@@ -79,6 +79,7 @@ class AdaptiveWorldModel:
         # Action timing tracking
         self.last_action_time = None
         self.action_count = 0
+        self.action_time_intervals = []  # Store action time intervals since last log
         
         # Display counter for interval-based display updates
         self.display_counter = 0
@@ -275,8 +276,8 @@ class AdaptiveWorldModel:
                     "step": self.training_step
                 })
             
-            threshold = AdaptiveWorldModelConfig.RECONSTRUCTION_THRESHOLD
-            if reconstruction_loss > threshold:
+            reconstruction_threshold = AdaptiveWorldModelConfig.RECONSTRUCTION_THRESHOLD
+            if reconstruction_loss > reconstruction_threshold:
                 # Train autoencoder if reconstruction is poor
                 train_loss = self.train_autoencoder(current_frame)
                 
@@ -288,28 +289,51 @@ class AdaptiveWorldModel:
                 
                 continue  # Skip action execution until reconstruction improves
             
-            # Step 3: Check past predictions accuracy (if any)
+            # Step 3: Train predictors until fresh predictions meet threshold
             prediction_errors = []
             if self.prediction_buffer:
-                prediction_errors = self.evaluate_predictions(frame_tensor)
-                
-                if all(error < threshold for error in prediction_errors):
-                    # All predictions accurate - increase lookahead
-                    ## comment out for now
-                    print("Low prediction error, Ready to create higher level abstraction")
-                    # self.lookahead += 1
-                    
-                    # # Check if we need a new hierarchical level
-                    # if self.lookahead > self.get_max_predictor_lookahead() + self.max_lookahead_margin:
-                    #     self.create_new_hierarchy_level()
-                else:
-                    # Train predictors that had errors
-                    for level, error in enumerate(prediction_errors):
-                        if error > threshold:
-                            self.train_predictor(level, frame_tensor)
-                    
-                    # Adjust lookahead based on accuracy horizon
-                    self.lookahead = self.find_accurate_prediction_horizon()
+                # Get prediction context for fresh predictions
+                history_features, history_actions = self.get_prediction_context()
+
+                while True:  # Keep training until all fresh prediction errors are below threshold
+                    # Make fresh predictions with current context
+                    fresh_predictions = []
+                    for predictor in self.predictors:
+                        with torch.no_grad():
+                            prediction = predictor.forward(history_features, history_actions)
+                            fresh_predictions.append(prediction)
+
+                    # Evaluate fresh predictions using same loss as training
+                    prediction_errors = self.evaluate_fresh_predictions(fresh_predictions, frame_tensor)
+
+                    # Log prediction errors to wandb (periodically)
+                    if self.wandb_enabled and self.training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+                        log_dict = {"step": self.training_step}
+
+                        # Log individual predictor errors with grouping
+                        for level, error in enumerate(prediction_errors):
+                            log_dict[f"prediction_errors/level_{level}"] = error
+
+                        wandb.log(log_dict)
+
+                    prediction_threshold = AdaptiveWorldModelConfig.PREDICTION_THRESHOLD
+                    if all(error < prediction_threshold for error in prediction_errors):
+                        # All fresh predictions accurate - ready to proceed
+                        break
+                    else:
+                        # Train predictors that had errors using the same predictions we evaluated
+                        for level, error in enumerate(prediction_errors):
+                            if error > prediction_threshold:
+                                self.train_predictor(
+                                    level,
+                                    frame_tensor,
+                                    fresh_predictions[level],
+                                    history_features,
+                                    history_actions
+                                )
+
+                # Adjust lookahead based on accuracy horizon
+                self.lookahead = self.find_accurate_prediction_horizon()
             
             # Step 4: Select action based on uncertainty maximization
             best_action, all_action_predictions = self.select_action_by_uncertainty(current_features)
@@ -335,15 +359,25 @@ class AdaptiveWorldModel:
             # Step 5: Take action and make predictions using the interface (only if reconstruction is good)
             current_time = time.time()
             
-            # Calculate time between actions and log to wandb (periodically)
+            # Calculate time between actions and accumulate statistics
             if self.last_action_time is not None:
                 time_between_actions = current_time - self.last_action_time
+                self.action_time_intervals.append(time_between_actions)
+
+                # Log action timing statistics periodically
                 if self.wandb_enabled and self.action_count % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
-                    wandb.log({
-                        "time_between_actions": time_between_actions,
-                        "action_count": self.action_count,
-                        "step": self.training_step
-                    })
+                    if self.action_time_intervals:
+                        wandb.log({
+                            "action_timing/mean_interval": np.mean(self.action_time_intervals),
+                            "action_timing/median_interval": np.median(self.action_time_intervals),
+                            "action_timing/min_interval": np.min(self.action_time_intervals),
+                            "action_timing/max_interval": np.max(self.action_time_intervals),
+                            "action_timing/std_interval": np.std(self.action_time_intervals),
+                            "action_count": self.action_count,
+                            "step": self.training_step
+                        })
+                        # Clear intervals after logging
+                        self.action_time_intervals = []
             
             self.robot.execute_action(action_to_execute)
             self.last_action_time = current_time
@@ -622,56 +656,10 @@ class AdaptiveWorldModel:
                     best_action = action
         
         return best_action, all_action_predictions
-    
-    def train_predictor(self, level, current_frame_tensor):
-        """Train neural predictor at specified level (gradients flow to autoencoder automatically)"""
-        predictor = self.predictors[level]
-        
-        # Initialize predictor optimizer if not exists
-        if not hasattr(predictor, 'optimizer'):
-            predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=self._get_predictor_lr())
 
-        # Initialize autoencoder optimizer for joint training
-        if not hasattr(self, 'autoencoder_optimizer'):
-            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=self._get_autoencoder_lr())
-        
-        # Get appropriate history window
-        history_features, history_actions = self.get_prediction_context()
-        history_features = [f.detach() for f in history_features]  # Detach history to prevent backprop through old encoder graphs
-        
-        # Calculate target patches from actual frame (same as evaluation)
-        target_patches = self.patchify(current_frame_tensor)
-
-        # Zero gradients for both predictor and autoencoder
-        predictor.optimizer.zero_grad()
-        self.autoencoder_optimizer.zero_grad()
-
-        # Forward pass through predictor
-        predicted_features = predictor.forward(history_features, history_actions)
-
-        # Convert predicted features back to patches using decoder (same as evaluation)
-        # Create identity ids_restore since we're working with unmasked features
-        B, seq_len, _ = predicted_features.shape
-        L = seq_len - 1  # Remove CLS token count
-        ids_restore = torch.arange(L, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
-
-        # Use decoder to convert features to patches
-        pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
-
-        # Calculate patch-space loss
-        loss_patch = torch.nn.functional.mse_loss(pred_patches, target_patches)
-
-        # Calculate latent-space loss (grad flows into encoder to make it prediction-friendly)
-        target_latent = self.autoencoder.encode(current_frame_tensor)  # No stop-grad!
-        loss_latent = torch.nn.functional.mse_loss(
-            predicted_features[:, 1:, :],  # Exclude CLS token
-            target_latent[:, 1:, :]        # Exclude CLS token
-        )
-
-        # Combine losses with weights
-        w_patch = AdaptiveWorldModelConfig.PRED_PATCH_W
-        w_latent = AdaptiveWorldModelConfig.PRED_LATENT_W
-        prediction_loss = w_patch * loss_patch + w_latent * loss_latent
+    def _calculate_predictor_metrics(self, predictor, pred_patches, target_patches, weights_before=None):
+        """Calculate detailed training metrics for predictor including UWR"""
+        metrics = {}
 
         # Calculate explained variance (R²) in patch space - scale-invariant predictor quality metric
         with torch.no_grad():
@@ -680,72 +668,50 @@ class AdaptiveWorldModel:
             var_resid = resid.var(unbiased=False)
             explained_variance = 1.0 - (var_resid / (var_y + 1e-12))  # R^2 in [−∞, 1]
 
-        # Backward pass - this will train both predictor and autoencoder!
-        prediction_loss.backward()
+        # Detailed per-layer gradient norms for transformer layers
+        transformer_layer_grad_stats = {}
+        other_layer_grad_stats = {}
 
-        # Log gradient norms (global and per-layer) - throttled
-        grad_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), float('inf'))
-        layer_grad_metrics = {}
+        for name, param in predictor.named_parameters():
+            if param.grad is not None:
+                grad_norms = param.grad.data.abs().flatten()
 
-        # Only calculate detailed gradient metrics periodically to reduce overhead
-        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
-            # Detailed per-layer gradient norms for transformer layers
-            transformer_layer_grad_stats = {}
-            other_layer_grad_stats = {}
-
-            for name, param in predictor.named_parameters():
-                if param.grad is not None:
-                    grad_norms = param.grad.data.abs().flatten()
-
-                    # Parse layer name for more detailed tracking
-                    if 'transformer_layers' in name:
-                        # Extract layer index for transformer layers (e.g., 'transformer_layers.0.self_attn.in_proj_weight')
-                        parts = name.split('.')
-                        if len(parts) >= 3:
-                            layer_idx = parts[1]  # Get layer index
-                            sublayer = '.'.join(parts[2:4])  # Get sublayer type (e.g., 'self_attn.in_proj_weight')
-                            layer_key = f"transformer_layer_{layer_idx}_{sublayer}"
-                        else:
-                            layer_key = f"transformer_layer_{parts[1] if len(parts) > 1 else 'unknown'}"
-
-                        if layer_key not in transformer_layer_grad_stats:
-                            transformer_layer_grad_stats[layer_key] = []
-                        transformer_layer_grad_stats[layer_key].extend(grad_norms.tolist())
+                # Parse layer name for more detailed tracking
+                if 'transformer_layers' in name:
+                    # Extract layer index for transformer layers (e.g., 'transformer_layers.0.self_attn.in_proj_weight')
+                    parts = name.split('.')
+                    if len(parts) >= 3:
+                        layer_idx = parts[1]  # Get layer index
+                        sublayer = '.'.join(parts[2:4])  # Get sublayer type (e.g., 'self_attn.in_proj_weight')
+                        layer_key = f"transformer_layer_{layer_idx}_{sublayer}"
                     else:
-                        # Group other layers by base name
-                        layer_name = name.split('.')[0]
-                        if layer_name not in other_layer_grad_stats:
-                            other_layer_grad_stats[layer_name] = []
-                        other_layer_grad_stats[layer_name].extend(grad_norms.tolist())
+                        layer_key = f"transformer_layer_{parts[1] if len(parts) > 1 else 'unknown'}"
 
-            # Process transformer layers
-            for layer_key, grad_values in transformer_layer_grad_stats.items():
-                if grad_values:
-                    grad_tensor = torch.tensor(grad_values)
-                    layer_grad_metrics[f"grad_norms/transformer/{layer_key}"] = grad_tensor.median().item()
+                    if layer_key not in transformer_layer_grad_stats:
+                        transformer_layer_grad_stats[layer_key] = []
+                    transformer_layer_grad_stats[layer_key].extend(grad_norms.tolist())
+                else:
+                    # Group other layers by base name
+                    layer_name = name.split('.')[0]
+                    if layer_name not in other_layer_grad_stats:
+                        other_layer_grad_stats[layer_name] = []
+                    other_layer_grad_stats[layer_name].extend(grad_norms.tolist())
 
-            # Process other layers
-            for layer_name, grad_values in other_layer_grad_stats.items():
-                if grad_values:
-                    grad_tensor = torch.tensor(grad_values)
-                    layer_grad_metrics[f"grad_norms/{layer_name}"] = grad_tensor.median().item()
+        # Process transformer layers
+        for layer_key, grad_values in transformer_layer_grad_stats.items():
+            if grad_values:
+                grad_tensor = torch.tensor(grad_values)
+                metrics[f"grad_norms/transformer/{layer_key}"] = grad_tensor.median().item()
 
-        # Capture weights before step for UWR calculation (throttled)
-        weights_before = {}
-        layer_uwr_metrics = {}
+        # Process other layers
+        for layer_name, grad_values in other_layer_grad_stats.items():
+            if grad_values:
+                grad_tensor = torch.tensor(grad_values)
+                metrics[f"grad_norms/{layer_name}"] = grad_tensor.median().item()
+
+        # Calculate UWR metrics if weights_before provided
         uwr_95th = 0.0
-
-        # Only calculate detailed UWR metrics periodically to reduce overhead
-        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
-            for name, param in predictor.named_parameters():
-                if param.grad is not None:
-                    weights_before[name] = param.data.clone()
-
-        predictor.optimizer.step()
-        self.autoencoder_optimizer.step()
-
-        # Calculate per-layer update-to-weight ratios using actual Adam steps (throttled)
-        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0 and weights_before:
+        if weights_before:
             transformer_layer_uwrs = {}
             other_layer_uwrs = {}
             all_param_uwrs = []
@@ -782,35 +748,120 @@ class AdaptiveWorldModel:
             for layer_key, uwr_values in transformer_layer_uwrs.items():
                 if uwr_values:
                     uwr_tensor = torch.tensor(uwr_values)
-                    layer_uwr_metrics[f"uwr/transformer/{layer_key}"] = uwr_tensor.median().item()
+                    metrics[f"uwr/transformer/{layer_key}"] = uwr_tensor.median().item()
 
             # Process other layer UWRs
             for layer_name, uwr_values in other_layer_uwrs.items():
                 if uwr_values:
                     uwr_tensor = torch.tensor(uwr_values)
-                    layer_uwr_metrics[f"uwr/{layer_name}"] = uwr_tensor.median().item()
+                    metrics[f"uwr/{layer_name}"] = uwr_tensor.median().item()
 
             # Calculate global UWR 95th percentile
             if all_param_uwrs:
                 param_uwrs_tensor = torch.tensor(all_param_uwrs)
                 uwr_95th = torch.quantile(param_uwrs_tensor, 0.95).item()
 
-            # Log predictor training metrics to wandb (inside throttled block)
+        # Store key metrics for later use
+        metrics['explained_variance'] = explained_variance
+        metrics['uwr_95th'] = uwr_95th
+
+        return metrics
+
+    def train_predictor(self, level, current_frame_tensor, predicted_features=None, history_features=None, history_actions=None):
+        """Train neural predictor at specified level (gradients flow to autoencoder automatically)."""
+        predictor = self.predictors[level]
+
+        # Initialize predictor optimizer if not exists
+        if not hasattr(predictor, 'optimizer'):
+            predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=self._get_predictor_lr())
+
+        # Initialize autoencoder optimizer for joint training
+        if not hasattr(self, 'autoencoder_optimizer'):
+            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=self._get_autoencoder_lr())
+
+        # Ensure frame tensor lives on the correct device
+        current_frame_tensor = current_frame_tensor.to(self.device)
+
+        # Determine prediction context and recompute predictions with gradients
+        if predicted_features is not None:
+            if history_features is None or history_actions is None:
+                raise ValueError("history_features and history_actions are required when providing predicted_features")
+            history_features_for_forward = history_features
+            history_actions_for_forward = history_actions
+        else:
+            history_features_for_forward, history_actions_for_forward = self.get_prediction_context()
+
+        history_features_for_forward = [feat.detach().to(self.device) for feat in (history_features_for_forward or [])]
+        history_actions_for_forward = list(history_actions_for_forward or [])
+
+        predicted_features = predictor.forward(history_features_for_forward, history_actions_for_forward)
+
+        # Initialize target patches from actual frame (same as evaluation)
+        target_patches = self.patchify(current_frame_tensor)
+
+        # Zero gradients for both predictor and autoencoder
+        predictor.optimizer.zero_grad()
+        self.autoencoder_optimizer.zero_grad()
+
+        # Convert predicted features back to patches using decoder (same as evaluation)
+        B, seq_len, _ = predicted_features.shape
+        L = seq_len - 1  # Remove CLS token count
+        ids_restore = torch.arange(L, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
+
+        # Use decoder to convert features to patches
+        pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
+
+        # Calculate patch-space loss
+        loss_patch = torch.nn.functional.mse_loss(pred_patches, target_patches)
+
+        # Calculate latent-space loss (grad flows into encoder to make it prediction-friendly)
+        target_latent = self.autoencoder.encode(current_frame_tensor)  # No stop-grad!
+        loss_latent = torch.nn.functional.mse_loss(
+            predicted_features[:, 1:, :],  # Exclude CLS token
+            target_latent[:, 1:, :]        # Exclude CLS token
+        )
+
+        # Combine losses with weights
+        w_patch = AdaptiveWorldModelConfig.PRED_PATCH_W
+        w_latent = AdaptiveWorldModelConfig.PRED_LATENT_W
+        prediction_loss = w_patch * loss_patch + w_latent * loss_latent
+
+        # Backward pass - this will train both predictor and autoencoder!
+        prediction_loss.backward()
+
+        # Log gradient norms (global and per-layer) - throttled
+        grad_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), float('inf'))
+
+        # Capture weights before step for UWR calculation (throttled)
+        weights_before = {}
+        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+            for name, param in predictor.named_parameters():
+                if param.grad is not None:
+                    weights_before[name] = param.data.clone()
+
+        predictor.optimizer.step()
+        self.autoencoder_optimizer.step()
+        # Calculate detailed metrics periodically to reduce overhead
+        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+            # Calculate all metrics together
+            detailed_metrics = self._calculate_predictor_metrics(predictor, pred_patches, target_patches, weights_before)
+            # Log predictor training metrics to wandb
             if self.wandb_enabled:
                 log_dict = {
                     "predictor_training_loss": prediction_loss.item(),
                     "predictor_patch_loss": loss_patch.item(),
                     "predictor_latent_loss": loss_latent.item(),
-                    "predictor_explained_variance": explained_variance.item(),
+                    "predictor_explained_variance": detailed_metrics['explained_variance'].item(),
                     "predictor_training_step": getattr(self, 'predictor_training_step', 0),
                     "step": self.training_step,
                     "predictor_grad_norm": grad_norm,
                     "predictor_lr": predictor.optimizer.param_groups[0]['lr'],
-                    "predictor_uwr_95th": uwr_95th,
+                    "predictor_uwr_95th": detailed_metrics['uwr_95th'],
                 }
                 # Add per-layer gradient and UWR statistics
-                log_dict.update(layer_grad_metrics)
-                log_dict.update(layer_uwr_metrics)
+                for key, value in detailed_metrics.items():
+                    if key not in ['explained_variance', 'uwr_95th']:
+                        log_dict[key] = value
 
                 wandb.log(log_dict)
             
@@ -820,7 +871,8 @@ class AdaptiveWorldModel:
         # Save checkpoint periodically based on predictor training steps
         if self.predictor_training_step % self.save_interval == 0:
             self.save_checkpoint()
-    
+
+
     def train_autoencoder(self, ground_truth_frame):
         """Train only the autoencoder with masked reconstruction"""
         # Convert to properly scaled tensor
@@ -981,30 +1033,54 @@ class AdaptiveWorldModel:
                 'timestamp': current_time()
             })
     
+    def _compute_prediction_loss(self, predicted_features, actual_frame_tensor):
+        """Compute prediction loss using same method as training (patch + latent loss)"""
+        with torch.no_grad():
+            # Calculate target patches and latent features
+            target_patches = self.patchify(actual_frame_tensor)
+            target_latent = self.autoencoder.encode(actual_frame_tensor)
+
+            # Convert predicted features to patches using decoder
+            B, seq_len, _ = predicted_features.shape
+            L = seq_len - 1  # Remove CLS token count
+            ids_restore = torch.arange(L, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
+            pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
+
+            # Calculate patch-space loss
+            loss_patch = torch.nn.functional.mse_loss(pred_patches, target_patches)
+
+            # Calculate latent-space loss
+            loss_latent = torch.nn.functional.mse_loss(
+                predicted_features[:, 1:, :],  # Exclude CLS token
+                target_latent[:, 1:, :]        # Exclude CLS token
+            )
+
+            # Combine losses with same weights as training
+            w_patch = AdaptiveWorldModelConfig.PRED_PATCH_W
+            w_latent = AdaptiveWorldModelConfig.PRED_LATENT_W
+            total_loss = w_patch * loss_patch + w_latent * loss_latent
+
+            return total_loss.item()
+
     def evaluate_predictions(self, actual_frame_tensor):
-        """Compare past predictions with actual outcome using patch space reconstruction loss"""
+        """Compare past predictions with actual outcome using same loss as training"""
         errors = []
-        
-        # Calculate target patches from actual frame (same as main loop step 2)
-        target_patches = self.patchify(actual_frame_tensor)
-        
+
         for pred_data in self.prediction_buffer:
             predicted_features = pred_data['prediction']
-            
-            # Convert predicted features back to patches using decoder
-            with torch.no_grad():
-                # Create identity ids_restore since we're working with unmasked features
-                B, seq_len, _ = predicted_features.shape
-                L = seq_len - 1  # Remove CLS token count
-                ids_restore = torch.arange(L, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
-                
-                # Use decoder to convert features to patches
-                pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
-                
-                # Calculate reconstruction loss in patch space (same as training)
-                reconstruction_loss = torch.nn.functional.mse_loss(pred_patches, target_patches).item()
-                errors.append(reconstruction_loss)
-            
+            error = self._compute_prediction_loss(predicted_features, actual_frame_tensor)
+            errors.append(error)
+
+        return errors
+
+    def evaluate_fresh_predictions(self, fresh_predictions, actual_frame_tensor):
+        """Evaluate freshly made predictions using same loss as training"""
+        errors = []
+
+        for predicted_features in fresh_predictions:
+            error = self._compute_prediction_loss(predicted_features, actual_frame_tensor)
+            errors.append(error)
+
         return errors
     
     def get_max_predictor_lookahead(self):

@@ -25,7 +25,7 @@ def main():
 
     # Optional: Override learning rates (leave as None to use saved optimizer rates or config defaults)
     # AUTOENCODER_LR = 1e-4  # Uncomment to override autoencoder learning rate
-    PREDICTOR_LR = 3e-4    # Uncomment to override predictor learning rate
+    PREDICTOR_LR = None    # Uncomment to override predictor learning rate
     AUTOENCODER_LR = None    # Use saved optimizer rate or config default
     # PREDICTOR_LR = None      # Use saved optimizer rate or config default
 
@@ -46,7 +46,7 @@ def main():
     world_model = AdaptiveWorldModel(
         jetbot,
         interactive=False,
-        wandb_project="jetbot-developmental-movement",
+        wandb_project="jetbot-developmental-movement-testing",
         checkpoint_dir=CHECKPOINT_DIR,
         autoencoder_lr=AUTOENCODER_LR,
         predictor_lr=PREDICTOR_LR
