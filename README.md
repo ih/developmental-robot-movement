@@ -60,8 +60,9 @@ This repository contains research code for developmental robot movement with a m
 ### Configuration
 - **config.py**: Contains image transforms, constants, and adaptive world model parameters
 - **AdaptiveWorldModelConfig class**: Centralized configuration for all model parameters
+- **Recording configuration**: `RECORDING_MODE` boolean controls recording vs online mode, `RECORDING_MAX_DISK_GB` limits total disk usage
 - **Configurable intervals**: Logging frequency, visualization uploads, checkpoint saving, and display intervals
-- **Action timing**: Configurable delay between actions via `ACTION_DELAY` parameter (default 0.1 seconds)
+- **Action timing**: Configurable delay between actions via `ACTION_DELAY` parameter (default 0 seconds)
 - **IP addresses**: JetBot connection IPs specified in integration example (modify as needed)
 
 ## Running the Code
@@ -97,17 +98,17 @@ python adaptive_world_model.py
 
 ### Recording and Replay System
 ```bash
-# Record a session (set MODE = "record" in config.py)
+# Record a session (set RECORDING_MODE = True in config.py)
 python jetbot_world_model_example.py
 
-# Replay a recorded session
+# Replay all recorded sessions
 python replay_session_example.py
 ```
-- **Recording mode**: Captures robot observations and actions with shard rotation for disk space management
-- **Replay mode**: Replays recorded sessions using the exact same main loop, enabling GPU utilization for predictor training
+- **Recording mode**: Captures robot observations and actions with automatic disk space management
+- **Replay mode**: Replays all recorded sessions using the exact same main loop, enabling GPU utilization for predictor training
 - **Robot-agnostic replay**: Can replay any robot's recorded sessions regardless of robot type
 - **Checkpoint sharing**: All modes (online, record, replay) share the same checkpoint directory for continuous learning
-- **Shard management**: Automatic cleanup of old recording shards to prevent disk space issues
+- **Disk space management**: Automatic cleanup of oldest sessions when total recordings exceed configurable disk limit (default 10 GB)
 
 ### Interactive JetBot Testing
 ```bash
@@ -146,7 +147,7 @@ Required Python packages:
   - `models/predictor.py`: TransformerActionConditionedPredictor with sequence length management
 - `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
-- `recording_writer.py`: Recording system with shard rotation for disk space management
+- `recording_writer.py`: Recording system with automatic disk space management
 - `recording_reader.py`: Reads recorded sessions with smart observation/action sequencing
 - `replay_robot.py`: Robot interface replacement for replaying recorded sessions
 - `recorded_policy.py`: Action selector factory for recorded action playback

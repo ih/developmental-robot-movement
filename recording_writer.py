@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import glob
 from datetime import datetime
 from typing import Dict, Any, List
 import numpy as np
@@ -11,18 +12,18 @@ class RecordingWriter:
     """Writes recording data with shard rotation to manage disk space."""
 
     def __init__(self, base_dir: str = None, session_name: str = None,
-                 shard_size: int = None, max_shards: int = None):
+                 shard_size: int = None, max_disk_gb: float = None):
         """Initialize recording writer.
 
         Args:
             base_dir: Base directory for recordings (defaults to config.RECORDING_BASE_DIR)
             session_name: Session name (auto-generated if None)
             shard_size: Steps per shard (defaults to config.RECORDING_SHARD_SIZE)
-            max_shards: Maximum shards to keep (defaults to config.RECORDING_MAX_SHARDS)
+            max_disk_gb: Maximum disk space in GB (defaults to config.RECORDING_MAX_DISK_GB)
         """
         self.base_dir = base_dir or config.RECORDING_BASE_DIR
         self.shard_size = shard_size or config.RECORDING_SHARD_SIZE
-        self.max_shards = max_shards or config.RECORDING_MAX_SHARDS
+        self.max_disk_gb = max_disk_gb or config.RECORDING_MAX_DISK_GB
 
         # Generate session name if not provided
         if session_name is None:
@@ -49,14 +50,14 @@ class RecordingWriter:
             'session_name': session_name,
             'start_time': datetime.now().isoformat(),
             'shard_size': self.shard_size,
-            'max_shards': self.max_shards,
+            'max_disk_gb': self.max_disk_gb,
             'action_space': None,  # Will be set when first initialized
             'robot_type': None,    # Will be set when first initialized
             'total_shards': 0
         }
 
         print(f"RecordingWriter: Initialized session '{session_name}'")
-        print(f"RecordingWriter: Shard size={self.shard_size}, Max shards={self.max_shards}")
+        print(f"RecordingWriter: Shard size={self.shard_size}, Max disk space={self.max_disk_gb} GB")
 
     def set_session_metadata(self, action_space: List[Dict[str, Any]], robot_type: str = "unknown"):
         """Set session metadata (action space, robot type, etc.)."""
@@ -154,8 +155,8 @@ class RecordingWriter:
         # Clear buffer
         self.event_buffer = []
 
-        # Clean up old shards if we exceed max_shards
-        self._cleanup_old_shards()
+        # Clean up old sessions if we exceed disk space limit
+        self._cleanup_old_sessions()
 
         # Update total_shards to reflect actual shards on disk
         self._update_total_shards_count()
@@ -175,38 +176,74 @@ class RecordingWriter:
 
         print(f"RecordingWriter: Wrote shard {self.current_shard} ({len(self.event_buffer)} events)")
 
-    def _cleanup_old_shards(self):
-        """Remove old shard files if we exceed max_shards."""
-        if self.current_shard + 1 <= self.max_shards:
+    def _cleanup_old_sessions(self):
+        """Remove old session directories if total recording size exceeds disk limit."""
+        total_size_gb = self._get_total_recordings_size_gb()
+
+        if total_size_gb <= self.max_disk_gb:
             return
 
-        # Calculate which shards to remove
-        oldest_shard_to_keep = self.current_shard + 1 - self.max_shards
-        shards_to_remove = list(range(0, oldest_shard_to_keep))
+        print(f"RecordingWriter: Total recordings size {total_size_gb:.2f} GB exceeds limit {self.max_disk_gb} GB")
 
-        for shard_idx in shards_to_remove:
-            shard_suffix = f"_shard_{shard_idx:03d}"
+        # Get all session directories sorted by modification time (oldest first)
+        session_dirs = []
+        if os.path.exists(self.base_dir):
+            for item in os.listdir(self.base_dir):
+                item_path = os.path.join(self.base_dir, item)
+                if os.path.isdir(item_path) and item.startswith('session_'):
+                    # Skip current session
+                    if item_path != self.session_dir:
+                        mtime = os.path.getmtime(item_path)
+                        session_dirs.append((mtime, item_path, item))
 
-            # Remove shard file
-            events_file = os.path.join(self.session_dir, f"events{shard_suffix}.jsonl")
-            if os.path.exists(events_file):
-                os.remove(events_file)
+        # Sort by modification time (oldest first)
+        session_dirs.sort(key=lambda x: x[0])
 
-            # Remove associated frame files
-            frame_start = shard_idx * self.shard_size
-            frame_end = min((shard_idx + 1) * self.shard_size, self.step_count)
+        # Remove oldest sessions until we're under the limit
+        removed_count = 0
+        for mtime, session_path, session_name in session_dirs:
+            if total_size_gb <= self.max_disk_gb:
+                break
 
-            for frame_idx in range(frame_start, frame_end):
-                frame_filename = f"frame_{frame_idx:06d}.jpg"
-                frame_path = os.path.join(self.session_dir, "frames", frame_filename)
-                if os.path.exists(frame_path):
-                    os.remove(frame_path)
+            session_size_gb = self._get_directory_size_gb(session_path)
+            print(f"RecordingWriter: Removing old session '{session_name}' ({session_size_gb:.2f} GB)")
 
-        print(f"RecordingWriter: Cleaned up {len(shards_to_remove)} old shards")
+            try:
+                self._remove_directory_recursive(session_path)
+                total_size_gb -= session_size_gb
+                removed_count += 1
+            except Exception as e:
+                print(f"RecordingWriter: Warning - failed to remove session {session_name}: {e}")
+
+        if removed_count > 0:
+            print(f"RecordingWriter: Cleaned up {removed_count} old sessions. New total: {total_size_gb:.2f} GB")
+
+    def _get_total_recordings_size_gb(self) -> float:
+        """Get total size of all recordings in GB."""
+        if not os.path.exists(self.base_dir):
+            return 0.0
+        return self._get_directory_size_gb(self.base_dir)
+
+    def _get_directory_size_gb(self, directory: str) -> float:
+        """Get size of directory in GB."""
+        total_size = 0
+        try:
+            for dirpath, dirnames, filenames in os.walk(directory):
+                for filename in filenames:
+                    file_path = os.path.join(dirpath, filename)
+                    if os.path.exists(file_path):
+                        total_size += os.path.getsize(file_path)
+        except Exception as e:
+            print(f"RecordingWriter: Warning - error calculating directory size: {e}")
+        return total_size / (1024 ** 3)  # Convert to GB
+
+    def _remove_directory_recursive(self, directory: str):
+        """Recursively remove a directory and all its contents."""
+        import shutil
+        shutil.rmtree(directory)
 
     def _update_total_shards_count(self):
         """Update total_shards count to reflect actual shards on disk."""
-        import glob
         shard_pattern = os.path.join(self.session_dir, "events_shard_*.jsonl")
         actual_shard_files = glob.glob(shard_pattern)
         self.session_meta['total_shards'] = len(actual_shard_files)

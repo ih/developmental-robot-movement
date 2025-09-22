@@ -30,11 +30,6 @@ def main():
     AUTOENCODER_LR = None    # Use saved optimizer rate or config default
     PREDICTOR_LR = None      # Use saved optimizer rate or config default
 
-    # Check mode - this file only handles online and record modes
-    if config.MODE == "replay":
-        logger.error("For replay mode, use replay_session_example.py instead")
-        sys.exit(1)
-
     # Create JetBot interface
     logger.info("Connecting to JetBot...")
     try:
@@ -46,8 +41,8 @@ def main():
         logger.error(f"Problem connecting to JetBot: {e}")
         sys.exit(1)
 
-    # Setup based on mode
-    if config.MODE == "record":
+    # Setup based on recording mode
+    if config.RECORDING_MODE:
         logger.info("Starting in RECORD mode...")
         logger.info(f"Recording to: {config.RECORDING_BASE_DIR}")
 
@@ -57,7 +52,7 @@ def main():
                 base_dir=config.RECORDING_BASE_DIR,
                 session_name=config.RECORDING_SESSION_NAME,
                 shard_size=config.RECORDING_SHARD_SIZE,
-                max_shards=config.RECORDING_MAX_SHARDS
+                max_disk_gb=config.RECORDING_MAX_DISK_GB
             )
             robot = RecordingRobot(jetbot, writer)
             logger.info(f"Recording session: {writer.session_name}")
@@ -67,7 +62,7 @@ def main():
             jetbot.cleanup()
             sys.exit(1)
 
-    else:  # config.MODE == "online" or default
+    else:
         logger.info("Starting in ONLINE mode...")
         robot = jetbot
 
@@ -96,7 +91,7 @@ def main():
         world_model.save_checkpoint()
 
         # Show recording stats if in record mode
-        if config.MODE == "record":
+        if config.RECORDING_MODE:
             stats = robot.get_recording_stats()
             logger.info(f"Recording complete!")
             logger.info(f"Session: {stats['session_name']}")
