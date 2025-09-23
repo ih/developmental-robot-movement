@@ -2,6 +2,8 @@
 
 Research code for developmental robot movement with hierarchical world models and uncertainty-based exploration.
 
+Currently a work in progress with [notes here](https://docs.google.com/document/d/e/2PACX-1vTdVqbwuou38bDDVrR4LonrjLcE2SXu6SYXUpeU9nmfKAc9raojYJW40eqHxlj8fqNR1FU9o24JCzPX/pub):
+
 ## Project Overview
 
 This repository contains research code for developmental robot movement with a modular architecture:
@@ -208,8 +210,9 @@ model = AdaptiveWorldModel(robot_interface)
 The following metrics are automatically logged when wandb is enabled:
 
 **Vision System:**
-- **`reconstruction_loss`**: Quality of visual reconstruction (lower is better, logged periodically)
+- **`reconstruction_loss`**: Quality of visual reconstruction (lower is better, logged every 100 steps)
 - **`autoencoder_training_loss`**: Training loss during autoencoder updates
+- **`autoencoder_training_step`**: Dedicated counter for autoencoder training iterations
 - **`mask_ratio`**: Dynamic mask ratio used during autoencoder training (0.3-0.85 range)
 
 **Prediction System:**
@@ -238,6 +241,10 @@ The following metrics are automatically logged when wandb is enabled:
 - **<0**: Worse than baseline (indicates potential data/scale mismatches or unstable updates)
 - **→1.0**: Excellent alignment in patch space (theoretical maximum)
 
+**Training Progress Metrics:**
+- **`consecutive_autoencoder_iterations`**: Number of consecutive autoencoder training steps before proceeding to prediction training
+- **`predictor_training_iterations`**: Number of predictor training iterations needed before meeting threshold
+
 **Action Timing Statistics:**
 - **`action_timing/mean_interval`**: Average time between actions (logged every 100 actions)
 - **`action_timing/median_interval`**: Median time between actions
@@ -245,7 +252,6 @@ The following metrics are automatically logged when wandb is enabled:
 - **`action_timing/max_interval`**: Maximum time between actions
 - **`action_timing/std_interval`**: Standard deviation of action intervals
 - **`action_count`**: Total number of actions taken
-- **`step`** and **`training_step`**: Overall timestep counters for tracking progress
 
 **Fresh Prediction Quality:**
 - **`prediction_errors/level_X`**: Prediction error for each predictor level (guides training decisions)

@@ -14,12 +14,12 @@ class AdaptiveWorldModelConfig:
     MAX_LOOKAHEAD_MARGIN = 5
     PREDICTION_HISTORY_SIZE = 10
     UNCERTAINTY_THRESHOLD = 0.7
-    RECONSTRUCTION_THRESHOLD = 0.0022
-    PREDICTION_THRESHOLD = 0.01  # Threshold for prediction errors (slightly higher than reconstruction)
+    RECONSTRUCTION_THRESHOLD = 0.0005
+    PREDICTION_THRESHOLD = 0.0005  # Threshold for prediction errors (slightly higher than reconstruction)
 
     # Training parameters
     AUTOENCODER_LR = 1e-4
-    PREDICTOR_LR = 3e-4
+    PREDICTOR_LR = 1e-4
     MASK_RATIO_MIN = 0.3  # Minimum mask ratio for randomized masking
     MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking
 
@@ -49,7 +49,7 @@ REPLAY_SESSION_DIR = f"{AUX_DIR}/sessions/session_20250921_142133"
 RECORDING_BASE_DIR = f"{AUX_DIR}/sessions"  # Base directory for new recordings
 
 # Recording Configuration
-RECORDING_SHARD_SIZE = 200  # Number of steps per shard before rotating
+RECORDING_SHARD_SIZE = 1000  # Number of steps per shard before rotating
 RECORDING_MAX_DISK_GB = 10.0  # Maximum disk space in GB for all recordings (older sessions deleted when exceeded)
 RECORDING_SESSION_NAME = None  # Auto-generate if None (timestamp-based)
 

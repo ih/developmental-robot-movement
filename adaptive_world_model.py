@@ -44,8 +44,15 @@ class AdaptiveWorldModel:
                 "prediction_history_size": AdaptiveWorldModelConfig.PREDICTION_HISTORY_SIZE,
                 "uncertainty_threshold": AdaptiveWorldModelConfig.UNCERTAINTY_THRESHOLD,
                 "reconstruction_threshold": AdaptiveWorldModelConfig.RECONSTRUCTION_THRESHOLD,
-                "log_interval": AdaptiveWorldModelConfig.LOG_INTERVAL,
-                "visualization_upload_interval": AdaptiveWorldModelConfig.VISUALIZATION_UPLOAD_INTERVAL
+                "prediction_threshold": AdaptiveWorldModelConfig.PREDICTION_THRESHOLD,
+                "autoencoder_lr": AdaptiveWorldModelConfig.AUTOENCODER_LR,
+                "predictor_lr": AdaptiveWorldModelConfig.PREDICTOR_LR,
+                "mask_ratio_min": AdaptiveWorldModelConfig.MASK_RATIO_MIN,
+                "mask_ratio_max": AdaptiveWorldModelConfig.MASK_RATIO_MAX,
+                "pred_patch_w": AdaptiveWorldModelConfig.PRED_PATCH_W,
+                "pred_latent_w": AdaptiveWorldModelConfig.PRED_LATENT_W,
+                "max_history_size": AdaptiveWorldModelConfig.MAX_HISTORY_SIZE,
+                "checkpoint_history_limit": AdaptiveWorldModelConfig.CHECKPOINT_HISTORY_LIMIT,
             })
             self.wandb_enabled = True
         else:
@@ -87,6 +94,9 @@ class AdaptiveWorldModel:
         
         # Display counter for interval-based display updates
         self.display_counter = 0
+
+        # Counter for consecutive autoencoder training iterations before reaching step 3
+        self.consecutive_autoencoder_iterations = 0
         
         # Load checkpoint if it exists
         self.load_checkpoint()
@@ -306,22 +316,31 @@ class AdaptiveWorldModel:
             if reconstruction_loss > reconstruction_threshold:
                 # Train autoencoder if reconstruction is poor
                 train_loss = self.train_autoencoder(current_frame)
-                
+
                 # Show current and reconstructed frames while training (periodically)
                 # if self.autoencoder_training_step % AdaptiveWorldModelConfig.DISPLAY_TRAINING_INTERVAL == 0:
                 #     self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
                 self.autoencoder_training_step += 1
-                
-                
+                self.consecutive_autoencoder_iterations += 1
+
+
                 continue  # Skip action execution until reconstruction improves
             
             # Step 3: Train predictors until fresh predictions meet threshold
+            # Log consecutive autoencoder training iterations if any occurred
+            if self.consecutive_autoencoder_iterations > 0:
+                if self.wandb_enabled:
+                    wandb.log({"consecutive_autoencoder_iterations": self.consecutive_autoencoder_iterations})
+                self.consecutive_autoencoder_iterations = 0  # Reset counter
+
             prediction_errors = []
             if self.prediction_buffer:
                 # Get prediction context for fresh predictions
                 history_features, history_actions = self.get_prediction_context()
 
+                predictor_training_iterations = 0
                 while True:  # Keep training until all fresh prediction errors are below threshold
+                    predictor_training_iterations += 1
                     # Make fresh predictions with current context
                     fresh_predictions = []
                     for predictor in self.predictors:
@@ -345,6 +364,8 @@ class AdaptiveWorldModel:
                     prediction_threshold = AdaptiveWorldModelConfig.PREDICTION_THRESHOLD
                     if all(error < prediction_threshold for error in prediction_errors):
                         # All fresh predictions accurate - ready to proceed
+                        if self.wandb_enabled:
+                            wandb.log({"predictor_training_iterations": predictor_training_iterations})
                         break
                     else:
                         # Train predictors that had errors using the same predictions we evaluated

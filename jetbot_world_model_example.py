@@ -28,7 +28,7 @@ def main():
 
     # Optional: Override learning rates (leave as None to use saved optimizer rates or config defaults)
     AUTOENCODER_LR = None    # Use saved optimizer rate or config default
-    PREDICTOR_LR = None      # Use saved optimizer rate or config default
+    PREDICTOR_LR = 2e-4      # Use saved optimizer rate or config default
 
     # Create JetBot interface
     logger.info("Connecting to JetBot...")
