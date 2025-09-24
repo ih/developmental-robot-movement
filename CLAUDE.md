@@ -1,8 +1,6 @@
-# Developmental Robot Movement
+# CLAUDE.md
 
-Research code for developmental robot movement with hierarchical world models and uncertainty-based exploration.
-
-Currently a work in progress with [notes here](https://docs.google.com/document/d/e/2PACX-1vTdVqbwuou38bDDVrR4LonrjLcE2SXu6SYXUpeU9nmfKAc9raojYJW40eqHxlj8fqNR1FU9o24JCzPX/pub):
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
@@ -39,15 +37,16 @@ This repository contains research code for developmental robot movement with a m
 ## Key Components
 
 ### Session Viewer Notebook
-- **session_viewer.ipynb**: Jupyter notebook for exploring recorded sessions. Provides frame playback with action callouts and lets you run autoencoder/predictor checkpoints to compare predictions against ground truth.
+- **session_viewer.ipynb**: Use this notebook to browse recorded sessions, visualize the actions between observations, and run autoencoder/predictor checkpoints against stored frames.
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
-- **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for improved generalization
+- **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for better generalization
 - **TransformerActionConditionedPredictor**: Causal transformer that interleaves visual features with action tokens
 - **Fresh prediction training**: Predictors trained using fresh predictions with consistent loss calculation
 - **Dual loss training**: Combined patch-space reconstruction + latent-space prediction losses for encoder optimization
-- **Joint training architecture**: Autoencoder reconstruction loss + action predictor gradient flow with shared encoder
+- **Prediction-friendly representations**: Encoder learns features that are both visually meaningful and easy to predict
+- **Joint training architecture**: Autoencoder reconstruction loss + dual predictor losses with shared encoder gradients
 - **Sequence length management**: Handles long histories (4096 token capacity with clipping for GPU safety)
 - **Quality gating**: Robot stops acting when reconstruction loss > threshold, focuses on vision training
 - **Real-time visualization**: Training progress display showing current vs reconstructed frames
@@ -61,13 +60,12 @@ This repository contains research code for developmental robot movement with a m
 - **Format**: `{'motor_left': 0, 'motor_right': value, 'duration': 0.2}`
 - **Smooth ramping**: Gradual acceleration/deceleration for gearbox protection
 - **Automatic stopping**: Motors automatically ramp down to 0 after duration expires
+- **Motor configuration**: Uses right motor for movement control, left motor remains at 0
 
 ### Configuration
 - **config.py**: Contains image transforms, constants, and adaptive world model parameters
-- **AdaptiveWorldModelConfig class**: Centralized configuration for all model parameters
+- **AdaptiveWorldModelConfig class**: Centralized configuration for all model parameters including thresholds, learning rates, and training intervals
 - **Recording configuration**: `RECORDING_MODE` boolean controls recording vs online mode, `RECORDING_MAX_DISK_GB` limits total disk usage
-- **Configurable intervals**: Logging frequency, visualization uploads, checkpoint saving, and display intervals
-- **Action timing**: Configurable delay between actions via `ACTION_DELAY` parameter (default 0 seconds)
 - **IP addresses**: JetBot connection IPs specified in integration example (modify as needed)
 
 ## Running the Code
@@ -88,7 +86,7 @@ python jetbot_world_model_example.py
 - Requires JetBot running RPyC server
 - Interactive mode with real robot control
 - Press Enter to continue with proposed action, type custom action dict, or 'stop' to exit
-- **Automatic checkpoint saving**: Learning progress saved every 10 predictor training steps
+- **Automatic checkpoint saving**: Learning progress saved every 500 predictor training steps (configurable)
 - **Resume learning**: Automatically loads previous training progress on restart
 - **Connection error handling**: Automatically terminates when JetBot becomes unreachable (e.g., battery runs out, network disconnection)
 
@@ -115,18 +113,9 @@ python replay_session_example.py
 - **Checkpoint sharing**: All modes (online, record, replay) share the same checkpoint directory for continuous learning
 - **Disk space management**: Automatic cleanup of oldest sessions when total recordings exceed configurable disk limit (default 10 GB)
 
-### Interactive JetBot Testing
-```bash
-jupyter notebook test_jetbot_actions.ipynb
-```
-- Interactive testing of JetBot action space in Jupyter notebook
-- Test individual actions with visual feedback
-- Capture before/after frames and analyze differences
-- Useful for validating robot behavior and camera setup
-
 ## Dependencies
 
-Install the required dependencies:
+Install dependencies with:
 ```bash
 pip install -r requirements.txt
 ```
@@ -157,7 +146,7 @@ Required Python packages:
 - `replay_robot.py`: Robot interface replacement for replaying recorded sessions
 - `recorded_policy.py`: Action selector factory for recorded action playback
 - `replay_session_example.py`: Robot-agnostic replay script for recorded sessions
-- `test_jetbot_actions.ipynb`: Interactive Jupyter notebook for JetBot action space testing
+- `test_jetbot_actions.ipynb`: Jupyter notebook for interactive JetBot action space testing
 - `config.py`: Shared configuration, image transforms, and adaptive world model parameters
 - `requirements.txt`: Python package dependencies
 - `.gitignore`: Excludes `.claude/` directory, `CLAUDE.md`, wandb logs, checkpoints, and common Python artifacts
@@ -177,144 +166,66 @@ To add support for a new robot:
 - Include any parameters your robot needs (motor speeds, duration, etc.)
 - The world model will learn about all parameters in the action space
 
-## Experiment Tracking with Weights & Biases
+### Experiment Tracking
+- **Weights & Biases integration**: Pass `wandb_project` parameter to `AdaptiveWorldModel` constructor to enable logging
+- **Core metrics**: `reconstruction_loss`, `autoencoder_training_loss`, `predictor_training_loss`, `step`, `training_step`
+- **Dual loss components**: `predictor_patch_loss` (visual quality anchor), `predictor_latent_loss` (prediction-friendly encoder training)
+- **Predictor quality**: `predictor_explained_variance` (R² in patch space - scale-invariant metric showing predictor improvement over baseline)
+- **Training metrics**: `predictor_grad_norm`, `predictor_lr`, `predictor_uwr_95th`, `mask_ratio`
+- **Action timing statistics**: `action_timing/mean_interval`, `action_timing/median_interval`, `action_timing/min_interval`, `action_timing/max_interval`, `action_timing/std_interval`
+- **Fresh prediction quality**: `prediction_errors/level_X` for each predictor level (guides training decisions)
+- **Detailed transformer metrics**: Per-layer gradient norms and UWR for transformer layers (e.g., `grad_norms/transformer/transformer_layer_0_self_attn`, `uwr/transformer/transformer_layer_1_linear1`)
+- **New metrics**: `consecutive_autoencoder_iterations` and `predictor_training_iterations` for training phase analysis
+- **Usage**: `AdaptiveWorldModel(robot_interface, wandb_project="my-experiment")` or `None` to disable
 
-The system includes optional integration with [Weights & Biases](https://wandb.ai/) for experiment tracking and visualization.
-
-### Enabling wandb Logging
-
-To enable wandb logging, provide a project name when creating the AdaptiveWorldModel:
-
-```python
-# With wandb logging and checkpoints enabled
-model = AdaptiveWorldModel(robot_interface, wandb_project="my-robot-experiment", checkpoint_dir="my_checkpoints")
-
-# Without wandb logging but with checkpoints (default)
-model = AdaptiveWorldModel(robot_interface, checkpoint_dir="checkpoints")
-
-# Minimal setup (no wandb, default checkpoint directory)
-model = AdaptiveWorldModel(robot_interface)
-```
-
-### Logging and Visualization Features
-
-**Efficient Logging:**
-- **Throttled logging**: All metrics logged every 100 steps (LOG_INTERVAL) to reduce computational overhead
-- **Optimized calculations**: Detailed gradient norms and update-to-weight ratios calculated only when logging occurs
-- **Configurable intervals**: Adjust `LOG_INTERVAL` in config.py to control logging frequency
-
-**Visual Monitoring:**
-- **Prediction visualizations**: Complete visualization grids uploaded to wandb periodically
-- **Remote monitoring**: View current frame, decoded frame, and all action predictions via wandb interface
-- **Upload frequency**: Visualizations uploaded every 10 steps (configurable via `VISUALIZATION_UPLOAD_INTERVAL`)
-
-### Logged Metrics
-
-The following metrics are automatically logged when wandb is enabled:
-
-**Vision System:**
-- **`reconstruction_loss`**: Quality of visual reconstruction (lower is better, logged every 100 steps)
-- **`autoencoder_training_loss`**: Training loss during autoencoder updates
-- **`autoencoder_training_step`**: Dedicated counter for autoencoder training iterations
-- **`mask_ratio`**: Dynamic mask ratio used during autoencoder training (0.3-0.85 range)
-
-**Prediction System:**
-- **`predictor_training_loss`**: Combined patch + latent loss for predictor training
-- **`predictor_patch_loss`**: Patch-space reconstruction loss (anchors visual quality)
-- **`predictor_latent_loss`**: Latent-space prediction loss (trains encoder for predictability)
-- **`predictor_explained_variance`**: R² in patch space - scale-invariant predictor quality metric (target: >0.2 indicates meaningful learning)
-- **`predictor_training_step`**: Dedicated counter for predictor training iterations
-- **`predictor_grad_norm`**: Global gradient norm for predictor parameters
-- **`predictor_lr`**: Current learning rate for predictor optimizer
-- **`predictor_uwr_95th`**: 95th percentile update-to-weight ratio across all predictor parameters
-
-**Detailed Transformer Metrics:**
-- **Per-layer gradient norms**: `grad_norms/transformer/transformer_layer_X_sublayer` (median values)
-- **Per-layer UWR**: `uwr/transformer/transformer_layer_X_sublayer` (median values)
-- **Sublayer tracking**: Separate metrics for self_attn, linear1, linear2, etc. components
-
-**Dual Loss Training Approach:**
-- **Patch loss (weight=1.0)**: Maintains visual reconstruction quality and prevents representation collapse
-- **Latent loss (weight=0.1)**: Encourages encoder to learn prediction-friendly representations
-- **Combined approach**: Encoder gradients flow from both predictor and reconstruction tasks
-
-**Interpreting Explained Variance (R²):**
-- **≈0.0**: Predictor no better than predicting mean patch values (common early in training)
-- **0.2-0.6**: Materially learning useful structure; should trend upward over training steps
-- **<0**: Worse than baseline (indicates potential data/scale mismatches or unstable updates)
-- **→1.0**: Excellent alignment in patch space (theoretical maximum)
-
-**Training Progress Metrics:**
-- **`consecutive_autoencoder_iterations`**: Number of consecutive autoencoder training steps before proceeding to prediction training
-- **`predictor_training_iterations`**: Number of predictor training iterations needed before meeting threshold
-
-**Action Timing Statistics:**
-- **`action_timing/mean_interval`**: Average time between actions (logged every 100 actions)
-- **`action_timing/median_interval`**: Median time between actions
-- **`action_timing/min_interval`**: Minimum time between actions
-- **`action_timing/max_interval`**: Maximum time between actions
-- **`action_timing/std_interval`**: Standard deviation of action intervals
-- **`action_count`**: Total number of actions taken
-
-**Fresh Prediction Quality:**
-- **`prediction_errors/level_X`**: Prediction error for each predictor level (guides training decisions)
-
-**Visual Data:**
-- **`predictions_visualization`**: Complete visualization showing current frame, decoded frame, and predictions for all actions
-
-### Setup
-
-1. Install wandb: `pip install wandb` (included in requirements.txt)
-2. Login to wandb: `wandb login`
-3. Run with project name parameter to enable logging
-
-## Learning Progress Persistence
-
-The system automatically saves and loads learning progress to enable continuous training across sessions with a rolling backup system for maximum reliability.
-
-### Features
-
+### Learning Progress Persistence
 - **Rolling backup system**: Automatic backup creation before each save for safety
 - **Automatic checkpointing**: Model weights, optimizers, and training progress saved periodically
 - **Predictable behavior**: Every run picks up exactly where the last run finished
 - **Automatic safety net**: One-deep rollback point if new checkpoint gets corrupted
-- **Resume training**: Automatically loads existing checkpoints on startup
-- **Configurable directory**: Set checkpoint location via `checkpoint_dir` parameter
-- **Periodic saves**: Checkpoints saved every 500 predictor training steps (configurable)
+- **Checkpoint directory**: Configurable via `checkpoint_dir` parameter (defaults to "checkpoints")
+- **Resume training**: Automatically loads existing checkpoints on startup (primary files first, then backup files)
+- **Saved components**:
+  - Neural network weights (autoencoder, predictors)
+  - Optimizer states for continued training
+  - Training step counters and learning progress
+  - Recent history buffers (last 100 entries)
+- **File naming**:
+  - Primary files: `autoencoder.pth`, `predictor_0.pth`, `state.pkl`
+  - Backup files: `autoencoder_backup.pth`, `predictor_0_backup.pth`, `state_backup.pkl`
+- **Usage**: `AdaptiveWorldModel(robot_interface, checkpoint_dir="jetbot_checkpoints")`
 
-### File Naming Convention
+### Configuration Management
+- **Centralized parameters**: All adaptive world model parameters moved to `config.py` in `AdaptiveWorldModelConfig` class
+- **Recording configuration**: `RECORDING_MODE` boolean and `RECORDING_MAX_DISK_GB` for disk space management
+- **Configurable intervals**: Logging, visualization upload, checkpoint saving, and training display frequencies
+- **Training parameters**:
+  - Mask ratio bounds (MASK_RATIO_MIN=0.3, MASK_RATIO_MAX=0.85)
+  - Learning rates (AUTOENCODER_LR=1e-4, PREDICTOR_LR=1e-4)
+  - Quality thresholds (RECONSTRUCTION_THRESHOLD=0.0005, PREDICTION_THRESHOLD=0.0005)
+- **Action timing**: Configurable delay between actions via `ACTION_DELAY` parameter for controlled execution timing
+- **Easy tuning**: Modify parameters in one location instead of scattered throughout the code
+- **Default values**: Reasonable defaults for all parameters (LOG_INTERVAL=100, ACTION_DELAY=0, etc.)
+- **Recent changes**: Tightened quality thresholds and unified learning rates for more consistent training
 
-- **Primary files**: `autoencoder.pth`, `predictor_0.pth`, `state.pkl`
-- **Backup files**: `autoencoder_backup.pth`, `predictor_0_backup.pth`, `state_backup.pkl`
+### Logging and Monitoring
+- **Throttled logging frequency**: All metrics logged periodically (LOG_INTERVAL=100 steps) to reduce computational overhead
+- **Periodic visualization uploads**: Complete prediction visualizations uploaded to wandb every N steps
+- **Comprehensive metrics**: Reconstruction loss, predictor training loss, timing metrics, action counts, and mask ratios
+- **Scale-invariant quality tracking**: Explained variance (R²) in patch space provides intuitive predictor performance assessment
+- **Visual monitoring**: Remote access to current frame, decoded frame, and all action predictions via wandb
+- **Training insights**: Track dynamic mask ratios and reconstruction-based predictor training progress
+- **Detailed transformer metrics**: Per-layer gradient norms and update-to-weight ratios for individual transformer layers and sublayers
+- **Optimized metric calculation**: Gradient norms and UWR calculations throttled to reduce performance impact during training
+- **Hierarchical metric organization**: Transformer layers tracked separately with detailed sublayer breakdowns (e.g., `grad_norms/transformer/transformer_layer_0_self_attn`)
+- **Statistical focus**: Only median values tracked for gradient norms and per-layer UWR, plus 95th percentile for global UWR
+- **Learning rate flexibility**: Override learning rates at runtime while respecting saved optimizer states
 
-### Saved Components
-
-- Neural network weights (autoencoder, predictors)
-- Optimizer states for continued training
-- Training step counters and learning progress
-- Recent history buffers (last 100 entries)
-
-### Usage
-
-```python
-# Custom checkpoint directory
-model = AdaptiveWorldModel(robot_interface, checkpoint_dir="jetbot_checkpoints")
-
-# Override learning rates (useful for experimentation)
-model = AdaptiveWorldModel(robot_interface, autoencoder_lr=1e-4, predictor_lr=5e-4)
-
-# Default directory ("checkpoints") with config learning rates
-model = AdaptiveWorldModel(robot_interface)
-```
-
-### Learning Rate Management
-
-The system uses a hierarchy for determining learning rates:
-
-1. **Explicit parameters** (e.g., `predictor_lr=1e-3`) - Override everything
-2. **Saved optimizer state** - Used when resuming from checkpoint and no explicit override
-3. **Config defaults** - Used when starting fresh and no explicit override
-
-This allows for flexible experimentation while respecting existing training state.
-
-Checkpoints are excluded from git via `.gitignore` to avoid committing large model files.
+### Enhanced Visualization System
+- **Real-time prediction comparison**: Visual display comparing last predicted frame with actual current frame
+- **Integrated error metrics**: Reconstruction loss displayed above decoded frame, prediction error above last prediction
+- **Performance optimization**: Display updates on configurable intervals (DISPLAY_INTERVAL=10) instead of every iteration
+- **Smart interactive mode**: Always shows current visualization in interactive mode for user decision-making
+- **Comprehensive layout**: Current frame → Decoded frame (with reconstruction loss) → Last prediction (with error) → Action predictions
+- **Visual error analysis**: Direct pixel-by-pixel comparison between predictions and reality
+- **Efficient rendering**: Reduced CPU/GPU usage during long training runs while maintaining visual feedback
