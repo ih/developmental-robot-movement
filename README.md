@@ -38,8 +38,8 @@ This repository contains research code for developmental robot movement with a m
 
 ## Key Components
 
-### Session Viewer Notebook
-- **session_viewer.ipynb**: Jupyter notebook for exploring recorded sessions. Provides frame playback with action callouts and lets you run autoencoder/predictor checkpoints to compare predictions against ground truth.
+### Session Explorer Notebook
+- **session_explorer.ipynb**: Interactive Jupyter notebook for exploring recorded sessions and training models. Provides frame playback with action callouts, lets you run autoencoder/predictor checkpoints to compare predictions against ground truth, and includes training sections to improve models on specific frames or sequences.
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
@@ -115,6 +115,17 @@ python replay_session_example.py
 - **Checkpoint sharing**: All modes (online, record, replay) share the same checkpoint directory for continuous learning
 - **Disk space management**: Automatic cleanup of oldest sessions when total recordings exceed configurable disk limit (default 10 GB)
 
+### Session Explorer and Training
+```bash
+jupyter notebook session_explorer.ipynb
+```
+- **Interactive session exploration**: Load and browse recorded robot sessions with frame-by-frame playback
+- **Model inference**: Run autoencoder and predictor checkpoints on selected frames to compare predictions with ground truth
+- **Adaptive training**: Train models on specific frames or sequences using the exact same algorithms as the live system
+- **Threshold-based training**: Train until reconstruction/prediction loss drops below specified thresholds
+- **Step-based training**: Train for a specific number of iterations with real-time progress monitoring
+- **AdaptiveWorldModel integration**: Uses actual `AdaptiveWorldModel.train_autoencoder()` and `train_predictor()` methods for authentic training experience
+
 ### Interactive JetBot Testing
 ```bash
 jupyter notebook test_jetbot_actions.ipynb
@@ -157,6 +168,7 @@ Required Python packages:
 - `replay_robot.py`: Robot interface replacement for replaying recorded sessions
 - `recorded_policy.py`: Action selector factory for recorded action playback
 - `replay_session_example.py`: Robot-agnostic replay script for recorded sessions
+- `session_explorer.ipynb`: Interactive session exploration and training notebook with AdaptiveWorldModel integration
 - `test_jetbot_actions.ipynb`: Interactive Jupyter notebook for JetBot action space testing
 - `config.py`: Shared configuration, image transforms, and adaptive world model parameters
 - `requirements.txt`: Python package dependencies

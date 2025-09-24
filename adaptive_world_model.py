@@ -916,6 +916,8 @@ class AdaptiveWorldModel:
         if self.predictor_training_step % self.save_interval == 0:
             self.save_checkpoint()
 
+        return prediction_loss.item()
+
 
     def train_autoencoder(self, ground_truth_frame):
         """Train only the autoencoder with masked reconstruction"""
