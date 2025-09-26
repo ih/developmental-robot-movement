@@ -313,7 +313,250 @@ def get_future_action_for_prediction(session_state, target_obs_index):
     next_obs = observations[target_obs_index + 1]
     return find_action_between_events(events, current_obs["event_index"], next_obs["event_index"])
 
+def visualize_autoencoder_weights(autoencoder):
+    """Visualize key autoencoder weights for monitoring changes"""
+    if autoencoder is None:
+        return None
+    
+    with torch.no_grad():
+        # Get patch embedding weights (first layer)
+        patch_embed_weight = autoencoder.patch_embed.proj.weight.detach().cpu()
+        
+        # Get cls token and pos embed
+        cls_token = autoencoder.cls_token.detach().cpu()
+        pos_embed = autoencoder.pos_embed.detach().cpu()
+        
+        # Get some decoder weights
+        decoder_embed_weight = autoencoder.decoder_embed.weight.detach().cpu() if hasattr(autoencoder, 'decoder_embed') else None
+        
+        # Create visualization
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # Patch embedding weights - show first 16 filters
+        patch_weights_vis = patch_embed_weight[:16].view(16, 3, 16, 16)
+        patch_grid = torch.cat([torch.cat([patch_weights_vis[i*4+j] for j in range(4)], dim=2) for i in range(4)], dim=1)
+        patch_grid = (patch_grid - patch_grid.min()) / (patch_grid.max() - patch_grid.min())
+        axes[0, 0].imshow(patch_grid.permute(1, 2, 0))
+        axes[0, 0].set_title("Patch Embed Weights (16 filters)")
+        axes[0, 0].axis("off")
+        
+        # Patch embedding weight statistics
+        axes[0, 1].hist(patch_embed_weight.flatten().numpy(), bins=50, alpha=0.7)
+        axes[0, 1].set_title(f"Patch Embed Weight Distribution\nMean: {patch_embed_weight.mean():.6f}, Std: {patch_embed_weight.std():.6f}")
+        axes[0, 1].set_xlabel("Weight Value")
+        axes[0, 1].set_ylabel("Count")
+        
+        # CLS token visualization
+        cls_reshaped = cls_token.view(-1).numpy()
+        axes[0, 2].plot(cls_reshaped)
+        axes[0, 2].set_title(f"CLS Token\nMean: {cls_token.mean():.6f}, Std: {cls_token.std():.6f}")
+        axes[0, 2].set_xlabel("Dimension")
+        axes[0, 2].set_ylabel("Value")
+        
+        # Position embedding visualization (first 100 dimensions)
+        pos_vis = pos_embed[0, :, :100].numpy()
+        im = axes[1, 0].imshow(pos_vis, aspect='auto', cmap='coolwarm')
+        axes[1, 0].set_title(f"Position Embeddings (first 100 dims)\nShape: {pos_embed.shape}")
+        axes[1, 0].set_xlabel("Embedding Dimension")
+        axes[1, 0].set_ylabel("Position")
+        plt.colorbar(im, ax=axes[1, 0])
+        
+        # Decoder embedding weights if available
+        if decoder_embed_weight is not None:
+            axes[1, 1].hist(decoder_embed_weight.flatten().numpy(), bins=50, alpha=0.7, color='orange')
+            axes[1, 1].set_title(f"Decoder Embed Weight Distribution\nMean: {decoder_embed_weight.mean():.6f}, Std: {decoder_embed_weight.std():.6f}")
+            axes[1, 1].set_xlabel("Weight Value")
+            axes[1, 1].set_ylabel("Count")
+        else:
+            axes[1, 1].text(0.5, 0.5, "Decoder weights\nnot available", ha='center', va='center', transform=axes[1, 1].transAxes)
+            axes[1, 1].set_title("Decoder Weights")
+        
+        # Weight norms across layers
+        layer_norms = []
+        layer_names = []
+        for name, param in autoencoder.named_parameters():
+            if 'weight' in name and param.dim() >= 2:
+                layer_norms.append(param.norm().item())
+                layer_names.append(name.split('.')[-2] if '.' in name else name)
+        
+        if layer_norms:
+            axes[1, 2].bar(range(len(layer_norms)), layer_norms)
+            axes[1, 2].set_title("Layer Weight Norms")
+            axes[1, 2].set_xlabel("Layer")
+            axes[1, 2].set_ylabel("L2 Norm")
+            axes[1, 2].set_xticks(range(0, len(layer_names), max(1, len(layer_names)//5)))
+            axes[1, 2].set_xticklabels([layer_names[i] for i in range(0, len(layer_names), max(1, len(layer_names)//5))], rotation=45)
+        else:
+            axes[1, 2].text(0.5, 0.5, "No weight layers\nfound", ha='center', va='center', transform=axes[1, 2].transAxes)
+            axes[1, 2].set_title("Layer Weight Norms")
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Return weight statistics for comparison
+        stats = {
+            'patch_embed_mean': patch_embed_weight.mean().item(),
+            'patch_embed_std': patch_embed_weight.std().item(),
+            'cls_token_mean': cls_token.mean().item(),
+            'cls_token_std': cls_token.std().item(),
+            'pos_embed_mean': pos_embed.mean().item(),
+            'pos_embed_std': pos_embed.std().item(),
+            'layer_norms': dict(zip(layer_names, layer_norms)) if layer_norms else {}
+        }
+        return stats
 
+def visualize_predictor_weights(predictor):
+    """Visualize key predictor (transformer) weights for monitoring changes"""
+    if predictor is None:
+        return None
+    
+    with torch.no_grad():
+        # Get various transformer weights based on actual architecture
+        # Action embedding weights  
+        action_embed_weight = predictor.action_embedding.weight.detach().cpu() if hasattr(predictor, 'action_embedding') else None
+        
+        # Position embedding weights
+        pos_embed_weight = predictor.position_embedding.weight.detach().cpu() if hasattr(predictor, 'position_embedding') else None
+        
+        # Token type embedding weights
+        token_type_weight = predictor.token_type_embedding.weight.detach().cpu() if hasattr(predictor, 'token_type_embedding') else None
+        
+        # Future query parameter
+        future_query_weight = predictor.future_query.detach().cpu() if hasattr(predictor, 'future_query') else None
+        
+        # Get first transformer layer weights (TransformerEncoderLayer structure)
+        first_layer_self_attn_weight = None
+        first_layer_linear1_weight = None
+        first_layer_linear2_weight = None
+        
+        if hasattr(predictor, 'transformer_layers') and len(predictor.transformer_layers) > 0:
+            first_layer = predictor.transformer_layers[0]
+            
+            # Self-attention weights (in_proj_weight contains Q, K, V)
+            if hasattr(first_layer, 'self_attn') and hasattr(first_layer.self_attn, 'in_proj_weight'):
+                first_layer_self_attn_weight = first_layer.self_attn.in_proj_weight.detach().cpu()
+            
+            # MLP weights
+            if hasattr(first_layer, 'linear1') and hasattr(first_layer.linear1, 'weight'):
+                first_layer_linear1_weight = first_layer.linear1.weight.detach().cpu()
+            if hasattr(first_layer, 'linear2') and hasattr(first_layer.linear2, 'weight'):
+                first_layer_linear2_weight = first_layer.linear2.weight.detach().cpu()
+        
+        # Output head weights
+        output_head_weight = predictor.output_head.weight.detach().cpu() if hasattr(predictor, 'output_head') and hasattr(predictor.output_head, 'weight') else None
+        
+        # Create visualization
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # Action embedding weights
+        if action_embed_weight is not None:
+            axes[0, 0].hist(action_embed_weight.flatten().numpy(), bins=50, alpha=0.7, color='blue')
+            axes[0, 0].set_title(f"Action Embed Weight Distribution\nMean: {action_embed_weight.mean():.6f}, Std: {action_embed_weight.std():.6f}")
+            axes[0, 0].set_xlabel("Weight Value")
+            axes[0, 0].set_ylabel("Count")
+        else:
+            axes[0, 0].text(0.5, 0.5, "Action embedding\nweights not found", ha='center', va='center', transform=axes[0, 0].transAxes)
+            axes[0, 0].set_title("Action Embedding Weights")
+        
+        # Position embedding weights
+        if pos_embed_weight is not None:
+            axes[0, 1].hist(pos_embed_weight.flatten().numpy(), bins=50, alpha=0.7, color='green')
+            axes[0, 1].set_title(f"Position Embed Weight Distribution\nMean: {pos_embed_weight.mean():.6f}, Std: {pos_embed_weight.std():.6f}")
+            axes[0, 1].set_xlabel("Weight Value")
+            axes[0, 1].set_ylabel("Count")
+        else:
+            axes[0, 1].text(0.5, 0.5, "Position embedding\nweights not found", ha='center', va='center', transform=axes[0, 1].transAxes)
+            axes[0, 1].set_title("Position Embedding Weights")
+        
+        # First transformer layer self-attention weights
+        if first_layer_self_attn_weight is not None:
+            axes[0, 2].hist(first_layer_self_attn_weight.flatten().numpy(), bins=50, alpha=0.7, color='red')
+            axes[0, 2].set_title(f"First Layer Self-Attn Weights\nMean: {first_layer_self_attn_weight.mean():.6f}, Std: {first_layer_self_attn_weight.std():.6f}")
+            axes[0, 2].set_xlabel("Weight Value")
+            axes[0, 2].set_ylabel("Count")
+        else:
+            axes[0, 2].text(0.5, 0.5, "Self-attention\nweights not found", ha='center', va='center', transform=axes[0, 2].transAxes)
+            axes[0, 2].set_title("First Layer Self-Attn")
+        
+        # First transformer layer linear1 (MLP) weights
+        if first_layer_linear1_weight is not None:
+            axes[1, 0].hist(first_layer_linear1_weight.flatten().numpy(), bins=50, alpha=0.7, color='purple')
+            axes[1, 0].set_title(f"First Layer Linear1 Weights\nMean: {first_layer_linear1_weight.mean():.6f}, Std: {first_layer_linear1_weight.std():.6f}")
+            axes[1, 0].set_xlabel("Weight Value")
+            axes[1, 0].set_ylabel("Count")
+        else:
+            axes[1, 0].text(0.5, 0.5, "Linear1 weights\nnot found", ha='center', va='center', transform=axes[1, 0].transAxes)
+            axes[1, 0].set_title("First Layer Linear1")
+        
+        # Output head weights
+        if output_head_weight is not None:
+            axes[1, 1].hist(output_head_weight.flatten().numpy(), bins=50, alpha=0.7, color='orange')
+            axes[1, 1].set_title(f"Output Head Weight Distribution\nMean: {output_head_weight.mean():.6f}, Std: {output_head_weight.std():.6f}")
+            axes[1, 1].set_xlabel("Weight Value")
+            axes[1, 1].set_ylabel("Count")
+        else:
+            axes[1, 1].text(0.5, 0.5, "Output head\nweights not found", ha='center', va='center', transform=axes[1, 1].transAxes)
+            axes[1, 1].set_title("Output Head Weights")
+        
+        # Weight norms across all layers
+        layer_norms = []
+        layer_names = []
+        for name, param in predictor.named_parameters():
+            if 'weight' in name and param.dim() >= 2:
+                layer_norms.append(param.norm().item())
+                # Shorten layer names for display
+                short_name = name.split('.')[-1] if '.' in name else name
+                if len(short_name) > 15:
+                    short_name = short_name[:12] + "..."
+                layer_names.append(short_name)
+        
+        if layer_norms:
+            axes[1, 2].bar(range(len(layer_norms)), layer_norms)
+            axes[1, 2].set_title("Layer Weight Norms")
+            axes[1, 2].set_xlabel("Layer")
+            axes[1, 2].set_ylabel("L2 Norm")
+            # Show every 5th label to avoid overcrowding
+            step = max(1, len(layer_names)//8)
+            axes[1, 2].set_xticks(range(0, len(layer_names), step))
+            axes[1, 2].set_xticklabels([layer_names[i] for i in range(0, len(layer_names), step)], rotation=45, ha='right')
+        else:
+            axes[1, 2].text(0.5, 0.5, "No weight layers\nfound", ha='center', va='center', transform=axes[1, 2].transAxes)
+            axes[1, 2].set_title("Layer Weight Norms")
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Return weight statistics for comparison
+        stats = {}
+        if action_embed_weight is not None:
+            stats.update({
+                'action_embed_mean': action_embed_weight.mean().item(),
+                'action_embed_std': action_embed_weight.std().item(),
+            })
+        if pos_embed_weight is not None:
+            stats.update({
+                'pos_embed_mean': pos_embed_weight.mean().item(),
+                'pos_embed_std': pos_embed_weight.std().item(),
+            })
+        if first_layer_self_attn_weight is not None:
+            stats.update({
+                'first_self_attn_mean': first_layer_self_attn_weight.mean().item(),
+                'first_self_attn_std': first_layer_self_attn_weight.std().item(),
+            })
+        if first_layer_linear1_weight is not None:
+            stats.update({
+                'first_linear1_mean': first_layer_linear1_weight.mean().item(),
+                'first_linear1_std': first_layer_linear1_weight.std().item(),
+            })
+        if output_head_weight is not None:
+            stats.update({
+                'output_head_mean': output_head_weight.mean().item(),
+                'output_head_std': output_head_weight.std().item(),
+            })
+        if layer_norms:
+            stats['layer_norms'] = dict(zip(layer_names, layer_norms))
+        
+        return stats
 
 
 # In[4]:
@@ -370,7 +613,7 @@ training_widgets = {}
 
 def on_train_autoencoder_threshold(_):
     """Train autoencoder until threshold is met using AdaptiveWorldModel"""
-    autoencoder = session_state.get("autoencoder")
+    autoencoder = adaptive_world_model.autoencoder
     if autoencoder is None:
         with training_widgets["autoencoder_training_output"]:
             training_widgets["autoencoder_training_output"].clear_output()
@@ -393,14 +636,15 @@ def on_train_autoencoder_threshold(_):
     observation = session_state.get("observations", [])[idx]
     frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"]).unsqueeze(0).to(device)
     
-    # Load models into AdaptiveWorldModel
-    adaptive_world_model.autoencoder = autoencoder
-    adaptive_world_model.device = device
-    
     with training_widgets["autoencoder_training_output"]:
         training_widgets["autoencoder_training_output"].clear_output()
+        
+        # Show pre-training weights
         display(Markdown(f"**Training autoencoder using AdaptiveWorldModel on frame {idx+1} (step {observation['step']})**"))
         display(Markdown(f"Target threshold: {format_loss(threshold)}, Max steps: {max_steps}"))
+        display(Markdown("### Pre-Training Network Weights"))
+        pre_stats = visualize_autoencoder_weights(autoencoder)
+        
         display(Markdown("**Using AdaptiveWorldModel.train_autoencoder() method with randomized masking**"))
         
         losses = []
@@ -433,6 +677,27 @@ def on_train_autoencoder_threshold(_):
             display(Markdown(f"✅ **Target threshold {format_loss(threshold)} achieved!**"))
         else:
             display(Markdown(f"⚠️ **Target threshold {format_loss(threshold)} not reached after {max_steps} steps**"))
+        
+        # Show post-training weights
+        display(Markdown("### Post-Training Network Weights"))
+        post_stats = visualize_autoencoder_weights(autoencoder)
+        
+        # Compare weight changes
+        if pre_stats and post_stats:
+            weight_changes = {
+                'patch_embed_mean_change': abs(post_stats['patch_embed_mean'] - pre_stats['patch_embed_mean']),
+                'patch_embed_std_change': abs(post_stats['patch_embed_std'] - pre_stats['patch_embed_std']),
+                'cls_token_mean_change': abs(post_stats['cls_token_mean'] - pre_stats['cls_token_mean']),
+                'cls_token_std_change': abs(post_stats['cls_token_std'] - pre_stats['cls_token_std']),
+            }
+            changes_text = f"""
+**Weight Changes:**
+- Patch Embed Mean: {weight_changes['patch_embed_mean_change']:.8f}
+- Patch Embed Std: {weight_changes['patch_embed_std_change']:.8f}
+- CLS Token Mean: {weight_changes['cls_token_mean_change']:.8f}
+- CLS Token Std: {weight_changes['cls_token_std_change']:.8f}
+            """
+            display(Markdown(changes_text))
         
         # Plot training progress
         if len(losses) > 1:
@@ -467,7 +732,7 @@ def on_train_autoencoder_threshold(_):
 
 def on_train_autoencoder_steps(_):
     """Train autoencoder for specified number of steps using AdaptiveWorldModel"""
-    autoencoder = session_state.get("autoencoder")
+    autoencoder = adaptive_world_model.autoencoder
     if autoencoder is None:
         with training_widgets["autoencoder_training_output"]:
             training_widgets["autoencoder_training_output"].clear_output()
@@ -489,13 +754,14 @@ def on_train_autoencoder_steps(_):
     observation = session_state.get("observations", [])[idx]
     frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"]).unsqueeze(0).to(device)
     
-    # Load models into AdaptiveWorldModel
-    adaptive_world_model.autoencoder = autoencoder
-    adaptive_world_model.device = device
-    
     with training_widgets["autoencoder_training_output"]:
         training_widgets["autoencoder_training_output"].clear_output()
+        
+        # Show pre-training weights
         display(Markdown(f"**Training autoencoder using AdaptiveWorldModel on frame {idx+1} (step {observation['step']}) for {num_steps} steps**"))
+        display(Markdown("### Pre-Training Network Weights"))
+        pre_stats = visualize_autoencoder_weights(autoencoder)
+        
         display(Markdown("**Using AdaptiveWorldModel.train_autoencoder() method with randomized masking**"))
         
         losses = []
@@ -516,6 +782,27 @@ def on_train_autoencoder_steps(_):
         # Display results
         display(Markdown(f"**Training completed in {end_time-start_time:.1f}s**"))
         display(Markdown(f"Initial loss: {format_loss(losses[0])}, Final loss: {format_loss(final_loss)}"))
+        
+        # Show post-training weights
+        display(Markdown("### Post-Training Network Weights"))
+        post_stats = visualize_autoencoder_weights(autoencoder)
+        
+        # Compare weight changes
+        if pre_stats and post_stats:
+            weight_changes = {
+                'patch_embed_mean_change': abs(post_stats['patch_embed_mean'] - pre_stats['patch_embed_mean']),
+                'patch_embed_std_change': abs(post_stats['patch_embed_std'] - pre_stats['patch_embed_std']),
+                'cls_token_mean_change': abs(post_stats['cls_token_mean'] - pre_stats['cls_token_mean']),
+                'cls_token_std_change': abs(post_stats['cls_token_std'] - pre_stats['cls_token_std']),
+            }
+            changes_text = f"""
+**Weight Changes:**
+- Patch Embed Mean: {weight_changes['patch_embed_mean_change']:.8f}
+- Patch Embed Std: {weight_changes['patch_embed_std_change']:.8f}
+- CLS Token Mean: {weight_changes['cls_token_mean_change']:.8f}
+- CLS Token Std: {weight_changes['cls_token_std_change']:.8f}
+            """
+            display(Markdown(changes_text))
         
         # Plot training progress
         if len(losses) > 1:
@@ -572,8 +859,8 @@ train_autoencoder_steps_button.on_click(on_train_autoencoder_steps)
 # Predictor Training Section using AdaptiveWorldModel
 def on_train_predictor_threshold(_):
     """Train predictor until threshold is met using AdaptiveWorldModel"""
-    autoencoder = session_state.get("autoencoder")
-    predictor = session_state.get("predictor")
+    autoencoder = adaptive_world_model.autoencoder
+    predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
     frame_slider = session_widgets.get("frame_slider")
     
     with training_widgets["predictor_training_output"]:
@@ -608,23 +895,14 @@ def on_train_predictor_threshold(_):
         next_obs = session_state["observations"][target_idx + 1]
         target_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
         
-        # Load models into AdaptiveWorldModel and setup predictors
-        adaptive_world_model.autoencoder = autoencoder
-        adaptive_world_model.predictors = [predictor]
-        adaptive_world_model.device = device
-        
         # Get feature history and setup context
         feature_history = []
         for obs in selected_obs:
-            cached = session_state["feature_cache"].get(obs["frame_path"])
-            if cached is None:
-                tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
-                autoencoder.eval()
-                with torch.no_grad():
-                    encoded = autoencoder.encode(tensor)
-                session_state["feature_cache"][obs["frame_path"]] = encoded.detach().cpu()
-                cached = session_state["feature_cache"][obs["frame_path"]]
-            feature_history.append(cached.to(device))
+            tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
+            autoencoder.eval()
+            with torch.no_grad():
+                encoded = autoencoder.encode(tensor).detach()
+            feature_history.append(encoded)
 
         recorded_future_action, action_source = get_future_action_for_prediction(session_state, target_idx)
         info_message = None
@@ -642,6 +920,11 @@ def on_train_predictor_threshold(_):
         display(Markdown(f"**Training predictor using AdaptiveWorldModel on history ending at frame {target_idx+1} (step {selected_obs[-1]['step']})**"))
         display(Markdown(f"Target threshold: {format_loss(threshold)}, Max steps: {max_steps}"))
         display(Markdown(f"History length: {len(selected_obs)} frames"))
+        
+        # Show pre-training weights
+        display(Markdown("### Pre-Training Predictor Network Weights"))
+        pre_stats = visualize_predictor_weights(predictor)
+        
         display(Markdown(f"**Using AdaptiveWorldModel.train_predictor() method with joint training**"))
         
         losses = []
@@ -652,7 +935,6 @@ def on_train_predictor_threshold(_):
         
         for step in progress:
             # Use AdaptiveWorldModel's train_predictor method
-            # This method expects current_frame_tensor, predicted_features, history_features, history_actions
             try:
                 # Set up prediction context for fresh predictions
                 predicted_features = predictor(feature_history, history_actions_with_future)
@@ -691,6 +973,58 @@ def on_train_predictor_threshold(_):
         else:
             display(Markdown(f"⚠️ **Target threshold {format_loss(threshold)} not reached after {max_steps} steps**"))
         
+        # Show post-training weights
+        display(Markdown("### Post-Training Predictor Network Weights"))
+        post_stats = visualize_predictor_weights(predictor)
+        
+        # Compare weight changes
+        if pre_stats and post_stats:
+            weight_changes = {}
+            if 'action_embed_mean' in pre_stats and 'action_embed_mean' in post_stats:
+                weight_changes.update({
+                    'action_embed_mean_change': abs(post_stats['action_embed_mean'] - pre_stats['action_embed_mean']),
+                    'action_embed_std_change': abs(post_stats['action_embed_std'] - pre_stats['action_embed_std']),
+                })
+            if 'pos_embed_mean' in pre_stats and 'pos_embed_mean' in post_stats:
+                weight_changes.update({
+                    'pos_embed_mean_change': abs(post_stats['pos_embed_mean'] - pre_stats['pos_embed_mean']),
+                    'pos_embed_std_change': abs(post_stats['pos_embed_std'] - pre_stats['pos_embed_std']),
+                })
+            if 'first_self_attn_mean' in pre_stats and 'first_self_attn_mean' in post_stats:
+                weight_changes.update({
+                    'first_self_attn_mean_change': abs(post_stats['first_self_attn_mean'] - pre_stats['first_self_attn_mean']),
+                    'first_self_attn_std_change': abs(post_stats['first_self_attn_std'] - pre_stats['first_self_attn_std']),
+                })
+            if 'first_linear1_mean' in pre_stats and 'first_linear1_mean' in post_stats:
+                weight_changes.update({
+                    'first_linear1_mean_change': abs(post_stats['first_linear1_mean'] - pre_stats['first_linear1_mean']),
+                    'first_linear1_std_change': abs(post_stats['first_linear1_std'] - pre_stats['first_linear1_std']),
+                })
+            
+            if weight_changes:
+                changes_lines = ["**Weight Changes:**"]
+                if 'action_embed_mean_change' in weight_changes:
+                    changes_lines.extend([
+                        f"- Action Embed Mean: {weight_changes['action_embed_mean_change']:.8f}",
+                        f"- Action Embed Std: {weight_changes['action_embed_std_change']:.8f}",
+                    ])
+                if 'pos_embed_mean_change' in weight_changes:
+                    changes_lines.extend([
+                        f"- Position Embed Mean: {weight_changes['pos_embed_mean_change']:.8f}",
+                        f"- Position Embed Std: {weight_changes['pos_embed_std_change']:.8f}",
+                    ])
+                if 'first_self_attn_mean_change' in weight_changes:
+                    changes_lines.extend([
+                        f"- First Self-Attn Mean: {weight_changes['first_self_attn_mean_change']:.8f}",
+                        f"- First Self-Attn Std: {weight_changes['first_self_attn_std_change']:.8f}",
+                    ])
+                if 'first_linear1_mean_change' in weight_changes:
+                    changes_lines.extend([
+                        f"- First Linear1 Mean: {weight_changes['first_linear1_mean_change']:.8f}",
+                        f"- First Linear1 Std: {weight_changes['first_linear1_std_change']:.8f}",
+                    ])
+                display(Markdown("\n".join(changes_lines)))
+        
         # Plot training progress
         if len(losses) > 1:
             fig, ax = plt.subplots(1, 1, figsize=(8, 4))
@@ -726,8 +1060,8 @@ def on_train_predictor_threshold(_):
 
 def on_train_predictor_steps(_):
     """Train predictor for specified number of steps using AdaptiveWorldModel"""
-    autoencoder = session_state.get("autoencoder")
-    predictor = session_state.get("predictor")
+    autoencoder = adaptive_world_model.autoencoder
+    predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
     frame_slider = session_widgets.get("frame_slider")
     
     with training_widgets["predictor_training_output"]:
@@ -761,23 +1095,14 @@ def on_train_predictor_steps(_):
         next_obs = session_state["observations"][target_idx + 1]
         target_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
         
-        # Load models into AdaptiveWorldModel and setup predictors
-        adaptive_world_model.autoencoder = autoencoder
-        adaptive_world_model.predictors = [predictor]
-        adaptive_world_model.device = device
-        
         # Get feature history and setup context
         feature_history = []
         for obs in selected_obs:
-            cached = session_state["feature_cache"].get(obs["frame_path"])
-            if cached is None:
-                tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
-                autoencoder.eval()
-                with torch.no_grad():
-                    encoded = autoencoder.encode(tensor)
-                session_state["feature_cache"][obs["frame_path"]] = encoded.detach().cpu()
-                cached = session_state["feature_cache"][obs["frame_path"]]
-            feature_history.append(cached.to(device))
+            tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
+            autoencoder.eval()
+            with torch.no_grad():
+                encoded = autoencoder.encode(tensor).detach()
+            feature_history.append(encoded)
 
         recorded_future_action, action_source = get_future_action_for_prediction(session_state, target_idx)
         info_message = None
@@ -794,6 +1119,11 @@ def on_train_predictor_steps(_):
 
         display(Markdown(f"**Training predictor using AdaptiveWorldModel on history ending at frame {target_idx+1} (step {selected_obs[-1]['step']}) for {num_steps} steps**"))
         display(Markdown(f"History length: {len(selected_obs)} frames"))
+        
+        # Show pre-training weights
+        display(Markdown("### Pre-Training Predictor Network Weights"))
+        pre_stats = visualize_predictor_weights(predictor)
+        
         display(Markdown(f"**Using AdaptiveWorldModel.train_predictor() method with joint training**"))
         
         losses = []
@@ -830,6 +1160,58 @@ def on_train_predictor_steps(_):
         # Display results
         display(Markdown(f"**Training completed in {end_time-start_time:.1f}s**"))
         display(Markdown(f"Initial total loss: {format_loss(losses[0])}, Final total loss: {format_loss(final_loss)}"))
+        
+        # Show post-training weights
+        display(Markdown("### Post-Training Predictor Network Weights"))
+        post_stats = visualize_predictor_weights(predictor)
+        
+        # Compare weight changes
+        if pre_stats and post_stats:
+            weight_changes = {}
+            if 'action_embed_mean' in pre_stats and 'action_embed_mean' in post_stats:
+                weight_changes.update({
+                    'action_embed_mean_change': abs(post_stats['action_embed_mean'] - pre_stats['action_embed_mean']),
+                    'action_embed_std_change': abs(post_stats['action_embed_std'] - pre_stats['action_embed_std']),
+                })
+            if 'pos_embed_mean' in pre_stats and 'pos_embed_mean' in post_stats:
+                weight_changes.update({
+                    'pos_embed_mean_change': abs(post_stats['pos_embed_mean'] - pre_stats['pos_embed_mean']),
+                    'pos_embed_std_change': abs(post_stats['pos_embed_std'] - pre_stats['pos_embed_std']),
+                })
+            if 'first_self_attn_mean' in pre_stats and 'first_self_attn_mean' in post_stats:
+                weight_changes.update({
+                    'first_self_attn_mean_change': abs(post_stats['first_self_attn_mean'] - pre_stats['first_self_attn_mean']),
+                    'first_self_attn_std_change': abs(post_stats['first_self_attn_std'] - pre_stats['first_self_attn_std']),
+                })
+            if 'first_linear1_mean' in pre_stats and 'first_linear1_mean' in post_stats:
+                weight_changes.update({
+                    'first_linear1_mean_change': abs(post_stats['first_linear1_mean'] - pre_stats['first_linear1_mean']),
+                    'first_linear1_std_change': abs(post_stats['first_linear1_std'] - pre_stats['first_linear1_std']),
+                })
+            
+            if weight_changes:
+                changes_lines = ["**Weight Changes:**"]
+                if 'action_embed_mean_change' in weight_changes:
+                    changes_lines.extend([
+                        f"- Action Embed Mean: {weight_changes['action_embed_mean_change']:.8f}",
+                        f"- Action Embed Std: {weight_changes['action_embed_std_change']:.8f}",
+                    ])
+                if 'pos_embed_mean_change' in weight_changes:
+                    changes_lines.extend([
+                        f"- Position Embed Mean: {weight_changes['pos_embed_mean_change']:.8f}",
+                        f"- Position Embed Std: {weight_changes['pos_embed_std_change']:.8f}",
+                    ])
+                if 'first_self_attn_mean_change' in weight_changes:
+                    changes_lines.extend([
+                        f"- First Self-Attn Mean: {weight_changes['first_self_attn_mean_change']:.8f}",
+                        f"- First Self-Attn Std: {weight_changes['first_self_attn_std_change']:.8f}",
+                    ])
+                if 'first_linear1_mean_change' in weight_changes:
+                    changes_lines.extend([
+                        f"- First Linear1 Mean: {weight_changes['first_linear1_mean_change']:.8f}",
+                        f"- First Linear1 Std: {weight_changes['first_linear1_std_change']:.8f}",
+                    ])
+                display(Markdown("\n".join(changes_lines)))
         
         # Plot training progress
         if len(losses) > 1:
@@ -885,239 +1267,171 @@ train_predictor_steps_button.on_click(on_train_predictor_steps)
 # In[7]:
 
 
-# Interactive controls and callbacks
-session_state = {
-    "session_name": None,
-    "session_dir": None,
-    "metadata": {},
-    "events": [],
-    "observations": [],
-    "actions": [],
-    "autoencoder": None,
-    "predictor": None,
-    "feature_cache": {},
-    "action_space": [],
-}
-
+# Main Session Explorer Interface
+session_state = {}
 session_widgets = {}
 
-def reset_feature_cache():
-    session_state["feature_cache"] = {}
-
-def on_refresh_sessions(_=None):
-    options = list_session_dirs(SESSIONS_BASE_DIR)
-    current = session_widgets["session_dropdown"].value if "session_dropdown" in session_widgets else None
-    session_widgets["session_dropdown"].options = options
-    if not options:
-        session_widgets["session_dropdown"].value = None
-    elif current in options:
-        session_widgets["session_dropdown"].value = current
-    else:
-        session_widgets["session_dropdown"].value = options[-1]
-
-def on_load_session(_):
-    dropdown = session_widgets["session_dropdown"]
-    session_name = dropdown.value
-    if not session_name:
+def on_load_session_change(change):
+    selected_session = change["new"]
+    if not selected_session:
         return
-    session_dir = os.path.join(SESSIONS_BASE_DIR, session_name)
-    metadata = load_session_metadata(session_dir)
+    session_dir = os.path.join(SESSIONS_BASE_DIR, selected_session)
+    if not os.path.exists(session_dir):
+        return
+
+    # Load session data
     events = load_session_events(session_dir)
     observations = extract_observations(events, session_dir)
     actions = extract_actions(events)
+    metadata = load_session_metadata(session_dir)
 
+    # Update session state
+    session_state.clear()
     session_state.update({
-        "session_name": session_name,
         "session_dir": session_dir,
-        "metadata": metadata,
+        "session_name": selected_session,
         "events": events,
         "observations": observations,
         "actions": actions,
+        "metadata": metadata,
     })
-    session_state["action_space"] = get_action_space(session_state)
-    reset_feature_cache()
-    tensor_cache.clear()
-    load_frame_bytes.cache_clear()
 
-    with session_widgets["session_area"]:
-        session_widgets["session_area"].clear_output()
-        if not observations:
-            display(Markdown(f"**{session_name}** has no observation frames."))
-            return
-        details = [
-            f"**Session:** {session_name}",
-            f"**Total events:** {len(events)}",
-            f"**Observations:** {len(observations)}",
-            f"**Actions:** {len(actions)}",
-        ]
+    # Update widgets
+    frame_slider = session_widgets.get("frame_slider")
+    history_slider = session_widgets.get("history_slider")
+
+    if frame_slider:
+        frame_slider.max = max(0, len(observations) - 1)
+        frame_slider.value = min(frame_slider.value, frame_slider.max)
+        frame_slider.description = f"Frame (0-{frame_slider.max})"
+
+    if history_slider:
+        history_slider.max = min(10, len(observations))
+        history_slider.value = min(history_slider.value, history_slider.max)
+
+    with session_widgets["output"]:
+        session_widgets["output"].clear_output()
+        display(Markdown(f"**Loaded session:** {selected_session}"))
+        display(Markdown(f"**Observations:** {len(observations)}"))
+        display(Markdown(f"**Actions:** {len(actions)}"))
         if metadata:
-            start_time = metadata.get("start_time")
-            if start_time:
-                details.append(f"**Start:** {start_time}")
-            robot_type = metadata.get("robot_type")
-            if robot_type:
-                details.append(f"**Robot:** {robot_type}")
-        display(Markdown("<br>".join(details)))
+            display(Markdown(f"**Metadata:** {len(metadata)} keys"))
 
-        frame_slider = widgets.IntSlider(value=0, min=0, max=len(observations) - 1, description="Frame", continuous_update=False)
-        play_widget = widgets.Play(interval=100, value=0, min=0, max=len(observations) - 1, step=1, description="Play")
-        widgets.jslink((play_widget, "value"), (frame_slider, "value"))
+def on_frame_change(change):
+    idx = change["new"]
+    observations = session_state.get("observations", [])
+    if not observations or idx >= len(observations):
+        return
 
-        frame_image = widgets.Image(format="jpg")
-        frame_image.layout.width = "448px"
-        frame_info = widgets.HTML()
-        history_preview = widgets.Output()
+    observation = observations[idx]
+    frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"])
+    frame_image = tensor_to_numpy_image(frame_tensor.unsqueeze(0))
 
-        session_widgets["frame_slider"] = frame_slider
-        session_widgets["play_widget"] = play_widget
-        session_widgets["frame_image"] = frame_image
-        session_widgets["frame_info"] = frame_info
-        session_widgets["history_preview"] = history_preview
+    with session_widgets["output"]:
+        session_widgets["output"].clear_output()
 
-        def update_history_preview(idx):
-            if "history_preview" not in session_widgets:
-                return
-            history_slider_widget = session_widgets.get("history_slider")
-            requested = history_slider_widget.value if history_slider_widget else 3
-            requested = max(1, requested)
-            requested = min(requested, idx + 1)
-            start = max(0, idx - requested + 1)
-            obs_slice = observations[start: idx + 1]
-            events_local = session_state.get("events", [])
-            display_items = []
-            for offset, obs in enumerate(obs_slice):
-                frame_bytes = load_frame_bytes(obs["full_path"])
-                border_color = "#4caf50" if (start + offset) == idx else "#cccccc"
-                image = widgets.Image(value=frame_bytes, format="jpg", layout=widgets.Layout(width="160px", height="120px", border=f"2px solid {border_color}"))
-                label_text = f"Step {obs['step']}"
-                if (start + offset) == idx:
-                    label_text += " (current)"
-                label = widgets.HTML(value=f"<div style='text-align:center; font-size:10px'>{label_text}</div>")
-                display_items.append(widgets.VBox([image, label]))
-                if offset < len(obs_slice) - 1:
-                    next_obs = obs_slice[offset + 1]
-                    actions_between = [events_local[i] for i in range(obs["event_index"] + 1, next_obs["event_index"]) if events_local[i].get("type") == "action"]
-                    if actions_between:
-                        action_text = "; ".join(format_action_label(act.get("data", {})) for act in actions_between)
-                    else:
-                        action_text = "No action"
-                    action_label = widgets.HTML(value=f"<div style='font-size:10px; padding:0 6px;'>Action: {action_text}</div>", layout=widgets.Layout(height="120px", display="flex", align_items="center", justify_content="center"))
-                    display_items.append(action_label)
-            session_widgets["history_preview"].clear_output()
-            with session_widgets["history_preview"]:
-                if display_items:
-                    layout = widgets.Layout(display="flex", flex_flow="row", align_items="center")
-                    display(widgets.HBox(display_items, layout=layout))
-                else:
-                    display(Markdown("History preview unavailable for this frame."))
+        display(Markdown(f"**Frame {idx+1}/{len(observations)}** (step {observation['step']})"))
+        display(Markdown(f"**Timestamp:** {format_timestamp(observation.get('timestamp'))}"))
 
-        session_widgets["update_history_preview"] = update_history_preview
-
-        def update_frame(change):
-            idx_local = change["new"] if isinstance(change, dict) else change
-            observation = observations[idx_local]
-            frame_image.value = load_frame_bytes(observation["full_path"])
-            frame_info.value = f"<b>Observation {idx_local + 1} / {len(observations)}</b><br>Step: {observation['step']}<br>Timestamp: {format_timestamp(observation['timestamp'])}"
-            update_history_preview(idx_local)
-
-        frame_slider.observe(update_frame, names="value")
-        update_frame({"new": frame_slider.value})
-
-        display(widgets.VBox([
-            widgets.HBox([play_widget, frame_slider]),
-            frame_image,
-            frame_info,
-            widgets.HTML("<b>History preview</b>"),
-            history_preview,
-        ]))
-
-    session_widgets["model_status"].value = ""
-    session_widgets["autoencoder_output"].clear_output()
-    session_widgets["predictor_output"].clear_output()
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+        ax.imshow(frame_image)
+        ax.set_title(f"Observation {idx+1} (step {observation['step']})")
+        ax.axis("off")
+        plt.tight_layout()
+        plt.show()
 
 def on_load_models(_):
-    messages = []
-    auto_path = session_widgets["autoencoder_path"].value.strip()
-    predictor_path = session_widgets["predictor_path"].value.strip()
+    # Load models into AdaptiveWorldModel
+    autoencoder_path = session_widgets["autoencoder_path"].value
+    predictor_path = session_widgets["predictor_path"].value
 
-    if auto_path:
-        if os.path.exists(auto_path):
-            try:
-                session_state["autoencoder"] = load_autoencoder_model(auto_path, device)
-                reset_feature_cache()
-                messages.append(f"Autoencoder loaded from `{auto_path}`.")
-            except Exception as exc:
-                session_state["autoencoder"] = None
-                messages.append(f"<span style='color:red'>Failed to load autoencoder: {exc}</span>")
-        else:
-            session_state["autoencoder"] = None
-            messages.append(f"<span style='color:red'>Autoencoder path not found: {auto_path}</span>")
-    else:
-        session_state["autoencoder"] = None
-        messages.append("Autoencoder path is empty; skipping load.")
+    with session_widgets["model_output"]:
+        session_widgets["model_output"].clear_output()
 
-    if predictor_path:
-        if os.path.exists(predictor_path):
-            try:
-                session_state["predictor"] = load_predictor_model(predictor_path, device)
-                messages.append(f"Predictor loaded from `{predictor_path}`.")
-            except Exception as exc:
-                session_state["predictor"] = None
-                messages.append(f"<span style='color:red'>Failed to load predictor: {exc}</span>")
-        else:
-            session_state["predictor"] = None
-            messages.append(f"<span style='color:red'>Predictor path not found: {predictor_path}</span>")
-    else:
-        session_state["predictor"] = None
-        messages.append("Predictor path is empty; skipping load.")
+        try:
+            # Load autoencoder if specified and exists
+            if autoencoder_path and os.path.exists(autoencoder_path):
+                adaptive_world_model.autoencoder = load_autoencoder_model(autoencoder_path, device)
+                display(Markdown(f"✅ **Loaded autoencoder** from {autoencoder_path}"))
+            elif autoencoder_path:
+                display(Markdown(f"❌ **Autoencoder file not found:** {autoencoder_path}"))
+            else:
+                display(Markdown("⚠️ **No autoencoder path specified**"))
 
-    session_widgets["model_status"].value = "<br>".join(messages)
+            # Load predictor if specified and exists
+            if predictor_path and os.path.exists(predictor_path):
+                predictor = load_predictor_model(predictor_path, device)
+                adaptive_world_model.predictors = [predictor]
+                display(Markdown(f"✅ **Loaded predictor** from {predictor_path}"))
+            elif predictor_path:
+                display(Markdown(f"❌ **Predictor file not found:** {predictor_path}"))
+            else:
+                display(Markdown("⚠️ **No predictor path specified**"))
+
+        except Exception as e:
+            display(Markdown(f"❌ **Error loading models:** {str(e)}"))
 
 def on_run_autoencoder(_):
-    autoencoder = session_state.get("autoencoder")
-    if autoencoder is None:
-        with session_widgets["autoencoder_output"]:
-            session_widgets["autoencoder_output"].clear_output()
-            display(Markdown("Load the autoencoder checkpoint first."))
-        return
+    autoencoder = adaptive_world_model.autoencoder
     frame_slider = session_widgets.get("frame_slider")
-    if frame_slider is None:
-        with session_widgets["autoencoder_output"]:
-            session_widgets["autoencoder_output"].clear_output()
-            display(Markdown("Load a session to select frames."))
-        return
-
-    idx = frame_slider.value
-    observation = session_state.get("observations", [])[idx]
-    frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"]).unsqueeze(0).to(device)
-
-    autoencoder.eval()
-    with torch.no_grad():
-        reconstructed = autoencoder.reconstruct(frame_tensor)
-    mse = torch.nn.functional.mse_loss(reconstructed, frame_tensor).item()
-
-    original_img = tensor_to_numpy_image(frame_tensor)
-    reconstructed_img = tensor_to_numpy_image(reconstructed)
 
     with session_widgets["autoencoder_output"]:
         session_widgets["autoencoder_output"].clear_output()
-        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+
+        if autoencoder is None:
+            display(Markdown("Load the autoencoder checkpoint first."))
+            return
+        if frame_slider is None:
+            display(Markdown("Load a session to select frames."))
+            return
+
+        idx = frame_slider.value
+        observation = session_state.get("observations", [])[idx]
+        frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"]).unsqueeze(0).to(device)
+
+        autoencoder.eval()
+        with torch.no_grad():
+            reconstructed = autoencoder.reconstruct(frame_tensor)
+            loss = torch.nn.functional.mse_loss(reconstructed, frame_tensor).item()
+
+        original_img = tensor_to_numpy_image(frame_tensor)
+        reconstructed_img = tensor_to_numpy_image(reconstructed)
+
+        display(Markdown(f"**Autoencoder Inference on Frame {idx+1} (step {observation['step']})**"))
+        display(Markdown(f"**Reconstruction Loss:** {loss:.6f}"))
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
         axes[0].imshow(original_img)
-        axes[0].set_title("Input")
+        axes[0].set_title("Original")
         axes[0].axis("off")
         axes[1].imshow(reconstructed_img)
-        axes[1].set_title(f"Reconstruction MSE: {mse:.6f}")
+        axes[1].set_title(f"Reconstructed (Loss: {loss:.6f})")
         axes[1].axis("off")
         plt.tight_layout()
         plt.show()
 
+        # Show autoencoder weight visualization
+        display(Markdown("### Autoencoder Network Weight Visualization"))
+        autoencoder_weight_stats = visualize_autoencoder_weights(autoencoder)
+
+        # Display autoencoder weight statistics
+        if autoencoder_weight_stats:
+            stats_text = f"""
+**Autoencoder Weight Statistics:**
+- Patch Embed: Mean={autoencoder_weight_stats['patch_embed_mean']:.6f}, Std={autoencoder_weight_stats['patch_embed_std']:.6f}
+- CLS Token: Mean={autoencoder_weight_stats['cls_token_mean']:.6f}, Std={autoencoder_weight_stats['cls_token_std']:.6f}
+- Position Embed: Mean={autoencoder_weight_stats['pos_embed_mean']:.6f}, Std={autoencoder_weight_stats['pos_embed_std']:.6f}
+            """
+            display(Markdown(stats_text))
+
 def on_run_predictor(_):
-    autoencoder = session_state.get("autoencoder")
-    predictor = session_state.get("predictor")
+    autoencoder = adaptive_world_model.autoencoder
+    predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
     frame_slider = session_widgets.get("frame_slider")
 
     with session_widgets["predictor_output"]:
         session_widgets["predictor_output"].clear_output()
+
         if autoencoder is None or predictor is None:
             display(Markdown("Load both autoencoder and predictor checkpoints first."))
             return
@@ -1134,134 +1448,75 @@ def on_run_predictor(_):
             display(Markdown(f"**Cannot run predictor:** {error}"))
             return
 
-        actual_history = len(selected_obs)
-        if history_slider_widget and actual_history != history_slider_widget.value:
-            history_slider_widget.value = actual_history
-
+        # Get features for history frames
         feature_history = []
         for obs in selected_obs:
-            cached = session_state["feature_cache"].get(obs["frame_path"])
-            if cached is None:
-                tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
-                autoencoder.eval()
-                with torch.no_grad():
-                    encoded = autoencoder.encode(tensor)
-                session_state["feature_cache"][obs["frame_path"]] = encoded.detach().cpu()
-                cached = session_state["feature_cache"][obs["frame_path"]]
-            feature_history.append(cached)
+            tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
+            autoencoder.eval()
+            with torch.no_grad():
+                encoded = autoencoder.encode(tensor).detach()
+            feature_history.append(encoded)
 
-        feature_history_gpu = [feat.to(device) for feat in feature_history]
+        display(Markdown(f"**Predictor Inference on History ending at Frame {target_idx+1} (step {selected_obs[-1]['step']})**"))
+        display(Markdown(f"**History length:** {len(selected_obs)} frames"))
 
-        recorded_future_action, action_source = get_future_action_for_prediction(session_state, target_idx)
-        recorded_action = clone_action(recorded_future_action) if recorded_future_action is not None else {}
+        # Show history sequence
+        history_images = []
+        for obs in selected_obs:
+            tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"])
+            history_images.append(tensor_to_numpy_image(tensor.unsqueeze(0)))
 
-        predictor.eval()
-        autoencoder.eval()
-
-        if recorded_future_action is None:
-            display(Markdown("No recorded action between current and next frame; using an empty action for comparison."))
-        elif action_source == "previous":
-            display(Markdown("Using the most recent action prior to the current frame for comparison."))
-        predictor.eval()
-        autoencoder.eval()
-
-        if recorded_future_action is None:
-            display(Markdown("No recorded action between current and next frame; using an empty action for comparison."))
-
-        def predict_for_action(action_dict):
-            history_actions = [clone_action(act) for act in action_dicts]
-            if action_dict is not None:
-                history_actions.append(clone_action(action_dict))
-            else:
-                history_actions.append({})
-            pred_features = predictor(feature_history_gpu, history_actions)
-            decoded_candidate = decode_features_to_image(autoencoder, pred_features)
-            return decoded_candidate
-
-        next_obs = session_state["observations"][target_idx + 1] if target_idx + 1 < len(session_state["observations"]) else None
-        actual_tensor_cpu = None
-        actual_tensor_gpu = None
-        actual_img = None
-        if next_obs is not None:
-            actual_tensor_cpu = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0)
-            actual_tensor_gpu = actual_tensor_cpu.to(device)
-            actual_img = tensor_to_numpy_image(actual_tensor_cpu)
-
-        all_predictions = []
-        with torch.no_grad():
-            recorded_pred_tensor = predict_for_action(recorded_action if recorded_future_action is not None else None)
-            recorded_img = tensor_to_numpy_image(recorded_pred_tensor)
-            recorded_mse = None
-            if actual_tensor_gpu is not None:
-                recorded_mse = torch.nn.functional.mse_loss(recorded_pred_tensor, actual_tensor_gpu).item()
-            recorded_label = "Recorded action" if recorded_future_action is not None else "Recorded action (none)"
-            all_predictions.append({
-                "label": recorded_label,
-                "action": clone_action(recorded_action),
-                "image": recorded_img,
-                "mse": recorded_mse,
-            })
-
-            for idx, action in enumerate(session_state.get("action_space", [])):
-                if actions_equal(action, recorded_action):
-                    continue
-                pred_tensor = predict_for_action(action)
-                pred_img = tensor_to_numpy_image(pred_tensor)
-                mse_value = None
-                if actual_tensor_gpu is not None:
-                    mse_value = torch.nn.functional.mse_loss(pred_tensor, actual_tensor_gpu).item()
-                all_predictions.append({
-                    "label": f"{idx + 1}. {format_action_label(action)}",
-                    "action": clone_action(action),
-                    "image": pred_img,
-                    "mse": mse_value,
-                })
-
-        history_steps_text = ", ".join(str(obs["step"]) for obs in selected_obs)
-        action_lines = []
-        for idx, action in enumerate(action_dicts, 1):
-            action_lines.append(f"{idx}. {format_action_label(action)}")
-        if not action_lines:
-            action_lines.append("(No actions in window)")
-
-        display(Markdown(f"**History steps:** {history_steps_text}"))
-        display(Markdown("**Recorded actions:**<br>" + "<br>".join(action_lines)))
-
-        history_fig, history_axes = plt.subplots(1, len(selected_obs), figsize=(3 * len(selected_obs), 3))
-        if isinstance(history_axes, np.ndarray):
-            axes_list = history_axes.flatten()
-        else:
-            axes_list = [history_axes]
-        for idx, (obs, ax) in enumerate(zip(selected_obs, axes_list)):
-            img = np.array(load_frame_image(obs["full_path"]))
-            ax.imshow(img)
-            ax.set_title(f"Step {obs['step']}")
-            ax.axis("off")
-            if idx < len(action_dicts):
-                ax.set_xlabel(format_action_label(action_dicts[idx]), fontsize=9)
+        # Visualize history
+        fig, axes = plt.subplots(1, len(history_images), figsize=(3 * len(history_images), 3))
+        if len(history_images) == 1:
+            axes = [axes]
+        for i, img in enumerate(history_images):
+            axes[i].imshow(img)
+            axes[i].set_title(f"Frame {selected_obs[i]['observation_index']+1}")
+            axes[i].axis("off")
         plt.tight_layout()
         plt.show()
 
-        if actual_img is not None and all_predictions:
-            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-            axes[0].imshow(all_predictions[0]["image"])
-            axes[0].set_title("Predicted (recorded action)")
-            axes[0].axis("off")
-            title = f"Actual next frame (step {next_obs['step']})"
-            if all_predictions[0]["mse"] is not None:
-                title += f"MSE: {all_predictions[0]['mse']:.6f}"
-            axes[1].imshow(actual_img)
-            axes[1].set_title(title)
-            axes[1].axis("off")
-            plt.tight_layout()
-            plt.show()
-        elif all_predictions:
-            fig, ax = plt.subplots(1, 1, figsize=(5, 4))
-            ax.imshow(all_predictions[0]["image"])
-            ax.set_title("Predicted next frame (recorded action)")
-            ax.axis("off")
-            plt.tight_layout()
-            plt.show()
+        # Get recorded action between current and next frame if available
+        recorded_action, action_source = get_future_action_for_prediction(session_state, target_idx)
+        if recorded_action is None:
+            display(Markdown("*No recorded action between current and next frame; using empty action.*"))
+            recorded_action = {}
+        elif action_source == "previous":
+            display(Markdown("*Using the most recent action prior to the current frame.*"))
+
+        # Generate predictions for all possible actions
+        action_space = get_action_space(session_state)
+        all_predictions = []
+
+        if action_space:
+            for action in action_space:
+                history_actions_with_future = [clone_action(a) for a in action_dicts]
+                history_actions_with_future.append(clone_action(action))
+
+                predictor.eval()
+                with torch.no_grad():
+                    predicted_features = predictor(feature_history, history_actions_with_future)
+                    predicted_frame = decode_features_to_image(autoencoder, predicted_features)
+
+                predicted_img = tensor_to_numpy_image(predicted_frame)
+
+                # Calculate MSE if next frame exists
+                mse_loss = None
+                if target_idx + 1 < len(session_state.get("observations", [])):
+                    next_obs = session_state["observations"][target_idx + 1]
+                    next_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        mse_loss = torch.nn.functional.mse_loss(predicted_frame, next_tensor).item()
+
+                all_predictions.append({
+                    "action": action,
+                    "image": predicted_img,
+                    "label": format_action_label(action),
+                    "mse": mse_loss
+                })
+
+        display(Markdown("### Predictions for All Actions"))
 
         if all_predictions:
             cols = min(4, len(all_predictions))
@@ -1275,7 +1530,7 @@ def on_run_predictor(_):
                 if actions_equal(prediction["action"], recorded_action):
                     title += " (recorded)"
                 if prediction["mse"] is not None:
-                    title += f"MSE: {prediction['mse']:.6f}"
+                    title += f" MSE: {prediction['mse']:.6f}"
                 ax.set_title(title, fontsize=9)
                 ax.axis("off")
             for idx in range(len(all_predictions), rows * cols):
@@ -1285,88 +1540,106 @@ def on_run_predictor(_):
         else:
             display(Markdown("No actions available to visualize predictions."))
 
-def on_history_slider_change(_):
-    if "frame_slider" in session_widgets and "update_history_preview" in session_widgets:
-        session_widgets["update_history_preview"](session_widgets["frame_slider"].value)
+        # Show predictor weight visualization
+        display(Markdown("### Predictor Network Weight Visualization"))
+        predictor_weight_stats = visualize_predictor_weights(predictor)
 
-session_dropdown = widgets.Dropdown(description="Session", layout=widgets.Layout(width="300px"))
-session_widgets["session_dropdown"] = session_dropdown
+        # Display predictor weight statistics
+        if predictor_weight_stats:
+            stats_lines = ["**Predictor Weight Statistics:**"]
+            if 'action_embed_mean' in predictor_weight_stats:
+                stats_lines.append(f"- Action Embed: Mean={predictor_weight_stats['action_embed_mean']:.6f}, Std={predictor_weight_stats['action_embed_std']:.6f}")
+            if 'pos_embed_mean' in predictor_weight_stats:
+                stats_lines.append(f"- Position Embed: Mean={predictor_weight_stats['pos_embed_mean']:.6f}, Std={predictor_weight_stats['pos_embed_std']:.6f}")
+            if 'first_self_attn_mean' in predictor_weight_stats:
+                stats_lines.append(f"- First Self-Attn: Mean={predictor_weight_stats['first_self_attn_mean']:.6f}, Std={predictor_weight_stats['first_self_attn_std']:.6f}")
+            if 'first_linear1_mean' in predictor_weight_stats:
+                stats_lines.append(f"- First Linear1: Mean={predictor_weight_stats['first_linear1_mean']:.6f}, Std={predictor_weight_stats['first_linear1_std']:.6f}")
+            if 'output_head_mean' in predictor_weight_stats:
+                stats_lines.append(f"- Output Head: Mean={predictor_weight_stats['output_head_mean']:.6f}, Std={predictor_weight_stats['output_head_std']:.6f}")
+            display(Markdown("\n".join(stats_lines)))
 
-refresh_button = widgets.Button(description="Refresh", icon="refresh")
-load_session_button = widgets.Button(description="Load Session", button_style="primary")
+# Create session selection widgets
+session_dirs = list_session_dirs(SESSIONS_BASE_DIR)
+load_session_dropdown = widgets.Dropdown(
+    options=[""] + session_dirs,
+    value="",
+    description="Session:",
+    style={'description_width': '100px'}
+)
 
-session_area = widgets.Output()
-session_widgets["session_area"] = session_area
+frame_slider = widgets.IntSlider(value=0, min=0, max=0, description="Frame (0-0)", style={'description_width': '100px'})
+history_slider = widgets.IntSlider(value=3, min=2, max=10, description="History", style={'description_width': '100px'})
 
-autoencoder_path = widgets.Text(value=DEFAULT_AUTOENCODER_PATH, description="Autoencoder", layout=widgets.Layout(width="520px"))
-predictor_path = widgets.Text(value=DEFAULT_PREDICTOR_PATH, description="Predictor", layout=widgets.Layout(width="520px"))
-session_widgets["autoencoder_path"] = autoencoder_path
-session_widgets["predictor_path"] = predictor_path
+# Create model loading widgets
+autoencoder_path = widgets.Text(value=DEFAULT_AUTOENCODER_PATH, description="Autoencoder:", style={'description_width': '100px'})
+predictor_path = widgets.Text(value=DEFAULT_PREDICTOR_PATH, description="Predictor:", style={'description_width': '100px'})
+load_models_button = widgets.Button(description="Load Models", button_style="primary", icon="download")
 
-model_status = widgets.HTML()
-session_widgets["model_status"] = model_status
-
+# Create inference buttons
 run_autoencoder_button = widgets.Button(description="Run Autoencoder", button_style="success", icon="play")
+run_predictor_button = widgets.Button(description="Run Predictor", button_style="info", icon="play")
+
+# Create output widgets
+session_output = widgets.Output()
+model_output = widgets.Output()
 autoencoder_output = widgets.Output()
-session_widgets["autoencoder_output"] = autoencoder_output
-
-history_slider = widgets.IntSlider(value=3, min=2, max=8, description="History", continuous_update=False)
-session_widgets["history_slider"] = history_slider
-history_slider.observe(on_history_slider_change, names="value")
-
-run_predictor_button = widgets.Button(description="Run Predictor", button_style="info", icon="forward")
 predictor_output = widgets.Output()
-session_widgets["predictor_output"] = predictor_output
 
-refresh_button.on_click(on_refresh_sessions)
-load_session_button.on_click(on_load_session)
-load_models_button = widgets.Button(description="Load Models", button_style="primary", icon="upload")
+# Store widgets in global dict
+session_widgets.update({
+    "load_session_dropdown": load_session_dropdown,
+    "frame_slider": frame_slider,
+    "history_slider": history_slider,
+    "autoencoder_path": autoencoder_path,
+    "predictor_path": predictor_path,
+    "output": session_output,
+    "model_output": model_output,
+    "autoencoder_output": autoencoder_output,
+    "predictor_output": predictor_output,
+})
+
+# Connect event handlers
+load_session_dropdown.observe(on_load_session_change, names="value")
+frame_slider.observe(on_frame_change, names="value")
 load_models_button.on_click(on_load_models)
 run_autoencoder_button.on_click(on_run_autoencoder)
 run_predictor_button.on_click(on_run_predictor)
 
-on_refresh_sessions()
+# Display interface
+display(Markdown("## Session Explorer Interface"))
 
-display(widgets.VBox([
-    widgets.HBox([session_dropdown, refresh_button, load_session_button]),
-    session_area,
-    widgets.HTML("<hr><b>Model Checkpoints</b>"),
-    autoencoder_path,
-    predictor_path,
-    load_models_button,
-    model_status,
-    widgets.HTML("<hr>"),
-    widgets.VBox([
-        widgets.HTML("<b>Autoencoder Inference</b>"),
-        widgets.HTML("Uses the currently selected frame."),
-        run_autoencoder_button,
-        autoencoder_output,
-    ]),
-    widgets.HTML("<hr>"),
-    widgets.VBox([
-        widgets.HTML("<b>Predictor Inference</b>"),
-        widgets.HTML("History uses frames leading up to the current selection to predict the next observation."),
-        history_slider,
-        run_predictor_button,
-        predictor_output,
-    ]),
-    widgets.HTML("<hr>"),
-    widgets.VBox([
-        widgets.HTML("<b>Autoencoder Training (AdaptiveWorldModel)</b>"),
-        widgets.HTML("Train the autoencoder using AdaptiveWorldModel.train_autoencoder() with randomized masking."),
-        widgets.HBox([autoencoder_threshold, autoencoder_max_steps]),
-        widgets.HBox([train_autoencoder_threshold_button, train_autoencoder_steps_button, autoencoder_steps]),
-        autoencoder_training_output,
-    ]),
-    widgets.HTML("<hr>"),
-    widgets.VBox([
-        widgets.HTML("<b>Predictor Training (AdaptiveWorldModel)</b>"),
-        widgets.HTML("Train the predictor using AdaptiveWorldModel.train_predictor() with joint autoencoder training."),
-        widgets.HBox([predictor_threshold, predictor_max_steps]),
-        widgets.HBox([train_predictor_threshold_button, train_predictor_steps_button, predictor_steps]),
-        predictor_training_output,
-    ]),
-]))
+display(Markdown("### Session Selection"))
+display(widgets.HBox([load_session_dropdown]))
+display(widgets.HBox([frame_slider, history_slider]))
+display(session_output)
+
+display(Markdown("### Model Loading"))
+display(widgets.VBox([autoencoder_path, predictor_path]))
+display(load_models_button)
+display(model_output)
+
+display(Markdown("### Inference"))
+display(widgets.HBox([run_autoencoder_button, run_predictor_button]))
+
+display(Markdown("### Autoencoder Results"))
+display(autoencoder_output)
+
+display(Markdown("### Predictor Results"))
+display(predictor_output)
+
+display(Markdown("### Training Sections"))
+display(Markdown("#### Autoencoder Training"))
+display(widgets.HBox([training_widgets["autoencoder_threshold"], training_widgets["autoencoder_max_steps"]]))
+display(widgets.HBox([training_widgets["autoencoder_steps"]]))
+display(widgets.HBox([train_autoencoder_threshold_button, train_autoencoder_steps_button]))
+display(training_widgets["autoencoder_training_output"])
+
+display(Markdown("#### Predictor Training"))
+display(widgets.HBox([training_widgets["predictor_threshold"], training_widgets["predictor_max_steps"]]))
+display(widgets.HBox([training_widgets["predictor_steps"]]))
+display(widgets.HBox([train_predictor_threshold_button, train_predictor_steps_button]))
+display(training_widgets["predictor_training_output"])
 
 
 # In[ ]:

@@ -38,6 +38,7 @@ This repository contains research code for developmental robot movement with a m
 
 ### Session Explorer Notebook
 - **session_explorer.ipynb**: Interactive Jupyter notebook for exploring recorded sessions and training models. Browse recorded sessions with frame-by-frame playback, run autoencoder/predictor checkpoints against stored frames, and train models on specific frames or sequences using authentic AdaptiveWorldModel methods.
+- **Comprehensive weight visualization**: Real-time visualization of both autoencoder and predictor network weights during inference and training, including weight distribution histograms, layer norms, and detailed change tracking for transformer components (action embeddings, position embeddings, self-attention, MLP layers)
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
