@@ -125,6 +125,8 @@ jupyter notebook session_explorer.ipynb
 - **Threshold-based training**: Train until reconstruction/prediction loss drops below specified thresholds
 - **Step-based training**: Train for a specific number of iterations with real-time progress monitoring
 - **AdaptiveWorldModel integration**: Uses actual `AdaptiveWorldModel.train_autoencoder()` and `train_predictor()` methods for authentic training experience
+- **Model saving capabilities**: Save trained autoencoder and predictor models with configurable paths, compatible with AdaptiveWorldModel checkpoint format
+- **Interactive training controls**: Pause and resume buttons for both autoencoder and predictor training with responsive UI updates and proper state management
 
 ### Interactive JetBot Testing
 ```bash

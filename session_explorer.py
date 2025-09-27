@@ -69,7 +69,7 @@ class StubRobotInterface(RobotInterface):
 
 # Instantiate AdaptiveWorldModel for training access
 stub_robot = StubRobotInterface()
-adaptive_world_model = AdaptiveWorldModel(stub_robot, wandb_project=None, checkpoint_dir=config.DEFAULT_CHECKPOINT_DIR, interactive=False)
+adaptive_world_model = AdaptiveWorldModel(stub_robot, wandb_project="session_explorer", checkpoint_dir=config.DEFAULT_CHECKPOINT_DIR, interactive=False)
 
 
 # In[3]:
@@ -609,86 +609,137 @@ def format_loss(loss_value):
 
 
 # Autoencoder Training Section using AdaptiveWorldModel
-training_widgets = {}
+import asyncio
+import time
 
-def on_train_autoencoder_threshold(_):
-    """Train autoencoder until threshold is met using AdaptiveWorldModel"""
+training_widgets = {}
+AUTOENCODER_TASK_KEY = "autoencoder"
+
+
+def _prepare_autoencoder_training():
+    """Validate prerequisites and build context for autoencoder training."""
+    output = training_widgets["autoencoder_training_output"]
     autoencoder = adaptive_world_model.autoencoder
     if autoencoder is None:
-        with training_widgets["autoencoder_training_output"]:
-            training_widgets["autoencoder_training_output"].clear_output()
+        with output:
+            output.clear_output()
             display(Markdown("Load the autoencoder checkpoint first."))
-        return
-    
+        set_training_status("autoencoder", "error", "Autoencoder checkpoint is not loaded.")
+        update_training_loss("autoencoder", None)
+        return None
+
     frame_slider = session_widgets.get("frame_slider")
     if frame_slider is None:
-        with training_widgets["autoencoder_training_output"]:
-            training_widgets["autoencoder_training_output"].clear_output()
+        with output:
+            output.clear_output()
             display(Markdown("Load a session to select frames."))
-        return
-    
-    # Get training parameters
-    threshold = training_widgets["autoencoder_threshold"].value
-    max_steps = training_widgets["autoencoder_max_steps"].value
-    
-    # Setup for training
+        set_training_status("autoencoder", "error", "Load a session to select frames before training.")
+        update_training_loss("autoencoder", None)
+        return None
+
+    observations = session_state.get("observations", [])
+    if not observations:
+        with output:
+            output.clear_output()
+            display(Markdown("No session loaded. Load a recording before training."))
+        set_training_status("autoencoder", "error", "No session loaded.")
+        update_training_loss("autoencoder", None)
+        return None
+
     idx = frame_slider.value
-    observation = session_state.get("observations", [])[idx]
-    frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"]).unsqueeze(0).to(device)
-    
-    with training_widgets["autoencoder_training_output"]:
-        training_widgets["autoencoder_training_output"].clear_output()
-        
-        # Show pre-training weights
-        display(Markdown(f"**Training autoencoder using AdaptiveWorldModel on frame {idx+1} (step {observation['step']})**"))
+    observation = observations[idx]
+    frame_tensor = get_frame_tensor(
+        session_state["session_dir"],
+        observation["frame_path"],
+    ).unsqueeze(0).to(device)
+
+    return {
+        "autoencoder": autoencoder,
+        "frame_tensor": frame_tensor,
+        "idx": idx,
+        "observation": observation,
+        "output": output,
+    }
+
+
+async def autoencoder_threshold_training(context, threshold, max_steps):
+    autoencoder = context["autoencoder"]
+    frame_tensor = context["frame_tensor"]
+    idx = context["idx"]
+    observation = context["observation"]
+    output = context["output"]
+
+    training_control["autoencoder_resume_data"] = None
+    losses = []
+    start_time = time.time()
+
+    set_training_status("autoencoder", "running", f"Running to threshold {format_loss(threshold)}")
+    update_training_loss("autoencoder", None)
+
+    with output:
+        output.clear_output()
+        display(Markdown(
+            f"**Training autoencoder using AdaptiveWorldModel on frame {idx + 1} (step {observation['step']})**"
+        ))
         display(Markdown(f"Target threshold: {format_loss(threshold)}, Max steps: {max_steps}"))
         display(Markdown("### Pre-Training Network Weights"))
         pre_stats = visualize_autoencoder_weights(autoencoder)
-        
+
         display(Markdown("**Using AdaptiveWorldModel.train_autoencoder() method with randomized masking**"))
-        
-        losses = []
-        start_time = time.time()
-        
-        # Create progress bar
+        display(Markdown("**Tip: Click 'Pause' button to interrupt training at any time.**"))
+
         progress = tqdm(range(max_steps), desc="Training")
-        
-        for step in progress:
-            loss = train_autoencoder_step_wrapper(frame_tensor)
-            losses.append(loss)
-            
-            progress.set_postfix({"Loss": format_loss(loss)})
-            
-            # Check if threshold met
-            if loss <= threshold:
-                progress.close()
-                break
-        else:
+        try:
+            for step in progress:
+                await asyncio.sleep(0)
+                if training_control["autoencoder_paused"]:
+                    training_control["autoencoder_resume_data"] = {
+                        "frame_tensor": frame_tensor,
+                        "threshold": threshold,
+                        "max_steps": max_steps,
+                        "current_step": step,
+                        "losses": losses,
+                        "start_time": start_time,
+                        "pre_stats": pre_stats,
+                    }
+                    set_training_status("autoencoder", "paused", f"Paused at step {step} of {max_steps}. Resume available.")
+                    if losses:
+                        update_training_loss("autoencoder", losses[-1], len(losses), state="paused")
+                    else:
+                        update_training_loss("autoencoder", None)
+                    display(Markdown("**Training paused. Use Resume button to continue.**"))
+                    return
+
+                loss = train_autoencoder_step_wrapper(frame_tensor)
+                losses.append(loss)
+                update_training_loss("autoencoder", loss, len(losses))
+                progress.set_postfix({"Loss": format_loss(loss), "Step": f"{step + 1}/{max_steps}"})
+
+                if loss <= threshold:
+                    break
+        finally:
             progress.close()
-        
+
         end_time = time.time()
-        final_loss = losses[-1] if losses else float('inf')
-        
-        # Display results
-        display(Markdown(f"**Training completed after {len(losses)} steps in {end_time-start_time:.1f}s**"))
+        final_loss = losses[-1] if losses else float("inf")
+
+        display(Markdown(f"**Training completed after {len(losses)} steps in {end_time - start_time:.1f}s**"))
         display(Markdown(f"Final loss: {format_loss(final_loss)}"))
-        
+
         if final_loss <= threshold:
-            display(Markdown(f"✅ **Target threshold {format_loss(threshold)} achieved!**"))
+            display(Markdown(f"**Target threshold {format_loss(threshold)} achieved!**"))
         else:
-            display(Markdown(f"⚠️ **Target threshold {format_loss(threshold)} not reached after {max_steps} steps**"))
-        
-        # Show post-training weights
+            display(Markdown(f"**Target threshold {format_loss(threshold)} not reached after {max_steps} steps.**"))
+
         display(Markdown("### Post-Training Network Weights"))
         post_stats = visualize_autoencoder_weights(autoencoder)
-        
-        # Compare weight changes
+
         if pre_stats and post_stats:
             weight_changes = {
-                'patch_embed_mean_change': abs(post_stats['patch_embed_mean'] - pre_stats['patch_embed_mean']),
-                'patch_embed_std_change': abs(post_stats['patch_embed_std'] - pre_stats['patch_embed_std']),
-                'cls_token_mean_change': abs(post_stats['cls_token_mean'] - pre_stats['cls_token_mean']),
-                'cls_token_std_change': abs(post_stats['cls_token_std'] - pre_stats['cls_token_std']),
+                "patch_embed_mean_change": abs(post_stats["patch_embed_mean"] - pre_stats["patch_embed_mean"]),
+                "patch_embed_std_change": abs(post_stats["patch_embed_std"] - pre_stats["patch_embed_std"]),
+                "cls_token_mean_change": abs(post_stats["cls_token_mean"] - pre_stats["cls_token_mean"]),
+                "cls_token_std_change": abs(post_stats["cls_token_std"] - pre_stats["cls_token_std"]),
             }
             changes_text = f"""
 **Weight Changes:**
@@ -698,28 +749,26 @@ def on_train_autoencoder_threshold(_):
 - CLS Token Std: {weight_changes['cls_token_std_change']:.8f}
             """
             display(Markdown(changes_text))
-        
-        # Plot training progress
+
         if len(losses) > 1:
             fig, ax = plt.subplots(1, 1, figsize=(8, 4))
             ax.plot(losses)
             ax.set_xlabel("Training Step")
             ax.set_ylabel("Reconstruction Loss")
             ax.set_title("Autoencoder Training Progress (AdaptiveWorldModel)")
-            ax.axhline(y=threshold, color='r', linestyle='--', alpha=0.7, label=f'Target: {format_loss(threshold)}')
+            ax.axhline(y=threshold, color="r", linestyle="--", alpha=0.7, label=f"Target: {format_loss(threshold)}")
             ax.legend()
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.show()
-        
-        # Show final reconstruction
+
         adaptive_world_model.autoencoder.eval()
         with torch.no_grad():
             reconstructed = adaptive_world_model.autoencoder.reconstruct(frame_tensor)
-        
+
         original_img = tensor_to_numpy_image(frame_tensor)
         reconstructed_img = tensor_to_numpy_image(reconstructed)
-        
+
         fig, axes = plt.subplots(1, 2, figsize=(8, 4))
         axes[0].imshow(original_img)
         axes[0].set_title("Original")
@@ -730,70 +779,79 @@ def on_train_autoencoder_threshold(_):
         plt.tight_layout()
         plt.show()
 
-def on_train_autoencoder_steps(_):
-    """Train autoencoder for specified number of steps using AdaptiveWorldModel"""
-    autoencoder = adaptive_world_model.autoencoder
-    if autoencoder is None:
-        with training_widgets["autoencoder_training_output"]:
-            training_widgets["autoencoder_training_output"].clear_output()
-            display(Markdown("Load the autoencoder checkpoint first."))
-        return
-    
-    frame_slider = session_widgets.get("frame_slider")
-    if frame_slider is None:
-        with training_widgets["autoencoder_training_output"]:
-            training_widgets["autoencoder_training_output"].clear_output()
-            display(Markdown("Load a session to select frames."))
-        return
-    
-    # Get training parameters
-    num_steps = training_widgets["autoencoder_steps"].value
-    
-    # Setup for training
-    idx = frame_slider.value
-    observation = session_state.get("observations", [])[idx]
-    frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"]).unsqueeze(0).to(device)
-    
-    with training_widgets["autoencoder_training_output"]:
-        training_widgets["autoencoder_training_output"].clear_output()
-        
-        # Show pre-training weights
-        display(Markdown(f"**Training autoencoder using AdaptiveWorldModel on frame {idx+1} (step {observation['step']}) for {num_steps} steps**"))
+    if losses:
+        update_training_loss("autoencoder", final_loss, len(losses), state="completed")
+        set_training_status("autoencoder", "completed", f"Completed in {len(losses)} steps (final loss {format_loss(final_loss)}).")
+    else:
+        update_training_loss("autoencoder", None)
+        set_training_status("autoencoder", "completed", "Completed without updating any steps.")
+
+    training_control["autoencoder_resume_data"] = None
+
+
+async def autoencoder_steps_training(context, num_steps):
+    autoencoder = context["autoencoder"]
+    frame_tensor = context["frame_tensor"]
+    idx = context["idx"]
+    observation = context["observation"]
+    output = context["output"]
+
+    training_control["autoencoder_resume_data"] = None
+    losses = []
+    start_time = time.time()
+
+    set_training_status("autoencoder", "running", f"Running for {num_steps} steps")
+    update_training_loss("autoencoder", None)
+
+    with output:
+        output.clear_output()
+        display(Markdown(
+            f"**Training autoencoder using AdaptiveWorldModel on frame {idx + 1} (step {observation['step']}) for {num_steps} steps**"
+        ))
         display(Markdown("### Pre-Training Network Weights"))
         pre_stats = visualize_autoencoder_weights(autoencoder)
-        
+
         display(Markdown("**Using AdaptiveWorldModel.train_autoencoder() method with randomized masking**"))
-        
-        losses = []
-        start_time = time.time()
-        
-        # Create progress bar
+        display(Markdown("**Tip: Click 'Pause' button to interrupt training at any time.**"))
+
         progress = tqdm(range(num_steps), desc="Training")
-        
-        for step in progress:
-            loss = train_autoencoder_step_wrapper(frame_tensor)
-            losses.append(loss)
-            progress.set_postfix({"Loss": format_loss(loss)})
-        
-        progress.close()
+        try:
+            for step in progress:
+                await asyncio.sleep(0)
+                if training_control["autoencoder_paused"]:
+                    set_training_status("autoencoder", "paused", f"Paused after {step} of {num_steps} steps; restart to continue.")
+                    if losses:
+                        update_training_loss("autoencoder", losses[-1], len(losses), state="paused")
+                    else:
+                        update_training_loss("autoencoder", None)
+                    display(Markdown("**Training paused. Step-based training cannot be resumed.**"))
+                    display(Markdown(f"**Completed {step} out of {num_steps} steps before pausing.**"))
+                    return
+
+                loss = train_autoencoder_step_wrapper(frame_tensor)
+                losses.append(loss)
+                progress.set_postfix({"Loss": format_loss(loss), "Step": f"{step + 1}/{num_steps}"})
+        finally:
+            progress.close()
+
         end_time = time.time()
-        final_loss = losses[-1] if losses else float('inf')
-        
-        # Display results
-        display(Markdown(f"**Training completed in {end_time-start_time:.1f}s**"))
-        display(Markdown(f"Initial loss: {format_loss(losses[0])}, Final loss: {format_loss(final_loss)}"))
-        
-        # Show post-training weights
+        final_loss = losses[-1] if losses else float("inf")
+
+        display(Markdown(f"**Training completed in {end_time - start_time:.1f}s**"))
+        if losses:
+            display(Markdown(f"Initial loss: {format_loss(losses[0])}, Final loss: {format_loss(final_loss)}"))
+        else:
+            display(Markdown("** **No training steps were executed before the run stopped.**"))
+
         display(Markdown("### Post-Training Network Weights"))
         post_stats = visualize_autoencoder_weights(autoencoder)
-        
-        # Compare weight changes
+
         if pre_stats and post_stats:
             weight_changes = {
-                'patch_embed_mean_change': abs(post_stats['patch_embed_mean'] - pre_stats['patch_embed_mean']),
-                'patch_embed_std_change': abs(post_stats['patch_embed_std'] - pre_stats['patch_embed_std']),
-                'cls_token_mean_change': abs(post_stats['cls_token_mean'] - pre_stats['cls_token_mean']),
-                'cls_token_std_change': abs(post_stats['cls_token_std'] - pre_stats['cls_token_std']),
+                "patch_embed_mean_change": abs(post_stats["patch_embed_mean"] - pre_stats["patch_embed_mean"]),
+                "patch_embed_std_change": abs(post_stats["patch_embed_std"] - pre_stats["patch_embed_std"]),
+                "cls_token_mean_change": abs(post_stats["cls_token_mean"] - pre_stats["cls_token_mean"]),
+                "cls_token_std_change": abs(post_stats["cls_token_std"] - pre_stats["cls_token_std"]),
             }
             changes_text = f"""
 **Weight Changes:**
@@ -803,8 +861,7 @@ def on_train_autoencoder_steps(_):
 - CLS Token Std: {weight_changes['cls_token_std_change']:.8f}
             """
             display(Markdown(changes_text))
-        
-        # Plot training progress
+
         if len(losses) > 1:
             fig, ax = plt.subplots(1, 1, figsize=(8, 4))
             ax.plot(losses)
@@ -814,15 +871,14 @@ def on_train_autoencoder_steps(_):
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.show()
-        
-        # Show final reconstruction
+
         adaptive_world_model.autoencoder.eval()
         with torch.no_grad():
             reconstructed = adaptive_world_model.autoencoder.reconstruct(frame_tensor)
-        
+
         original_img = tensor_to_numpy_image(frame_tensor)
         reconstructed_img = tensor_to_numpy_image(reconstructed)
-        
+
         fig, axes = plt.subplots(1, 2, figsize=(8, 4))
         axes[0].imshow(original_img)
         axes[0].set_title("Original")
@@ -832,6 +888,161 @@ def on_train_autoencoder_steps(_):
         axes[1].axis("off")
         plt.tight_layout()
         plt.show()
+
+    if losses:
+        update_training_loss("autoencoder", final_loss, len(losses), state="completed")
+        set_training_status("autoencoder", "completed", f"Finished {len(losses)} steps (final loss {format_loss(final_loss)}).")
+    else:
+        update_training_loss("autoencoder", None)
+        set_training_status("autoencoder", "completed", "Completed without updating any steps.")
+
+    training_control["autoencoder_resume_data"] = None
+
+
+async def autoencoder_resume_training(resume_data):
+    output = training_widgets["autoencoder_training_output"]
+    autoencoder = adaptive_world_model.autoencoder
+    if autoencoder is None:
+        with output:
+            output.clear_output()
+            display(Markdown("**Autoencoder checkpoint not loaded. Load it before resuming.**"))
+        training_control["autoencoder_resume_data"] = None
+        update_training_loss("autoencoder", None)
+        return
+
+    with output:
+        output.clear_output()
+        display(Markdown("**Resuming autoencoder training...**"))
+
+        frame_tensor = resume_data["frame_tensor"]
+        threshold = resume_data["threshold"]
+        max_steps = resume_data["max_steps"]
+        current_step = resume_data["current_step"]
+        losses = resume_data["losses"]
+        start_time = resume_data["start_time"]
+        pre_stats = resume_data["pre_stats"]
+
+        if losses:
+            update_training_loss("autoencoder", losses[-1], len(losses))
+        else:
+            update_training_loss("autoencoder", None)
+
+        set_training_status("autoencoder", "running", f"Resuming from step {current_step} of {max_steps}.")
+
+        remaining_steps = max_steps - current_step
+        if remaining_steps <= 0:
+            display(Markdown("**Training already reached the requested number of steps.**"))
+            if losses:
+                update_training_loss("autoencoder", losses[-1], len(losses), state="completed")
+            else:
+                update_training_loss("autoencoder", None)
+            set_training_status("autoencoder", "completed", "Requested number of steps already reached before resuming.")
+            training_control["autoencoder_resume_data"] = None
+            return
+
+        progress = tqdm(range(remaining_steps), desc=f"Resuming from step {current_step}")
+        try:
+            for step_offset in progress:
+                await asyncio.sleep(0)
+                if training_control["autoencoder_paused"]:
+                    resume_data.update({
+                        "current_step": current_step + step_offset,
+                        "losses": losses,
+                    })
+                    set_training_status("autoencoder", "paused", f"Paused at step {current_step + step_offset} of {max_steps}. Resume available.")
+                    if losses:
+                        update_training_loss("autoencoder", losses[-1], len(losses), state="paused")
+                    else:
+                        update_training_loss("autoencoder", None)
+                    display(Markdown("**Training paused. Use Resume button to continue.**"))
+                    return
+
+                loss = train_autoencoder_step_wrapper(frame_tensor)
+                losses.append(loss)
+                update_training_loss("autoencoder", loss, len(losses))
+                progress.set_postfix({"Loss": format_loss(loss)})
+
+                if loss <= threshold:
+                    break
+        finally:
+            progress.close()
+
+        training_control["autoencoder_resume_data"] = None
+
+        end_time = time.time()
+        final_loss = losses[-1] if losses else float("inf")
+
+        display(Markdown(f"**Training completed after {len(losses)} total steps in {end_time - start_time:.1f}s**"))
+        display(Markdown(f"Final loss: {format_loss(final_loss)}"))
+
+        if final_loss <= threshold:
+            display(Markdown(f"**Target threshold {format_loss(threshold)} achieved!**"))
+        else:
+            display(Markdown(f"**Target threshold {format_loss(threshold)} not reached after {max_steps} steps.**"))
+
+        display(Markdown("### Post-Training Network Weights"))
+        post_stats = visualize_autoencoder_weights(adaptive_world_model.autoencoder)
+
+        if len(losses) > 1:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+            ax.plot(losses)
+            ax.set_xlabel("Training Step")
+            ax.set_ylabel("Reconstruction Loss")
+            ax.set_title("Autoencoder Training Progress (Resumed)")
+            ax.axhline(y=threshold, color="r", linestyle="--", alpha=0.7, label=f"Target: {format_loss(threshold)}")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+
+        if losses:
+            update_training_loss("autoencoder", final_loss, len(losses), state="completed")
+            set_training_status("autoencoder", "completed", f"Completed with final loss {format_loss(final_loss)} after {len(losses)} steps.")
+        else:
+            update_training_loss("autoencoder", None)
+            set_training_status("autoencoder", "completed", "Completed without updating any steps.")
+
+    # Resume function does not render reconstructions to keep output concise.
+
+
+def on_train_autoencoder_threshold(_):
+    context = _prepare_autoencoder_training()
+    if context is None:
+        return
+
+    training_control["autoencoder_paused"] = False
+    training_control["autoencoder_resume_data"] = None
+
+    threshold = training_widgets["autoencoder_threshold"].value
+    max_steps = training_widgets["autoencoder_max_steps"].value
+
+    set_training_status("autoencoder", "running", f"Running to threshold {format_loss(threshold)}")
+
+    start_training_task(
+        AUTOENCODER_TASK_KEY,
+        autoencoder_threshold_training(context, threshold, max_steps),
+        context["output"],
+    )
+
+
+def on_train_autoencoder_steps(_):
+    context = _prepare_autoencoder_training()
+    if context is None:
+        return
+
+    training_control["autoencoder_paused"] = False
+    training_control["autoencoder_resume_data"] = None
+
+    num_steps = training_widgets["autoencoder_steps"].value
+
+    set_training_status("autoencoder", "running", f"Running for {num_steps} steps")
+
+    start_training_task(
+        AUTOENCODER_TASK_KEY,
+        autoencoder_steps_training(context, num_steps),
+        context["output"],
+    )
+
 
 # Create autoencoder training widgets
 autoencoder_threshold = widgets.FloatText(value=0.0005, description="Threshold", step=0.0001, style={'description_width': '100px'})
@@ -856,180 +1067,471 @@ train_autoencoder_steps_button.on_click(on_train_autoencoder_steps)
 # In[6]:
 
 
+# Training control state for pause/resume functionality
+import asyncio
+
+AUTOENCODER_TASK_KEY = globals().get("AUTOENCODER_TASK_KEY", "autoencoder")
+PREDICTOR_TASK_KEY = globals().get("PREDICTOR_TASK_KEY", "predictor")
+
+training_control = {
+    "autoencoder_paused": False,
+    "predictor_paused": False,
+    "autoencoder_resume_data": None,
+    "predictor_resume_data": None,
+}
+
+training_tasks = {
+    AUTOENCODER_TASK_KEY: None,
+    PREDICTOR_TASK_KEY: None,
+}
+
+
+STATUS_STYLES = {
+    "idle": "color: #6c757d;",
+    "running": "color: #2e7d32;",
+    "pausing": "color: #f9a825;",
+    "paused": "color: #ef6c00;",
+    "completed": "color: #1565c0;",
+    "error": "color: #c62828;",
+}
+
+def _status_html(state: str, message: str) -> str:
+    style = STATUS_STYLES.get(state, STATUS_STYLES["idle"])
+    return f"<b>Status:</b> <span style='{style}'>{message}</span>"
+
+def set_training_status(kind: str, state: str, message: str) -> None:
+    widget = training_widgets.get(f"{kind}_status")
+    if widget is not None:
+        widget.value = _status_html(state, message)
+
+LOSS_COLORS = {
+    "running": "#2e7d32",
+    "paused": "#ef6c00",
+    "completed": "#1565c0",
+    "error": "#c62828",
+}
+
+LOSS_DEFAULT = "<b>Loss:</b> <span style='color: #6c757d;'>--</span>"
+
+def update_training_loss(kind: str, loss=None, step=None, state="running") -> None:
+    widget = training_widgets.get(f"{kind}_loss")
+    if widget is None:
+        return
+    if loss is None:
+        widget.value = LOSS_DEFAULT
+        return
+    color = LOSS_COLORS.get(state, LOSS_COLORS["running"])
+    step_text = f" (step {step})" if step is not None else ""
+    widget.value = f"<b>Loss:</b> <span style='color: {color};'>{format_loss(loss)}</span>{step_text}"
+
+
+TASK_NAME_TO_KIND = {
+    AUTOENCODER_TASK_KEY: "autoencoder",
+    PREDICTOR_TASK_KEY: "predictor",
+}
+
+
+
+def _get_event_loop():
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.get_event_loop()
+
+
+def start_training_task(task_name, coroutine, output_widget=None):
+    existing = training_tasks.get(task_name)
+    if existing and not existing.done():
+        if output_widget is not None:
+            with output_widget:
+                display(Markdown("**Training already in progress. Pause it before starting a new run.**"))
+        return None
+
+    loop = _get_event_loop()
+    task = loop.create_task(coroutine)
+    training_tasks[task_name] = task
+
+    def _cleanup(future):
+        training_tasks[task_name] = None
+        if output_widget is None:
+            return
+        if future.cancelled():
+            return
+        exc = future.exception()
+        if exc:
+            with output_widget:
+                display(Markdown(f"**Training error:** {exc}"))
+            kind = TASK_NAME_TO_KIND.get(task_name)
+            if kind:
+                set_training_status(kind, "error", f"Error: {exc}")
+                update_training_loss(kind, None, state="error")
+
+    task.add_done_callback(_cleanup)
+    return task
+
+
+def on_pause_autoencoder(_):
+    output = training_widgets["autoencoder_training_output"]
+    task = training_tasks.get(AUTOENCODER_TASK_KEY)
+    if task is None or task.done():
+        with output:
+            display(Markdown("**No autoencoder training is currently running.**"))
+        set_training_status("autoencoder", "idle", "Idle")
+        return
+
+    training_control["autoencoder_paused"] = True
+    set_training_status("autoencoder", "pausing", "Pause requested. Waiting for current step to finish...")
+    with output:
+        display(Markdown("**Pause requested. Waiting for current step to finish...**"))
+
+
+def on_resume_autoencoder(_):
+    output = training_widgets["autoencoder_training_output"]
+    resume_data = training_control.get("autoencoder_resume_data")
+    if resume_data is None:
+        with output:
+            display(Markdown("**No paused training to resume.**"))
+        set_training_status("autoencoder", "idle", "Idle")
+        return
+
+    task = training_tasks.get(AUTOENCODER_TASK_KEY)
+    if task and not task.done():
+        with output:
+            display(Markdown("**Autoencoder training already running. Pause it before resuming.**"))
+        return
+
+    training_control["autoencoder_paused"] = False
+    set_training_status("autoencoder", "running", "Resuming training...")
+    start_training_task(
+        AUTOENCODER_TASK_KEY,
+        autoencoder_resume_training(resume_data),
+        output,
+    )
+
+
+def on_pause_predictor(_):
+    output = training_widgets["predictor_training_output"]
+    task = training_tasks.get(PREDICTOR_TASK_KEY)
+    if task is None or task.done():
+        with output:
+            display(Markdown("**No predictor training is currently running.**"))
+        set_training_status("predictor", "idle", "Idle")
+        return
+
+    training_control["predictor_paused"] = True
+    set_training_status("predictor", "pausing", "Pause requested. Waiting for current step to finish...")
+    with output:
+        display(Markdown("**Pause requested. Waiting for current step to finish...**"))
+
+
+def on_resume_predictor(_):
+    output = training_widgets["predictor_training_output"]
+    resume_data = training_control.get("predictor_resume_data")
+    if resume_data is None:
+        with output:
+            display(Markdown("**No paused training to resume.**"))
+        set_training_status("predictor", "idle", "Idle")
+        return
+
+    task = training_tasks.get(PREDICTOR_TASK_KEY)
+    if task and not task.done():
+        with output:
+            display(Markdown("**Predictor training already running. Pause it before resuming.**"))
+        return
+
+    training_control["predictor_paused"] = False
+    set_training_status("predictor", "running", "Resuming training...")
+    start_training_task(
+        PREDICTOR_TASK_KEY,
+        predictor_resume_training(resume_data),
+        output,
+    )
+
+
+# Create pause/resume buttons
+pause_autoencoder_button = widgets.Button(description="Pause", button_style="warning", icon="pause")
+resume_autoencoder_button = widgets.Button(description="Resume", button_style="info", icon="play")
+pause_predictor_button = widgets.Button(description="Pause", button_style="warning", icon="pause")
+resume_predictor_button = widgets.Button(description="Resume", button_style="info", icon="play")
+
+# Connect pause/resume handlers
+pause_autoencoder_button.on_click(on_pause_autoencoder)
+resume_autoencoder_button.on_click(on_resume_autoencoder)
+pause_predictor_button.on_click(on_pause_predictor)
+resume_predictor_button.on_click(on_resume_predictor)
+
+autoencoder_status = widgets.HTML(value=_status_html("idle", "Idle"))
+autoencoder_loss = widgets.HTML(value=LOSS_DEFAULT)
+predictor_status = widgets.HTML(value=_status_html("idle", "Idle"))
+predictor_loss = widgets.HTML(value=LOSS_DEFAULT)
+
+# Add to training_widgets
+training_widgets.update({
+    "pause_autoencoder_button": pause_autoencoder_button,
+    "resume_autoencoder_button": resume_autoencoder_button,
+    "pause_predictor_button": pause_predictor_button,
+    "resume_predictor_button": resume_predictor_button,
+    "autoencoder_status": autoencoder_status,
+    "autoencoder_loss": autoencoder_loss,
+    "predictor_status": predictor_status,
+    "predictor_loss": predictor_loss,
+})
+
+
+# In[7]:
+
+
 # Predictor Training Section using AdaptiveWorldModel
-def on_train_predictor_threshold(_):
-    """Train predictor until threshold is met using AdaptiveWorldModel"""
+import asyncio
+import time
+
+PREDICTOR_TASK_KEY = "predictor"
+
+
+def _prepare_predictor_training():
+    """Validate prerequisites and gather tensors for predictor training."""
+    output = training_widgets["predictor_training_output"]
     autoencoder = adaptive_world_model.autoencoder
     predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
-    frame_slider = session_widgets.get("frame_slider")
-    
-    with training_widgets["predictor_training_output"]:
-        training_widgets["predictor_training_output"].clear_output()
-        
-        if autoencoder is None or predictor is None:
+    if autoencoder is None or predictor is None:
+        with output:
+            output.clear_output()
             display(Markdown("Load both autoencoder and predictor checkpoints first."))
-            return
-        if frame_slider is None:
-            display(Markdown("Load a session to select frames."))
-            return
-        
-        # Get training parameters
-        threshold = training_widgets["predictor_threshold"].value
-        max_steps = training_widgets["predictor_max_steps"].value
-        
-        target_idx = frame_slider.value
-        history_slider_widget = session_widgets.get("history_slider")
-        desired_history = history_slider_widget.value if history_slider_widget else 3
-        
-        selected_obs, action_dicts, error = build_predictor_sequence(session_state, target_idx, desired_history)
-        if error:
-            display(Markdown(f"**Cannot train predictor:** {error}"))
-            return
-        
-        # Check if we have a next frame for training target
-        if target_idx + 1 >= len(session_state["observations"]):
-            display(Markdown("**Cannot train predictor:** No next frame available as training target."))
-            return
-        
-        # Get target frame tensor
-        next_obs = session_state["observations"][target_idx + 1]
-        target_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
-        
-        # Get feature history and setup context
-        feature_history = []
-        for obs in selected_obs:
-            tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
-            autoencoder.eval()
-            with torch.no_grad():
-                encoded = autoencoder.encode(tensor).detach()
-            feature_history.append(encoded)
+        set_training_status("predictor", "error", "Load the autoencoder and predictor checkpoints first.")
+        update_training_loss("predictor", None)
+        return None
 
-        recorded_future_action, action_source = get_future_action_for_prediction(session_state, target_idx)
-        info_message = None
-        if recorded_future_action is None:
-            info_message = "No recorded action between current and next frame; using empty action."
-            recorded_future_action = {}
-        elif action_source == "previous":
-            info_message = "Using the most recent action prior to the current frame."
+    frame_slider = session_widgets.get("frame_slider")
+    if frame_slider is None:
+        with output:
+            output.clear_output()
+            display(Markdown("Load a session to select frames."))
+        set_training_status("predictor", "error", "Load a session to select frames before training.")
+        update_training_loss("predictor", None)
+        return None
+
+    observations = session_state.get("observations", [])
+    if not observations:
+        with output:
+            output.clear_output()
+            display(Markdown("No session loaded. Load a recording before training."))
+        set_training_status("predictor", "error", "No session loaded.")
+        update_training_loss("predictor", None)
+        return None
+
+    target_idx = frame_slider.value
+    history_slider_widget = session_widgets.get("history_slider")
+    desired_history = history_slider_widget.value if history_slider_widget else 3
+
+    selected_obs, action_dicts, error = build_predictor_sequence(session_state, target_idx, desired_history)
+    if error:
+        with output:
+            output.clear_output()
+            display(Markdown(f"**Cannot train predictor:** {error}"))
+        set_training_status("predictor", "error", f"Cannot train: {error}")
+        update_training_loss("predictor", None)
+        return None
+
+    if target_idx + 1 >= len(observations):
+        with output:
+            output.clear_output()
+            display(Markdown("**Cannot train predictor:** No next frame available as training target."))
+        set_training_status("predictor", "error", "No next frame available for training.")
+        update_training_loss("predictor", None)
+        return None
+
+    next_obs = observations[target_idx + 1]
+    target_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
+
+    feature_history = []
+    for obs in selected_obs:
+        tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
+        autoencoder.eval()
+        with torch.no_grad():
+            encoded = autoencoder.encode(tensor).detach()
+        feature_history.append(encoded)
+
+    recorded_future_action, action_source = get_future_action_for_prediction(session_state, target_idx)
+    info_message = None
+    if recorded_future_action is None:
+        info_message = "No recorded action between current and next frame; using empty action."
+        recorded_future_action = {}
+    elif action_source == "previous":
+        info_message = "Using the most recent action prior to the current frame."
+
+    history_actions_with_future = [clone_action(action) for action in action_dicts]
+    history_actions_with_future.append(clone_action(recorded_future_action))
+
+    return {
+        "output": output,
+        "autoencoder": autoencoder,
+        "predictor": predictor,
+        "target_idx": target_idx,
+        "selected_obs": selected_obs,
+        "info_message": info_message,
+        "feature_history": feature_history,
+        "history_actions_with_future": history_actions_with_future,
+        "target_tensor": target_tensor,
+        "next_obs": next_obs,
+    }
+
+
+def _display_predictor_weight_changes(pre_stats, post_stats):
+    if not (pre_stats and post_stats):
+        return
+
+    weight_changes = {}
+    if "action_embed_mean" in pre_stats and "action_embed_mean" in post_stats:
+        weight_changes.update({
+            "action_embed_mean_change": abs(post_stats["action_embed_mean"] - pre_stats["action_embed_mean"]),
+            "action_embed_std_change": abs(post_stats["action_embed_std"] - pre_stats["action_embed_std"]),
+        })
+    if "pos_embed_mean" in pre_stats and "pos_embed_mean" in post_stats:
+        weight_changes.update({
+            "pos_embed_mean_change": abs(post_stats["pos_embed_mean"] - pre_stats["pos_embed_mean"]),
+            "pos_embed_std_change": abs(post_stats["pos_embed_std"] - pre_stats["pos_embed_std"]),
+        })
+    if "first_self_attn_mean" in pre_stats and "first_self_attn_mean" in post_stats:
+        weight_changes.update({
+            "first_self_attn_mean_change": abs(post_stats["first_self_attn_mean"] - pre_stats["first_self_attn_mean"]),
+            "first_self_attn_std_change": abs(post_stats["first_self_attn_std"] - pre_stats["first_self_attn_std"]),
+        })
+    if "first_linear1_mean" in pre_stats and "first_linear1_mean" in post_stats:
+        weight_changes.update({
+            "first_linear1_mean_change": abs(post_stats["first_linear1_mean"] - pre_stats["first_linear1_mean"]),
+            "first_linear1_std_change": abs(post_stats["first_linear1_std"] - pre_stats["first_linear1_std"]),
+        })
+
+    if not weight_changes:
+        return
+
+    lines = ["**Weight Changes:**"]
+    if "action_embed_mean_change" in weight_changes:
+        lines.extend([
+            f"- Action Embed Mean: {weight_changes['action_embed_mean_change']:.8f}",
+            f"- Action Embed Std: {weight_changes['action_embed_std_change']:.8f}",
+        ])
+    if "pos_embed_mean_change" in weight_changes:
+        lines.extend([
+            f"- Position Embed Mean: {weight_changes['pos_embed_mean_change']:.8f}",
+            f"- Position Embed Std: {weight_changes['pos_embed_std_change']:.8f}",
+        ])
+    if "first_self_attn_mean_change" in weight_changes:
+        lines.extend([
+            f"- First Self-Attn Mean: {weight_changes['first_self_attn_mean_change']:.8f}",
+            f"- First Self-Attn Std: {weight_changes['first_self_attn_std_change']:.8f}",
+        ])
+    if "first_linear1_mean_change" in weight_changes:
+        lines.extend([
+            f"- First Linear1 Mean: {weight_changes['first_linear1_mean_change']:.8f}",
+            f"- First Linear1 Std: {weight_changes['first_linear1_std_change']:.8f}",
+        ])
+
+    display(Markdown("\n".join(lines)))
+
+
+async def predictor_threshold_training(context, threshold, max_steps):
+    output = context["output"]
+    autoencoder = context["autoencoder"]
+    predictor = context["predictor"]
+    target_idx = context["target_idx"]
+    selected_obs = context["selected_obs"]
+    info_message = context["info_message"]
+    feature_history = context["feature_history"]
+    history_actions_with_future = context["history_actions_with_future"]
+    target_tensor = context["target_tensor"]
+    next_obs = context["next_obs"]
+
+    training_control["predictor_resume_data"] = None
+    losses = []
+    start_time = time.time()
+
+    set_training_status("predictor", "running", f"Running to threshold {format_loss(threshold)}")
+    update_training_loss("predictor", None)
+
+    with output:
+        output.clear_output()
+        display(Markdown(
+            f"**Training predictor using AdaptiveWorldModel on history ending at frame {target_idx + 1} (step {selected_obs[-1]['step']})**"
+        ))
+        display(Markdown(f"Target threshold: {format_loss(threshold)}, Max steps: {max_steps}"))
+        display(Markdown(f"History length: {len(selected_obs)} frames"))
         if info_message:
             display(Markdown(info_message))
 
-        history_actions_with_future = [clone_action(action) for action in action_dicts]
-        history_actions_with_future.append(clone_action(recorded_future_action))
-
-        display(Markdown(f"**Training predictor using AdaptiveWorldModel on history ending at frame {target_idx+1} (step {selected_obs[-1]['step']})**"))
-        display(Markdown(f"Target threshold: {format_loss(threshold)}, Max steps: {max_steps}"))
-        display(Markdown(f"History length: {len(selected_obs)} frames"))
-        
-        # Show pre-training weights
         display(Markdown("### Pre-Training Predictor Network Weights"))
         pre_stats = visualize_predictor_weights(predictor)
-        
-        display(Markdown(f"**Using AdaptiveWorldModel.train_predictor() method with joint training**"))
-        
-        losses = []
-        start_time = time.time()
-        
-        # Create progress bar
+
+        display(Markdown("**Using AdaptiveWorldModel.train_predictor() method with joint training**"))
+        display(Markdown("**Tip: Click 'Pause' button to interrupt training at any time.**"))
+
         progress = tqdm(range(max_steps), desc="Training")
-        
-        for step in progress:
-            # Use AdaptiveWorldModel's train_predictor method
-            try:
-                # Set up prediction context for fresh predictions
-                predicted_features = predictor(feature_history, history_actions_with_future)
-                
-                loss = adaptive_world_model.train_predictor(
-                    level=0,
-                    current_frame_tensor=target_tensor,
-                    predicted_features=predicted_features,
-                    history_features=feature_history,
-                    history_actions=history_actions_with_future
-                )
+        try:
+            for step in progress:
+                await asyncio.sleep(0)
+                if training_control["predictor_paused"]:
+                    training_control["predictor_resume_data"] = {
+                        "target_tensor": target_tensor,
+                        "feature_history": feature_history,
+                        "history_actions_with_future": history_actions_with_future,
+                        "threshold": threshold,
+                        "max_steps": max_steps,
+                        "current_step": step,
+                        "losses": losses,
+                        "start_time": start_time,
+                    }
+                    set_training_status("predictor", "paused", f"Paused at step {step} of {max_steps}. Resume available.")
+                    if losses:
+                        update_training_loss("predictor", losses[-1], len(losses), state="paused")
+                    else:
+                        update_training_loss("predictor", None)
+                    display(Markdown("**Training paused. Use Resume button to continue.**"))
+                    return
+
+                try:
+                    predicted_features = predictor(feature_history, history_actions_with_future)
+                    loss = adaptive_world_model.train_predictor(
+                        level=0,
+                        current_frame_tensor=target_tensor,
+                        predicted_features=predicted_features,
+                        history_features=feature_history,
+                        history_actions=history_actions_with_future,
+                    )
+                except Exception as exc:
+                    display(Markdown(f"**Training error:** {exc}"))
+                    set_training_status("predictor", "error", f"Error: {exc}")
+                    training_control["predictor_resume_data"] = None
+                    update_training_loss("predictor", None, state="error")
+                    return
+
                 losses.append(loss)
-                
-                progress.set_postfix({"Loss": format_loss(loss)})
-                
-                # Check if threshold met
+                update_training_loss("predictor", loss, len(losses))
+                progress.set_postfix({"Loss": format_loss(loss), "Step": f"{step + 1}/{max_steps}"})
+
                 if loss <= threshold:
-                    progress.close()
                     break
-            except Exception as e:
-                progress.close()
-                display(Markdown(f"**Training error:** {str(e)}"))
-                return
-        else:
+        finally:
             progress.close()
-        
+
         end_time = time.time()
-        final_loss = losses[-1] if losses else float('inf')
-        
-        # Display results
-        display(Markdown(f"**Training completed after {len(losses)} steps in {end_time-start_time:.1f}s**"))
+        final_loss = losses[-1] if losses else float("inf")
+
+        display(Markdown(f"**Training completed after {len(losses)} steps in {end_time - start_time:.1f}s**"))
         display(Markdown(f"Final total loss: {format_loss(final_loss)}"))
-        
+
         if final_loss <= threshold:
-            display(Markdown(f"✅ **Target threshold {format_loss(threshold)} achieved!**"))
+            display(Markdown(f"**Target threshold {format_loss(threshold)} achieved!**"))
         else:
-            display(Markdown(f"⚠️ **Target threshold {format_loss(threshold)} not reached after {max_steps} steps**"))
-        
-        # Show post-training weights
+            display(Markdown(f"**Target threshold {format_loss(threshold)} not reached after {max_steps} steps.**"))
+
         display(Markdown("### Post-Training Predictor Network Weights"))
         post_stats = visualize_predictor_weights(predictor)
-        
-        # Compare weight changes
-        if pre_stats and post_stats:
-            weight_changes = {}
-            if 'action_embed_mean' in pre_stats and 'action_embed_mean' in post_stats:
-                weight_changes.update({
-                    'action_embed_mean_change': abs(post_stats['action_embed_mean'] - pre_stats['action_embed_mean']),
-                    'action_embed_std_change': abs(post_stats['action_embed_std'] - pre_stats['action_embed_std']),
-                })
-            if 'pos_embed_mean' in pre_stats and 'pos_embed_mean' in post_stats:
-                weight_changes.update({
-                    'pos_embed_mean_change': abs(post_stats['pos_embed_mean'] - pre_stats['pos_embed_mean']),
-                    'pos_embed_std_change': abs(post_stats['pos_embed_std'] - pre_stats['pos_embed_std']),
-                })
-            if 'first_self_attn_mean' in pre_stats and 'first_self_attn_mean' in post_stats:
-                weight_changes.update({
-                    'first_self_attn_mean_change': abs(post_stats['first_self_attn_mean'] - pre_stats['first_self_attn_mean']),
-                    'first_self_attn_std_change': abs(post_stats['first_self_attn_std'] - pre_stats['first_self_attn_std']),
-                })
-            if 'first_linear1_mean' in pre_stats and 'first_linear1_mean' in post_stats:
-                weight_changes.update({
-                    'first_linear1_mean_change': abs(post_stats['first_linear1_mean'] - pre_stats['first_linear1_mean']),
-                    'first_linear1_std_change': abs(post_stats['first_linear1_std'] - pre_stats['first_linear1_std']),
-                })
-            
-            if weight_changes:
-                changes_lines = ["**Weight Changes:**"]
-                if 'action_embed_mean_change' in weight_changes:
-                    changes_lines.extend([
-                        f"- Action Embed Mean: {weight_changes['action_embed_mean_change']:.8f}",
-                        f"- Action Embed Std: {weight_changes['action_embed_std_change']:.8f}",
-                    ])
-                if 'pos_embed_mean_change' in weight_changes:
-                    changes_lines.extend([
-                        f"- Position Embed Mean: {weight_changes['pos_embed_mean_change']:.8f}",
-                        f"- Position Embed Std: {weight_changes['pos_embed_std_change']:.8f}",
-                    ])
-                if 'first_self_attn_mean_change' in weight_changes:
-                    changes_lines.extend([
-                        f"- First Self-Attn Mean: {weight_changes['first_self_attn_mean_change']:.8f}",
-                        f"- First Self-Attn Std: {weight_changes['first_self_attn_std_change']:.8f}",
-                    ])
-                if 'first_linear1_mean_change' in weight_changes:
-                    changes_lines.extend([
-                        f"- First Linear1 Mean: {weight_changes['first_linear1_mean_change']:.8f}",
-                        f"- First Linear1 Std: {weight_changes['first_linear1_std_change']:.8f}",
-                    ])
-                display(Markdown("\n".join(changes_lines)))
-        
-        # Plot training progress
+        _display_predictor_weight_changes(pre_stats, post_stats)
+
         if len(losses) > 1:
             fig, ax = plt.subplots(1, 1, figsize=(8, 4))
             ax.plot(losses, label="Total Loss")
-            ax.axhline(y=threshold, color='r', linestyle='--', alpha=0.7, label=f'Target: {format_loss(threshold)}')
+            ax.axhline(y=threshold, color="r", linestyle="--", alpha=0.7, label=f"Target: {format_loss(threshold)}")
             ax.set_xlabel("Training Step")
             ax.set_ylabel("Loss")
             ax.set_title("Predictor Training Progress (AdaptiveWorldModel)")
@@ -1037,17 +1539,16 @@ def on_train_predictor_threshold(_):
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.show()
-        
-        # Show prediction comparison
+
         predictor.eval()
         autoencoder.eval()
         with torch.no_grad():
             predicted_features = predictor(feature_history, history_actions_with_future)
             predicted_frame = decode_features_to_image(autoencoder, predicted_features)
-        
+
         predicted_img = tensor_to_numpy_image(predicted_frame)
         target_img = tensor_to_numpy_image(target_tensor)
-        
+
         fig, axes = plt.subplots(1, 2, figsize=(8, 4))
         axes[0].imshow(predicted_img)
         axes[0].set_title(f"Predicted (Loss: {format_loss(final_loss)})")
@@ -1058,162 +1559,98 @@ def on_train_predictor_threshold(_):
         plt.tight_layout()
         plt.show()
 
-def on_train_predictor_steps(_):
-    """Train predictor for specified number of steps using AdaptiveWorldModel"""
-    autoencoder = adaptive_world_model.autoencoder
-    predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
-    frame_slider = session_widgets.get("frame_slider")
-    
-    with training_widgets["predictor_training_output"]:
-        training_widgets["predictor_training_output"].clear_output()
-        
-        if autoencoder is None or predictor is None:
-            display(Markdown("Load both autoencoder and predictor checkpoints first."))
-            return
-        if frame_slider is None:
-            display(Markdown("Load a session to select frames."))
-            return
-        
-        # Get training parameters
-        num_steps = training_widgets["predictor_steps"].value
-        
-        target_idx = frame_slider.value
-        history_slider_widget = session_widgets.get("history_slider")
-        desired_history = history_slider_widget.value if history_slider_widget else 3
-        
-        selected_obs, action_dicts, error = build_predictor_sequence(session_state, target_idx, desired_history)
-        if error:
-            display(Markdown(f"**Cannot train predictor:** {error}"))
-            return
-        
-        # Check if we have a next frame for training target
-        if target_idx + 1 >= len(session_state["observations"]):
-            display(Markdown("**Cannot train predictor:** No next frame available as training target."))
-            return
-        
-        # Get target frame tensor
-        next_obs = session_state["observations"][target_idx + 1]
-        target_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
-        
-        # Get feature history and setup context
-        feature_history = []
-        for obs in selected_obs:
-            tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
-            autoencoder.eval()
-            with torch.no_grad():
-                encoded = autoencoder.encode(tensor).detach()
-            feature_history.append(encoded)
+    if losses:
+        update_training_loss("predictor", final_loss, len(losses), state="completed")
+        set_training_status("predictor", "completed", f"Completed in {len(losses)} steps (final loss {format_loss(final_loss)}).")
+    else:
+        update_training_loss("predictor", None)
+        set_training_status("predictor", "completed", "Completed without updating any steps.")
 
-        recorded_future_action, action_source = get_future_action_for_prediction(session_state, target_idx)
-        info_message = None
-        if recorded_future_action is None:
-            info_message = "No recorded action between current and next frame; using empty action."
-            recorded_future_action = {}
-        elif action_source == "previous":
-            info_message = "Using the most recent action prior to the current frame."
+    training_control["predictor_resume_data"] = None
+
+
+async def predictor_steps_training(context, num_steps):
+    output = context["output"]
+    autoencoder = context["autoencoder"]
+    predictor = context["predictor"]
+    target_idx = context["target_idx"]
+    selected_obs = context["selected_obs"]
+    info_message = context["info_message"]
+    feature_history = context["feature_history"]
+    history_actions_with_future = context["history_actions_with_future"]
+    target_tensor = context["target_tensor"]
+    next_obs = context["next_obs"]
+
+    training_control["predictor_resume_data"] = None
+    losses = []
+    start_time = time.time()
+
+    set_training_status("predictor", "running", f"Running for {num_steps} steps")
+    update_training_loss("predictor", None)
+
+    with output:
+        output.clear_output()
+        display(Markdown(
+            f"**Training predictor using AdaptiveWorldModel on history ending at frame {target_idx + 1} (step {selected_obs[-1]['step']}) for {num_steps} steps**"
+        ))
+        display(Markdown(f"History length: {len(selected_obs)} frames"))
         if info_message:
             display(Markdown(info_message))
 
-        history_actions_with_future = [clone_action(action) for action in action_dicts]
-        history_actions_with_future.append(clone_action(recorded_future_action))
-
-        display(Markdown(f"**Training predictor using AdaptiveWorldModel on history ending at frame {target_idx+1} (step {selected_obs[-1]['step']}) for {num_steps} steps**"))
-        display(Markdown(f"History length: {len(selected_obs)} frames"))
-        
-        # Show pre-training weights
         display(Markdown("### Pre-Training Predictor Network Weights"))
         pre_stats = visualize_predictor_weights(predictor)
-        
-        display(Markdown(f"**Using AdaptiveWorldModel.train_predictor() method with joint training**"))
-        
-        losses = []
-        start_time = time.time()
-        
-        # Create progress bar
+
+        display(Markdown("**Using AdaptiveWorldModel.train_predictor() method with joint training**"))
+        display(Markdown("**Tip: Click 'Pause' button to interrupt training at any time.**"))
+
         progress = tqdm(range(num_steps), desc="Training")
-        
-        for step in progress:
-            # Use AdaptiveWorldModel's train_predictor method
-            try:
-                # Set up prediction context for fresh predictions
-                predicted_features = predictor(feature_history, history_actions_with_future)
-                
-                loss = adaptive_world_model.train_predictor(
-                    level=0,
-                    current_frame_tensor=target_tensor,
-                    predicted_features=predicted_features,
-                    history_features=feature_history,
-                    history_actions=history_actions_with_future
-                )
+        try:
+            for step in progress:
+                await asyncio.sleep(0)
+                if training_control["predictor_paused"]:
+                    set_training_status("predictor", "paused", f"Paused after {step} of {num_steps} steps; restart to continue.")
+                    if losses:
+                        update_training_loss("predictor", losses[-1], len(losses), state="paused")
+                    else:
+                        update_training_loss("predictor", None)
+                    display(Markdown("**Training paused. Step-based training cannot be resumed.**"))
+                    display(Markdown(f"**Completed {step} out of {num_steps} steps before pausing.**"))
+                    return
+
+                try:
+                    predicted_features = predictor(feature_history, history_actions_with_future)
+                    loss = adaptive_world_model.train_predictor(
+                        level=0,
+                        current_frame_tensor=target_tensor,
+                        predicted_features=predicted_features,
+                        history_features=feature_history,
+                        history_actions=history_actions_with_future,
+                    )
+                except Exception as exc:
+                    display(Markdown(f"**Training error:** {exc}"))
+                    set_training_status("predictor", "error", f"Error: {exc}")
+                    update_training_loss("predictor", None, state="error")
+                    return
+
                 losses.append(loss)
-                
-                progress.set_postfix({"Loss": format_loss(loss)})
-            except Exception as e:
-                progress.close()
-                display(Markdown(f"**Training error:** {str(e)}"))
-                return
-        
-        progress.close()
+                update_training_loss("predictor", loss, len(losses))
+                progress.set_postfix({"Loss": format_loss(loss), "Step": f"{step + 1}/{num_steps}"})
+        finally:
+            progress.close()
+
         end_time = time.time()
-        final_loss = losses[-1] if losses else float('inf')
-        
-        # Display results
-        display(Markdown(f"**Training completed in {end_time-start_time:.1f}s**"))
-        display(Markdown(f"Initial total loss: {format_loss(losses[0])}, Final total loss: {format_loss(final_loss)}"))
-        
-        # Show post-training weights
+        final_loss = losses[-1] if losses else float("inf")
+
+        display(Markdown(f"**Training completed in {end_time - start_time:.1f}s**"))
+        if losses:
+            display(Markdown(f"Initial total loss: {format_loss(losses[0])}, Final total loss: {format_loss(final_loss)}"))
+        else:
+            display(Markdown("** **No training steps were executed before the run stopped.**"))
+
         display(Markdown("### Post-Training Predictor Network Weights"))
         post_stats = visualize_predictor_weights(predictor)
-        
-        # Compare weight changes
-        if pre_stats and post_stats:
-            weight_changes = {}
-            if 'action_embed_mean' in pre_stats and 'action_embed_mean' in post_stats:
-                weight_changes.update({
-                    'action_embed_mean_change': abs(post_stats['action_embed_mean'] - pre_stats['action_embed_mean']),
-                    'action_embed_std_change': abs(post_stats['action_embed_std'] - pre_stats['action_embed_std']),
-                })
-            if 'pos_embed_mean' in pre_stats and 'pos_embed_mean' in post_stats:
-                weight_changes.update({
-                    'pos_embed_mean_change': abs(post_stats['pos_embed_mean'] - pre_stats['pos_embed_mean']),
-                    'pos_embed_std_change': abs(post_stats['pos_embed_std'] - pre_stats['pos_embed_std']),
-                })
-            if 'first_self_attn_mean' in pre_stats and 'first_self_attn_mean' in post_stats:
-                weight_changes.update({
-                    'first_self_attn_mean_change': abs(post_stats['first_self_attn_mean'] - pre_stats['first_self_attn_mean']),
-                    'first_self_attn_std_change': abs(post_stats['first_self_attn_std'] - pre_stats['first_self_attn_std']),
-                })
-            if 'first_linear1_mean' in pre_stats and 'first_linear1_mean' in post_stats:
-                weight_changes.update({
-                    'first_linear1_mean_change': abs(post_stats['first_linear1_mean'] - pre_stats['first_linear1_mean']),
-                    'first_linear1_std_change': abs(post_stats['first_linear1_std'] - pre_stats['first_linear1_std']),
-                })
-            
-            if weight_changes:
-                changes_lines = ["**Weight Changes:**"]
-                if 'action_embed_mean_change' in weight_changes:
-                    changes_lines.extend([
-                        f"- Action Embed Mean: {weight_changes['action_embed_mean_change']:.8f}",
-                        f"- Action Embed Std: {weight_changes['action_embed_std_change']:.8f}",
-                    ])
-                if 'pos_embed_mean_change' in weight_changes:
-                    changes_lines.extend([
-                        f"- Position Embed Mean: {weight_changes['pos_embed_mean_change']:.8f}",
-                        f"- Position Embed Std: {weight_changes['pos_embed_std_change']:.8f}",
-                    ])
-                if 'first_self_attn_mean_change' in weight_changes:
-                    changes_lines.extend([
-                        f"- First Self-Attn Mean: {weight_changes['first_self_attn_mean_change']:.8f}",
-                        f"- First Self-Attn Std: {weight_changes['first_self_attn_std_change']:.8f}",
-                    ])
-                if 'first_linear1_mean_change' in weight_changes:
-                    changes_lines.extend([
-                        f"- First Linear1 Mean: {weight_changes['first_linear1_mean_change']:.8f}",
-                        f"- First Linear1 Std: {weight_changes['first_linear1_std_change']:.8f}",
-                    ])
-                display(Markdown("\n".join(changes_lines)))
-        
-        # Plot training progress
+        _display_predictor_weight_changes(pre_stats, post_stats)
+
         if len(losses) > 1:
             fig, ax = plt.subplots(1, 1, figsize=(8, 4))
             ax.plot(losses)
@@ -1223,17 +1660,16 @@ def on_train_predictor_steps(_):
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.show()
-        
-        # Show prediction comparison
+
         predictor.eval()
         autoencoder.eval()
         with torch.no_grad():
             predicted_features = predictor(feature_history, history_actions_with_future)
             predicted_frame = decode_features_to_image(autoencoder, predicted_features)
-        
+
         predicted_img = tensor_to_numpy_image(predicted_frame)
         target_img = tensor_to_numpy_image(target_tensor)
-        
+
         fig, axes = plt.subplots(1, 2, figsize=(8, 4))
         axes[0].imshow(predicted_img)
         axes[0].set_title(f"Predicted (Loss: {format_loss(final_loss)})")
@@ -1243,6 +1679,169 @@ def on_train_predictor_steps(_):
         axes[1].axis("off")
         plt.tight_layout()
         plt.show()
+
+    if losses:
+        update_training_loss("predictor", final_loss, len(losses), state="completed")
+        set_training_status("predictor", "completed", f"Finished {len(losses)} steps (final loss {format_loss(final_loss)}).")
+    else:
+        update_training_loss("predictor", None)
+        set_training_status("predictor", "completed", "Completed without updating any steps.")
+
+    training_control["predictor_resume_data"] = None
+
+
+async def predictor_resume_training(resume_data):
+    output = training_widgets["predictor_training_output"]
+    autoencoder = adaptive_world_model.autoencoder
+    if autoencoder is None or not adaptive_world_model.predictors:
+        with output:
+            output.clear_output()
+            display(Markdown("**Required models are not loaded. Load checkpoints before resuming.**"))
+        set_training_status("predictor", "error", "Cannot resume because checkpoints are not loaded.")
+        training_control["predictor_resume_data"] = None
+        return
+
+    predictor = adaptive_world_model.predictors[0]
+
+    with output:
+        output.clear_output()
+        display(Markdown("**Resuming predictor training...**"))
+
+        target_tensor = resume_data["target_tensor"]
+        feature_history = resume_data["feature_history"]
+        history_actions_with_future = resume_data["history_actions_with_future"]
+        threshold = resume_data["threshold"]
+        max_steps = resume_data["max_steps"]
+        current_step = resume_data["current_step"]
+        losses = resume_data["losses"]
+        start_time = resume_data["start_time"]
+
+        if losses:
+            update_training_loss("predictor", losses[-1], len(losses))
+        else:
+            update_training_loss("predictor", None)
+
+        set_training_status("predictor", "running", f"Resuming from step {current_step} of {max_steps}.")
+
+        remaining_steps = max_steps - current_step
+        if remaining_steps <= 0:
+            display(Markdown("**Training already reached the requested number of steps.**"))
+            if losses:
+                update_training_loss("predictor", losses[-1], len(losses), state="completed")
+            else:
+                update_training_loss("predictor", None)
+            set_training_status("predictor", "completed", "Requested number of steps already reached before resuming.")
+            training_control["predictor_resume_data"] = None
+            return
+
+        progress = tqdm(range(remaining_steps), desc=f"Resuming from step {current_step}")
+        try:
+            for step_offset in progress:
+                await asyncio.sleep(0)
+                if training_control["predictor_paused"]:
+                    resume_data.update({
+                        "current_step": current_step + step_offset,
+                        "losses": losses,
+                    })
+                    display(Markdown("** **Training paused. Use Resume button to continue.**"))
+                    return
+
+                try:
+                    predicted_features = predictor(feature_history, history_actions_with_future)
+                    loss = adaptive_world_model.train_predictor(
+                        level=0,
+                        current_frame_tensor=target_tensor,
+                        predicted_features=predicted_features,
+                        history_features=feature_history,
+                        history_actions=history_actions_with_future,
+                    )
+                except Exception as exc:
+                    display(Markdown(f"**Training error:** {exc}"))
+                    set_training_status("predictor", "error", f"Error: {exc}")
+                    training_control["predictor_resume_data"] = None
+                    update_training_loss("predictor", None, state="error")
+                    return
+
+                losses.append(loss)
+                update_training_loss("predictor", loss, len(losses))
+                progress.set_postfix({"Loss": format_loss(loss)})
+
+                if loss <= threshold:
+                    break
+        finally:
+            progress.close()
+
+        training_control["predictor_resume_data"] = None
+
+        end_time = time.time()
+        final_loss = losses[-1] if losses else float("inf")
+
+        display(Markdown(f"**Training completed after {len(losses)} total steps in {end_time - start_time:.1f}s**"))
+        display(Markdown(f"Final total loss: {format_loss(final_loss)}"))
+
+        if final_loss <= threshold:
+            display(Markdown(f"**Target threshold {format_loss(threshold)} achieved!**"))
+        else:
+            display(Markdown(f"**Target threshold {format_loss(threshold)} not reached after {max_steps} steps.**"))
+
+        if len(losses) > 1:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+            ax.plot(losses, label="Total Loss")
+            ax.axhline(y=threshold, color="r", linestyle="--", alpha=0.7, label=f"Target: {format_loss(threshold)}")
+            ax.set_xlabel("Training Step")
+            ax.set_ylabel("Loss")
+            ax.set_title("Predictor Training Progress (Resumed)")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+
+        if losses:
+            update_training_loss("predictor", final_loss, len(losses), state="completed")
+            set_training_status("predictor", "completed", f"Completed with final loss {format_loss(final_loss)} after {len(losses)} steps.")
+        else:
+            update_training_loss("predictor", None)
+            set_training_status("predictor", "completed", "Completed without updating any steps.")
+
+
+def on_train_predictor_threshold(_):
+    context = _prepare_predictor_training()
+    if context is None:
+        return
+
+    training_control["predictor_paused"] = False
+    training_control["predictor_resume_data"] = None
+
+    threshold = training_widgets["predictor_threshold"].value
+    max_steps = training_widgets["predictor_max_steps"].value
+
+    set_training_status("predictor", "running", f"Running to threshold {format_loss(threshold)}")
+
+    start_training_task(
+        PREDICTOR_TASK_KEY,
+        predictor_threshold_training(context, threshold, max_steps),
+        context["output"],
+    )
+
+
+def on_train_predictor_steps(_):
+    context = _prepare_predictor_training()
+    if context is None:
+        return
+
+    training_control["predictor_paused"] = False
+    training_control["predictor_resume_data"] = None
+
+    num_steps = training_widgets["predictor_steps"].value
+
+    set_training_status("predictor", "running", f"Running for {num_steps} steps")
+
+    start_training_task(
+        PREDICTOR_TASK_KEY,
+        predictor_steps_training(context, num_steps),
+        context["output"],
+    )
+
 
 # Create predictor training widgets (same as before)
 predictor_threshold = widgets.FloatText(value=0.0005, description="Threshold", step=0.0001, style={'description_width': '100px'})
@@ -1264,12 +1863,139 @@ train_predictor_threshold_button.on_click(on_train_predictor_threshold)
 train_predictor_steps_button.on_click(on_train_predictor_steps)
 
 
-# In[7]:
+# In[8]:
 
 
 # Main Session Explorer Interface
 session_state = {}
 session_widgets = {}
+
+# Model saving functionality
+def on_save_autoencoder(_):
+    """Save the current autoencoder model"""
+    autoencoder = adaptive_world_model.autoencoder
+    save_path = session_widgets["autoencoder_save_path"].value
+
+    with session_widgets["save_output"]:
+        session_widgets["save_output"].clear_output()
+
+        if autoencoder is None:
+            display(Markdown("❌ **No autoencoder model loaded to save**"))
+            return
+
+        if not save_path.strip():
+            display(Markdown("❌ **Please specify a save path for the autoencoder**"))
+            return
+
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+            # Save model using the same format as AdaptiveWorldModel
+            checkpoint = {
+                'model_state_dict': autoencoder.state_dict(),
+                'step': adaptive_world_model.step if hasattr(adaptive_world_model, 'step') else 0,
+            }
+            torch.save(checkpoint, save_path)
+
+            display(Markdown(f"✅ **Autoencoder saved successfully to:** `{save_path}`"))
+
+        except Exception as e:
+            display(Markdown(f"❌ **Error saving autoencoder:** {str(e)}"))
+
+def on_save_predictor(_):
+    """Save the current predictor model"""
+    predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
+    save_path = session_widgets["predictor_save_path"].value
+
+    with session_widgets["save_output"]:
+        session_widgets["save_output"].clear_output()
+
+        if predictor is None:
+            display(Markdown("❌ **No predictor model loaded to save**"))
+            return
+
+        if not save_path.strip():
+            display(Markdown("❌ **Please specify a save path for the predictor**"))
+            return
+
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+            # Save model using the same format as AdaptiveWorldModel
+            checkpoint = {
+                'model_state_dict': predictor.state_dict(),
+                'level': getattr(predictor, 'level', 0),
+                'step': adaptive_world_model.step if hasattr(adaptive_world_model, 'step') else 0,
+            }
+            torch.save(checkpoint, save_path)
+
+            display(Markdown(f"✅ **Predictor saved successfully to:** `{save_path}`"))
+
+        except Exception as e:
+            display(Markdown(f"❌ **Error saving predictor:** {str(e)}"))
+
+def on_save_both(_):
+    """Save both autoencoder and predictor models"""
+    autoencoder = adaptive_world_model.autoencoder
+    predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
+
+    with session_widgets["save_output"]:
+        session_widgets["save_output"].clear_output()
+
+        if autoencoder is None and predictor is None:
+            display(Markdown("❌ **No models loaded to save**"))
+            return
+
+        saved_models = []
+        errors = []
+
+        # Save autoencoder if loaded and path specified
+        if autoencoder is not None:
+            autoencoder_path = session_widgets["autoencoder_save_path"].value
+            if autoencoder_path.strip():
+                try:
+                    os.makedirs(os.path.dirname(autoencoder_path), exist_ok=True)
+                    checkpoint = {
+                        'model_state_dict': autoencoder.state_dict(),
+                        'step': adaptive_world_model.step if hasattr(adaptive_world_model, 'step') else 0,
+                    }
+                    torch.save(checkpoint, autoencoder_path)
+                    saved_models.append(f"Autoencoder → `{autoencoder_path}`")
+                except Exception as e:
+                    errors.append(f"Autoencoder: {str(e)}")
+            else:
+                errors.append("Autoencoder: No save path specified")
+
+        # Save predictor if loaded and path specified
+        if predictor is not None:
+            predictor_path = session_widgets["predictor_save_path"].value
+            if predictor_path.strip():
+                try:
+                    os.makedirs(os.path.dirname(predictor_path), exist_ok=True)
+                    checkpoint = {
+                        'model_state_dict': predictor.state_dict(),
+                        'level': getattr(predictor, 'level', 0),
+                        'step': adaptive_world_model.step if hasattr(adaptive_world_model, 'step') else 0,
+                    }
+                    torch.save(checkpoint, predictor_path)
+                    saved_models.append(f"Predictor → `{predictor_path}`")
+                except Exception as e:
+                    errors.append(f"Predictor: {str(e)}")
+            else:
+                errors.append("Predictor: No save path specified")
+
+        # Display results
+        if saved_models:
+            display(Markdown("✅ **Successfully saved:**"))
+            for model in saved_models:
+                display(Markdown(f"- {model}"))
+
+        if errors:
+            display(Markdown("❌ **Errors occurred:**"))
+            for error in errors:
+                display(Markdown(f"- {error}"))
 
 def on_load_session_change(change):
     selected_session = change["new"]
@@ -1559,6 +2285,24 @@ def on_run_predictor(_):
                 stats_lines.append(f"- Output Head: Mean={predictor_weight_stats['output_head_mean']:.6f}, Std={predictor_weight_stats['output_head_std']:.6f}")
             display(Markdown("\n".join(stats_lines)))
 
+# Create model saving widgets
+autoencoder_save_path = widgets.Text(
+    value=os.path.join(config.DEFAULT_CHECKPOINT_DIR, "autoencoder_trained.pth"),
+    description="Save to:",
+    style={'description_width': '100px'}
+)
+predictor_save_path = widgets.Text(
+    value=os.path.join(config.DEFAULT_CHECKPOINT_DIR, "predictor_0_trained.pth"),
+    description="Save to:",
+    style={'description_width': '100px'}
+)
+
+save_autoencoder_button = widgets.Button(description="Save Autoencoder", button_style="primary", icon="save")
+save_predictor_button = widgets.Button(description="Save Predictor", button_style="primary", icon="save")
+save_both_button = widgets.Button(description="Save Both Models", button_style="success", icon="save")
+
+save_output = widgets.Output()
+
 # Create session selection widgets
 session_dirs = list_session_dirs(SESSIONS_BASE_DIR)
 load_session_dropdown = widgets.Dropdown(
@@ -1593,6 +2337,9 @@ session_widgets.update({
     "history_slider": history_slider,
     "autoencoder_path": autoencoder_path,
     "predictor_path": predictor_path,
+    "autoencoder_save_path": autoencoder_save_path,
+    "predictor_save_path": predictor_save_path,
+    "save_output": save_output,
     "output": session_output,
     "model_output": model_output,
     "autoencoder_output": autoencoder_output,
@@ -1605,6 +2352,9 @@ frame_slider.observe(on_frame_change, names="value")
 load_models_button.on_click(on_load_models)
 run_autoencoder_button.on_click(on_run_autoencoder)
 run_predictor_button.on_click(on_run_predictor)
+save_autoencoder_button.on_click(on_save_autoencoder)
+save_predictor_button.on_click(on_save_predictor)
+save_both_button.on_click(on_save_both)
 
 # Display interface
 display(Markdown("## Session Explorer Interface"))
@@ -1618,6 +2368,11 @@ display(Markdown("### Model Loading"))
 display(widgets.VBox([autoencoder_path, predictor_path]))
 display(load_models_button)
 display(model_output)
+
+display(Markdown("### Model Saving"))
+display(widgets.VBox([autoencoder_save_path, predictor_save_path]))
+display(widgets.HBox([save_autoencoder_button, save_predictor_button, save_both_button]))
+display(save_output)
 
 display(Markdown("### Inference"))
 display(widgets.HBox([run_autoencoder_button, run_predictor_button]))
@@ -1633,13 +2388,25 @@ display(Markdown("#### Autoencoder Training"))
 display(widgets.HBox([training_widgets["autoencoder_threshold"], training_widgets["autoencoder_max_steps"]]))
 display(widgets.HBox([training_widgets["autoencoder_steps"]]))
 display(widgets.HBox([train_autoencoder_threshold_button, train_autoencoder_steps_button]))
+display(widgets.HBox([training_widgets["pause_autoencoder_button"], training_widgets["resume_autoencoder_button"]]))
+display(training_widgets["autoencoder_status"])
+display(training_widgets["autoencoder_loss"])
 display(training_widgets["autoencoder_training_output"])
 
 display(Markdown("#### Predictor Training"))
 display(widgets.HBox([training_widgets["predictor_threshold"], training_widgets["predictor_max_steps"]]))
 display(widgets.HBox([training_widgets["predictor_steps"]]))
 display(widgets.HBox([train_predictor_threshold_button, train_predictor_steps_button]))
+display(widgets.HBox([training_widgets["pause_predictor_button"], training_widgets["resume_predictor_button"]]))
+display(training_widgets["predictor_status"])
+display(training_widgets["predictor_loss"])
 display(training_widgets["predictor_training_output"])
+
+
+# In[ ]:
+
+
+
 
 
 # In[ ]:

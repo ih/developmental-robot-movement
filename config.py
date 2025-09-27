@@ -14,8 +14,8 @@ class AdaptiveWorldModelConfig:
     MAX_LOOKAHEAD_MARGIN = 5
     PREDICTION_HISTORY_SIZE = 10
     UNCERTAINTY_THRESHOLD = 0.7
-    RECONSTRUCTION_THRESHOLD = 0.0005
-    PREDICTION_THRESHOLD = 0.0005  # Threshold for prediction errors (slightly higher than reconstruction)
+    RECONSTRUCTION_THRESHOLD = 0.001
+    PREDICTION_THRESHOLD = 0.001  # Threshold for prediction errors (slightly higher than reconstruction)
 
     # Training parameters
     AUTOENCODER_LR = 1e-4
