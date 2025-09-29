@@ -168,8 +168,10 @@ def tensor_to_numpy_image(tensor):
     if tensor.ndim == 4:
         tensor = tensor[0]
     tensor = tensor.detach().cpu().float()
-    tensor = tensor * 0.5 + 0.5
-    tensor = torch.clamp(tensor, 0.0, 1.0)
+    tmin, tmax = float(tensor.min()), float(tensor.max())
+    if tmin < -0.01 or tmax > 1.01:
+        tensor = tensor * 0.5 + 0.5
+    tensor = tensor.clamp(0.0, 1.0)
     return tensor.permute(1, 2, 0).numpy()
 
 def format_timestamp(ts):
