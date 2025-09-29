@@ -2026,12 +2026,19 @@ def on_load_session_change(change):
 
     # Update widgets
     frame_slider = session_widgets.get("frame_slider")
+    frame_input = session_widgets.get("frame_input")
     history_slider = session_widgets.get("history_slider")
 
     if frame_slider:
         frame_slider.max = max(0, len(observations) - 1)
         frame_slider.value = min(frame_slider.value, frame_slider.max)
         frame_slider.description = f"Frame (0-{frame_slider.max})"
+
+    if frame_input:
+        frame_input.min = 0
+        frame_input.max = max(0, len(observations) - 1)
+        target_value = frame_slider.value if frame_slider else frame_input.value
+        frame_input.value = max(frame_input.min, min(frame_input.max, target_value))
 
     if history_slider:
         history_slider.max = min(10, len(observations))
@@ -2045,10 +2052,9 @@ def on_load_session_change(change):
         if metadata:
             display(Markdown(f"**Metadata:** {len(metadata)} keys"))
 
-def on_frame_change(change):
-    idx = change["new"]
+def render_frame(idx):
     observations = session_state.get("observations", [])
-    if not observations or idx >= len(observations):
+    if not observations or idx < 0 or idx >= len(observations):
         return
 
     observation = observations[idx]
@@ -2067,6 +2073,36 @@ def on_frame_change(change):
         ax.axis("off")
         plt.tight_layout()
         plt.show()
+
+
+def on_frame_change(change):
+    idx = change["new"]
+    frame_input = session_widgets.get("frame_input")
+    if frame_input is not None and frame_input.value != idx:
+        frame_input.value = idx
+    render_frame(idx)
+
+
+def on_frame_input_change(change):
+    frame_slider = session_widgets.get("frame_slider")
+    frame_input = session_widgets.get("frame_input")
+    if frame_slider is None or frame_input is None:
+        return
+
+    new_value = change["new"]
+    if new_value is None:
+        return
+
+    idx = int(new_value)
+    idx = max(frame_slider.min, min(frame_slider.max, idx))
+
+    if frame_input.value != idx:
+        frame_input.value = idx
+
+    if frame_slider.value != idx:
+        frame_slider.value = idx
+    else:
+        render_frame(idx)
 
 def on_load_models(_):
     # Load models into AdaptiveWorldModel
@@ -2315,6 +2351,7 @@ load_session_dropdown = widgets.Dropdown(
 )
 
 frame_slider = widgets.IntSlider(value=0, min=0, max=0, description="Frame (0-0)", style={'description_width': '100px'})
+frame_input = widgets.BoundedIntText(value=0, min=0, max=0, description="Go to:", layout=widgets.Layout(width="140px"), style={'description_width': '60px'})
 history_slider = widgets.IntSlider(value=3, min=2, max=10, description="History", style={'description_width': '100px'})
 
 # Create model loading widgets
@@ -2336,6 +2373,7 @@ predictor_output = widgets.Output()
 session_widgets.update({
     "load_session_dropdown": load_session_dropdown,
     "frame_slider": frame_slider,
+    "frame_input": frame_input,
     "history_slider": history_slider,
     "autoencoder_path": autoencoder_path,
     "predictor_path": predictor_path,
@@ -2351,6 +2389,7 @@ session_widgets.update({
 # Connect event handlers
 load_session_dropdown.observe(on_load_session_change, names="value")
 frame_slider.observe(on_frame_change, names="value")
+frame_input.observe(on_frame_input_change, names="value")
 load_models_button.on_click(on_load_models)
 run_autoencoder_button.on_click(on_run_autoencoder)
 run_predictor_button.on_click(on_run_predictor)
@@ -2363,7 +2402,7 @@ display(Markdown("## Session Explorer Interface"))
 
 display(Markdown("### Session Selection"))
 display(widgets.HBox([load_session_dropdown]))
-display(widgets.HBox([frame_slider, history_slider]))
+display(widgets.HBox([frame_slider, frame_input, history_slider]))
 display(session_output)
 
 display(Markdown("### Model Loading"))
@@ -2403,6 +2442,12 @@ display(widgets.HBox([training_widgets["pause_predictor_button"], training_widge
 display(training_widgets["predictor_status"])
 display(training_widgets["predictor_loss"])
 display(training_widgets["predictor_training_output"])
+
+
+# In[ ]:
+
+
+
 
 
 # In[ ]:

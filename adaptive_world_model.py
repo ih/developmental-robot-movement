@@ -209,14 +209,15 @@ class AdaptiveWorldModel:
             self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
             
             # Restore optimizer (respecting explicit learning rate overrides)
-            if checkpoint['optimizer_state_dict'] is not None:
+            opt_state = checkpoint.get('optimizer_state_dict')
+            if opt_state is not None:
                 if not hasattr(self, 'autoencoder_optimizer'):
                     lr = self._get_autoencoder_lr()
                     self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=lr)
 
                 if self.explicit_autoencoder_lr is None:
                     # Use saved optimizer state if no explicit override
-                    self.autoencoder_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    self.autoencoder_optimizer.load_state_dict(opt_state)
                 else:
                     # Override learning rate but keep other optimizer state
                     print(f"Overriding autoencoder learning rate to {self.explicit_autoencoder_lr}")
@@ -241,14 +242,15 @@ class AdaptiveWorldModel:
                     predictor.load_state_dict(checkpoint['model_state_dict'])
 
                 # Restore optimizer (respecting explicit learning rate overrides)
-                if checkpoint['optimizer_state_dict'] is not None:
+                opt_state = checkpoint.get('optimizer_state_dict')
+                if opt_state is not None:
                     if not hasattr(predictor, 'optimizer'):
                         lr = self._get_predictor_lr()
                         predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=lr)
 
                     if self.explicit_predictor_lr is None:
                         # Use saved optimizer state if no explicit override
-                        predictor.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        predictor.optimizer.load_state_dict(opt_state)
                     else:
                         # Override learning rate but keep other optimizer state
                         print(f"Overriding predictor learning rate to {self.explicit_predictor_lr}")
