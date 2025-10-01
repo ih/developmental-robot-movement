@@ -41,6 +41,8 @@ This repository contains research code for developmental robot movement with a m
 - **Comprehensive weight visualization**: Real-time visualization of both autoencoder and predictor network weights during inference and training, including weight distribution histograms, layer norms, and detailed change tracking for transformer components (action embeddings, position embeddings, self-attention, MLP layers)
 - **Model saving capabilities**: Save trained autoencoder and predictor models with configurable paths, compatible with AdaptiveWorldModel checkpoint format
 - **Interactive training controls**: Pause and resume buttons for both autoencoder and predictor training with responsive UI updates and proper state management
+- **Attention introspection**: Visualize transformer attention patterns with heatmaps, breakdown charts, and quantitative metrics (APA, ALF, TTAR, RI@16, entropy)
+- **Action space sweep**: Predictions across full robot action space instead of +/-10% variants for comprehensive action effect analysis
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
@@ -55,6 +57,15 @@ This repository contains research code for developmental robot movement with a m
 - **Real-time visualization**: Training progress display showing current vs reconstructed frames
 - **Comprehensive experiment tracking**: Weights & Biases integration for reconstruction, predictor training, and timing metrics
 - **Learning progress persistence**: Automatic save/load of model weights, training progress, and history buffers
+- **Attention introspection**: TransformerActionConditionedPredictor returns per-layer attention maps when `return_attn=True` for analysis
+
+### Attention Analysis Infrastructure
+- **EncoderLayerWithAttn**: Custom transformer encoder layer that optionally captures and returns per-head attention weights
+- **Attention metrics**: APA (Attention to Previous Action), ALF (Attention to Last Frame), TTAR (Token-Type Attention Ratio), RI@16 (Recency Index), entropy
+- **Action sensitivity testing**: Build action variants across full action space to measure prediction diversity
+- **Counterfactual analysis**: Action shuffle/zero tests to validate that predictions meaningfully depend on action inputs
+- **Gradient flow tracking**: Monitor gradient magnitudes flowing through action-related parameters vs total network
+- **Token indexing**: Automatic derivation of frame/action/future token positions from sequence for robust metric calculation
 
 ### Action Space
 - **Duration-based actions**: Motor commands with automatic stopping after specified duration
@@ -141,7 +152,8 @@ Required Python packages:
 - `models/`: Neural network architectures directory
   - `models/__init__.py`: Module exports for clean imports
   - `models/autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
-  - `models/predictor.py`: TransformerActionConditionedPredictor with sequence length management
+  - `models/predictor.py`: TransformerActionConditionedPredictor with sequence length management and attention introspection
+  - `models/encoder_layer_with_attn.py`: Custom transformer encoder layer that optionally returns attention maps
 - `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
 - `recording_writer.py`: Recording system with automatic disk space management
@@ -149,6 +161,8 @@ Required Python packages:
 - `replay_robot.py`: Robot interface replacement for replaying recorded sessions
 - `recorded_policy.py`: Action selector factory for recorded action playback
 - `replay_session_example.py`: Robot-agnostic replay script for recorded sessions
+- `session_explorer.ipynb`: Interactive Jupyter notebook for session exploration with attention introspection and action space analysis
+- `session_explorer.py`: Python script version of session explorer notebook with identical functionality
 - `test_jetbot_actions.ipynb`: Jupyter notebook for interactive JetBot action space testing
 - `config.py`: Shared configuration, image transforms, and adaptive world model parameters
 - `requirements.txt`: Python package dependencies

@@ -1,6 +1,4 @@
-# Adaptive World Model with Hierarchical Action Learning
-# Based on Day 6 outline with future generalizations from the document
-
+﻿# Adaptive World Model with Hierarchical Action Learning
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,6 +9,7 @@ import os
 import pickle
 import random
 import signal
+import copy
 from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
 from config import AdaptiveWorldModelConfig
 
@@ -117,6 +116,227 @@ class AdaptiveWorldModel:
         else:
             return AdaptiveWorldModelConfig.PREDICTOR_LR
     
+    def _compute_grad_action_ratio(self, predictor):
+        """Compute ratio of gradient magnitude flowing through action-related parameters."""
+        total_grad = 0.0
+        action_grad = 0.0
+        for name, param in predictor.named_parameters():
+            if param.grad is None:
+                continue
+            grad_mean = param.grad.detach().abs().mean().item()
+            total_grad += grad_mean
+            if 'action' in name.lower():
+                action_grad += grad_mean
+        if total_grad <= 0.0:
+            return 0.0
+        return action_grad / (total_grad + 1e-8)
+
+    def _compute_attention_metrics(self, attn_info):
+        """Aggregate attention metrics from predictor attention payload."""
+        if not attn_info or not attn_info.get('attn'):
+            return {}
+
+        attn_list = attn_info['attn']
+        last_layer_attn = attn_list[-1]
+        future_idx = attn_info['future_idx']
+        if last_layer_attn is None or future_idx.numel() == 0:
+            return {}
+
+        A = last_layer_attn[:, :, future_idx, :]
+        zeros_template = torch.zeros_like(A[..., 0])
+
+        def sum_over(idx_tensor):
+            if idx_tensor.numel() == 0:
+                return zeros_template
+            return A[..., idx_tensor].sum(dim=-1)
+
+        last_action_pos = attn_info['last_action_pos']
+        if last_action_pos is not None:
+            apa = A[..., last_action_pos]
+        else:
+            apa = zeros_template
+
+        alf = sum_over(attn_info['last_frame_idx'])
+        action_mass = sum_over(attn_info['action_idx'])
+        frame_mass = sum_over(attn_info['frame_idx'])
+
+        ttar = action_mass / (frame_mass + 1e-8)
+
+        k = 16
+        total_mass = A.sum(dim=-1) + 1e-8
+        if A.shape[-1] >= k:
+            recent_mass = A[..., -k:].sum(dim=-1)
+        else:
+            recent_mass = A.sum(dim=-1)
+        ri_k = recent_mass / total_mass
+
+        P = (A / total_mass.unsqueeze(-1)).clamp_min(1e-8)
+        entropy = -(P * P.log()).sum(dim=-1)
+
+        agg = lambda tensor: tensor.mean().item() if tensor.numel() > 0 else 0.0
+
+        uniform_baseline = (1.0 / (future_idx.to(torch.float32) + 1.0)).mean().item()
+
+        return {
+            "predictor/attn/apa_mean": agg(apa),
+            "predictor/attn/alf_mean": agg(alf),
+            "predictor/attn/ttar_mean": agg(ttar),
+            "predictor/attn/ri16_mean": agg(ri_k),
+            "predictor/attn/attn_entropy_mean": agg(entropy),
+            "predictor/attn/uniform_baseline_mean": uniform_baseline,
+        }
+
+    def _prepare_actions(self, history_actions, override=None):
+        actions = [copy.deepcopy(action) for action in history_actions or []]
+        if override == 'shuffle' and actions:
+            random.shuffle(actions)
+        elif override == 'zero':
+            actions = [{key: 0.0 for key in action} for action in actions]
+        elif isinstance(override, list):
+            actions = override
+        return actions
+
+    def _compute_prediction_losses_eval(self, predicted_features, current_frame_tensor, target_patches=None, target_latent=None):
+        target_patches = target_patches if target_patches is not None else self.patchify(current_frame_tensor)
+        target_latent = target_latent if target_latent is not None else self.autoencoder.encode(current_frame_tensor)
+
+        B, seq_len, _ = predicted_features.shape
+        ids_restore = torch.arange(seq_len - 1, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
+        pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
+
+        loss_patch = torch.nn.functional.mse_loss(pred_patches, target_patches)
+        loss_latent = torch.nn.functional.mse_loss(
+            predicted_features[:, 1:, :],
+            target_latent[:, 1:, :],
+        )
+        total_loss = (
+            AdaptiveWorldModelConfig.PRED_PATCH_W * loss_patch
+            + AdaptiveWorldModelConfig.PRED_LATENT_W * loss_latent
+        )
+        return total_loss, loss_patch, loss_latent, pred_patches, ids_restore, target_patches, target_latent
+
+    def eval_predictor_loss(self, predictor, history_features, history_actions, current_frame_tensor, override_actions=None, target_patches=None, target_latent=None):
+        """Evaluate predictor loss with optional action overrides without affecting training state."""
+        features = [feat.to(self.device) for feat in (history_features or [])]
+        actions = self._prepare_actions(history_actions, override=override_actions)
+        with torch.no_grad():
+            pred_features = predictor.forward(features, actions)
+            total_loss, *_ = self._compute_prediction_losses_eval(
+                pred_features,
+                current_frame_tensor,
+                target_patches=target_patches,
+                target_latent=target_latent,
+            )
+        return total_loss.item()
+
+    def _build_action_variants(self, action, scale=0.1):
+        if action is None:
+            return []
+        variants = [copy.deepcopy(action)]
+        for key in ('motor_left', 'motor_right', 'duration'):
+            if key not in action:
+                continue
+            for factor in (1.0 - scale, 1.0 + scale):
+                variant = copy.deepcopy(action)
+                variant[key] = variant[key] * factor
+                if key != 'duration':
+                    variant[key] = float(max(-1.0, min(1.0, variant[key])))
+                else:
+                    variant[key] = float(max(0.0, variant[key]))
+                variants.append(variant)
+        unique = {}
+        for variant in variants:
+            signature = tuple(sorted(variant.items()))
+            unique[signature] = variant
+        return list(unique.values())
+
+    def _compute_action_sensitivity(self, predictor, history_features, history_actions, current_frame_tensor, target_patches=None, target_latent=None):
+        if not history_actions:
+            return {}
+
+        last_action = history_actions[-1]
+        variants = self._build_action_variants(last_action)
+        if len(variants) <= 1:
+            return {}
+
+        features = [feat for feat in history_features]
+        predictions = []
+        with torch.no_grad():
+            for variant in variants:
+                actions_variant = [copy.deepcopy(a) for a in history_actions]
+                actions_variant[-1] = variant
+                pred_variant = predictor.forward(features, actions_variant)
+                _, _, _, pred_patches, _, target_patches, target_latent = self._compute_prediction_losses_eval(
+                    pred_variant,
+                    current_frame_tensor,
+                    target_patches=target_patches,
+                    target_latent=target_latent,
+                )
+                predictions.append(pred_patches.unsqueeze(0))
+        if not predictions:
+            return {}
+        pred_stack = torch.cat(predictions, dim=0)
+        variance = pred_stack.var(dim=0).mean().item()
+        return {"predictor/action_sensitivity/variance": variance}
+
+    def _collect_predictor_diagnostics(self, predictor, history_features, history_actions, current_frame_tensor):
+        metrics = {}
+        if not history_features:
+            return metrics
+
+        features = [feat.detach().to(self.device) for feat in history_features]
+        actions = [copy.deepcopy(action) for action in history_actions]
+
+        with torch.no_grad():
+            was_training = predictor.training
+            predictor.eval()
+            pred_features, attn_info = predictor.forward(features, actions, return_attn=True)
+            total_loss, loss_patch, loss_latent, pred_patches, ids_restore, target_patches, target_latent = self._compute_prediction_losses_eval(
+                pred_features,
+                current_frame_tensor,
+            )
+            predictor.train(was_training)
+
+        metrics.update(self._compute_attention_metrics(attn_info))
+
+        loss_true = total_loss.item()
+        loss_shuf = self.eval_predictor_loss(
+            predictor,
+            features,
+            actions,
+            current_frame_tensor,
+            override_actions='shuffle',
+            target_patches=target_patches,
+            target_latent=target_latent,
+        )
+        loss_zero = self.eval_predictor_loss(
+            predictor,
+            features,
+            actions,
+            current_frame_tensor,
+            override_actions='zero',
+            target_patches=target_patches,
+            target_latent=target_latent,
+        )
+
+        metrics.update({
+            "predictor/counterfactual/asg": loss_shuf - loss_true,
+            "predictor/counterfactual/azg": loss_zero - loss_true,
+        })
+
+        metrics.update(
+            self._compute_action_sensitivity(
+                predictor,
+                features,
+                actions,
+                current_frame_tensor,
+                target_patches=target_patches,
+                target_latent=target_latent,
+            )
+        )
+
+        return metrics
+
     def save_checkpoint(self):
         """Save current learning progress to disk with rolling backup"""
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -708,12 +928,12 @@ class AdaptiveWorldModel:
         """Calculate detailed training metrics for predictor including UWR"""
         metrics = {}
 
-        # Calculate explained variance (R²) in patch space - scale-invariant predictor quality metric
+        # Calculate explained variance (RÂ²) in patch space - scale-invariant predictor quality metric
         with torch.no_grad():
             resid = pred_patches - target_patches
             var_y = target_patches.var(unbiased=False)
             var_resid = resid.var(unbiased=False)
-            explained_variance = 1.0 - (var_resid / (var_y + 1e-12))  # R^2 in [−∞, 1]
+            explained_variance = 1.0 - (var_resid / (var_y + 1e-12))  # R^2 in [âˆ’âˆž, 1]
 
         # Detailed per-layer gradient norms for transformer layers
         transformer_layer_grad_stats = {}
@@ -876,6 +1096,8 @@ class AdaptiveWorldModel:
         # Backward pass - this will train both predictor and autoencoder!
         prediction_loss.backward()
 
+        grad_action_ratio = self._compute_grad_action_ratio(predictor)
+
         # Log gradient norms (global and per-layer) - throttled
         grad_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), float('inf'))
 
@@ -903,11 +1125,20 @@ class AdaptiveWorldModel:
                     "predictor_grad_norm": grad_norm,
                     "predictor_lr": predictor.optimizer.param_groups[0]['lr'],
                     "predictor_uwr_95th": detailed_metrics['uwr_95th'],
+                    "predictor/grad/grad_action_ratio": grad_action_ratio,
                 }
                 # Add per-layer gradient and UWR statistics
                 for key, value in detailed_metrics.items():
                     if key not in ['explained_variance', 'uwr_95th']:
                         log_dict[key] = value
+
+                diagnostics = self._collect_predictor_diagnostics(
+                    predictor,
+                    history_features_for_forward,
+                    history_actions_for_forward,
+                    current_frame_tensor.detach(),
+                )
+                log_dict.update(diagnostics)
 
                 wandb.log(log_dict)
             

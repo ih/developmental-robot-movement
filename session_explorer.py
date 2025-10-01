@@ -24,6 +24,7 @@ import math
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 from PIL import Image
 import ipywidgets as widgets
 from IPython.display import display, Markdown
@@ -246,6 +247,132 @@ def load_predictor_model(path, device):
     model.eval()
     return model
 
+
+
+def build_action_variants(action, action_space=None):
+    """Build action variants using the actual action space instead of percentage variations.
+
+    Args:
+        action: The recorded action (unused, kept for compatibility)
+        action_space: List of all possible actions from the robot's action space
+
+    Returns:
+        List of action dictionaries from the action space
+    """
+    if action_space:
+        return [clone_action(a) for a in action_space]
+    # Fallback if no action_space provided
+    if not action:
+        return []
+    return [clone_action(action)]
+
+
+def compute_attention_visual_data(attn_info):
+    if not attn_info or not attn_info.get('attn'):
+        return None
+    attn_list = attn_info['attn']
+    last_layer_attn = attn_list[-1]
+    if last_layer_attn is None or last_layer_attn.size(0) == 0:
+        return None
+    attn_last = last_layer_attn[0]
+    future_idx = attn_info['future_idx']
+    if future_idx.numel() == 0:
+        return None
+
+    attn_future = attn_last.mean(dim=0)[future_idx]
+    total = attn_future.sum(dim=-1, keepdim=True) + 1e-8
+
+    if attn_info['last_action_pos'] is not None:
+        apa = attn_future[..., attn_info['last_action_pos']]
+    else:
+        apa = torch.zeros_like(attn_future[:, 0])
+
+    if attn_info['last_frame_idx'].numel() > 0:
+        alf = attn_future[..., attn_info['last_frame_idx']].sum(dim=-1)
+    else:
+        alf = torch.zeros_like(attn_future[:, 0])
+
+    if attn_info['action_idx'].numel() > 0:
+        action_mass = attn_future[..., attn_info['action_idx']].sum(dim=-1)
+    else:
+        action_mass = torch.zeros_like(attn_future[:, 0])
+
+    if attn_info['frame_idx'].numel() > 0:
+        frame_mass = attn_future[..., attn_info['frame_idx']].sum(dim=-1)
+    else:
+        frame_mass = torch.zeros_like(attn_future[:, 0])
+
+    ttar = action_mass / (frame_mass + 1e-8)
+
+    k = min(16, attn_future.shape[-1])
+    recent_mass = attn_future[..., -k:].sum(dim=-1)
+    ri_k = recent_mass / (total.squeeze(-1))
+
+    P = (attn_future / total).clamp_min(1e-8)
+    entropy = -(P * P.log()).sum(dim=-1)
+
+    metrics = {
+        'APA': apa.mean().item(),
+        'ALF': alf.mean().item(),
+        'TTAR': ttar.mean().item(),
+        'RI@16': ri_k.mean().item(),
+        'Entropy': entropy.mean().item(),
+        'UniformBaseline': (1.0 / (future_idx.to(torch.float32) + 1.0)).mean().item(),
+    }
+
+    last_action_frac = (apa / total.squeeze(-1)).cpu().numpy()
+    last_frame_frac = (alf / total.squeeze(-1)).cpu().numpy()
+    rest_frac = np.clip(1.0 - last_action_frac - last_frame_frac, 0.0, 1.0)
+
+    heatmap = attn_last[0][future_idx].cpu().numpy()
+    token_types = attn_info['token_types'].cpu().numpy()
+
+    return {
+        'metrics': metrics,
+        'heatmap': heatmap,
+        'token_types': token_types,
+        'breakdown': {
+            'last_action': last_action_frac,
+            'last_frame': last_frame_frac,
+            'rest': rest_frac,
+        },
+        'future_indices': future_idx.cpu().numpy(),
+    }
+
+
+def plot_attention_heatmap(heatmap, token_types):
+    if heatmap.size == 0:
+        return
+    fig, (ax_heat, ax_types) = plt.subplots(2, 1, figsize=(10, 4), gridspec_kw={'height_ratios': [4, 0.4]}, sharex=True)
+    im = ax_heat.imshow(heatmap, aspect='auto', cmap='viridis')
+    ax_heat.set_ylabel('Future Query')
+    ax_heat.set_title('Attention (last layer, head 0)')
+    fig.colorbar(im, ax=ax_heat, fraction=0.046, pad=0.04)
+    type_cmap = ListedColormap(['#4c72b0', '#dd8452', '#55a868'])
+    ax_types.imshow(token_types.reshape(1, -1), aspect='auto', cmap=type_cmap, vmin=0, vmax=2)
+    ax_types.set_yticks([])
+    ax_types.set_xlabel('Key Token Index')
+    ax_types.set_title('Token Types (frame/action/future)')
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_attention_breakdown(breakdown):
+    if not breakdown['last_action'].size:
+        return
+    indices = np.arange(len(breakdown['last_action']))
+    width = 0.25
+    plt.figure(figsize=(8, 4))
+    plt.bar(indices - width, breakdown['last_action'], width, label='Last Action')
+    plt.bar(indices, breakdown['last_frame'], width, label='Last Frame Block')
+    plt.bar(indices + width, breakdown['rest'], width, label='Rest')
+    plt.xlabel('Future Query Index')
+    plt.ylabel('Attention Fraction')
+    plt.ylim(0.0, 1.05)
+    plt.title('Attention Distribution per Future Query')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 def decode_features_to_image(autoencoder, predicted_features):
     autoencoder.eval()
     with torch.no_grad():
@@ -1066,6 +1193,7 @@ train_autoencoder_threshold_button.on_click(on_train_autoencoder_threshold)
 train_autoencoder_steps_button.on_click(on_train_autoencoder_steps)
 
 
+
 # In[6]:
 
 
@@ -1278,6 +1406,7 @@ training_widgets.update({
     "predictor_status": predictor_status,
     "predictor_loss": predictor_loss,
 })
+
 
 
 # In[7]:
@@ -1865,6 +1994,7 @@ train_predictor_threshold_button.on_click(on_train_predictor_threshold)
 train_predictor_steps_button.on_click(on_train_predictor_steps)
 
 
+
 # In[8]:
 
 
@@ -2188,6 +2318,7 @@ def on_run_autoencoder(_):
             """
             display(Markdown(stats_text))
 
+
 def on_run_predictor(_):
     autoencoder = adaptive_world_model.autoencoder
     predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
@@ -2212,25 +2343,19 @@ def on_run_predictor(_):
             display(Markdown(f"**Cannot run predictor:** {error}"))
             return
 
-        # Get features for history frames
         feature_history = []
+        history_images = []
         for obs in selected_obs:
             tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
             autoencoder.eval()
             with torch.no_grad():
                 encoded = autoencoder.encode(tensor).detach()
             feature_history.append(encoded)
+            history_images.append(tensor_to_numpy_image(tensor))
 
         display(Markdown(f"**Predictor Inference on History ending at Frame {target_idx+1} (step {selected_obs[-1]['step']})**"))
         display(Markdown(f"**History length:** {len(selected_obs)} frames"))
 
-        # Show history sequence
-        history_images = []
-        for obs in selected_obs:
-            tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"])
-            history_images.append(tensor_to_numpy_image(tensor.unsqueeze(0)))
-
-        # Visualize history
         fig, axes = plt.subplots(1, len(history_images), figsize=(3 * len(history_images), 3))
         if len(history_images) == 1:
             axes = [axes]
@@ -2241,7 +2366,6 @@ def on_run_predictor(_):
         plt.tight_layout()
         plt.show()
 
-        # Get recorded action between current and next frame if available
         recorded_action, action_source = get_future_action_for_prediction(session_state, target_idx)
         if recorded_action is None:
             display(Markdown("*No recorded action between current and next frame; using empty action.*"))
@@ -2249,39 +2373,53 @@ def on_run_predictor(_):
         elif action_source == "previous":
             display(Markdown("*Using the most recent action prior to the current frame.*"))
 
-        # Generate predictions for all possible actions
+        next_tensor = None
+        if target_idx + 1 < len(session_state.get("observations", [])):
+            next_obs = session_state["observations"][target_idx + 1]
+            next_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
+
+        history_actions_base = [clone_action(a) for a in action_dicts]
+        actions_for_baseline = history_actions_base + [clone_action(recorded_action)]
+
+        predictor.eval()
+        with torch.no_grad():
+            baseline_features, attn_info = predictor(feature_history, actions_for_baseline, return_attn=True)
+            baseline_frame_tensor = decode_features_to_image(autoencoder, baseline_features)
+        baseline_img = tensor_to_numpy_image(baseline_frame_tensor)
+        baseline_mse = None
+        if next_tensor is not None:
+            with torch.no_grad():
+                baseline_mse = torch.nn.functional.mse_loss(baseline_frame_tensor, next_tensor).item()
+
         action_space = get_action_space(session_state)
         all_predictions = []
 
         if action_space:
             for action in action_space:
-                history_actions_with_future = [clone_action(a) for a in action_dicts]
-                history_actions_with_future.append(clone_action(action))
-
-                predictor.eval()
-                with torch.no_grad():
-                    predicted_features = predictor(feature_history, history_actions_with_future)
-                    predicted_frame = decode_features_to_image(autoencoder, predicted_features)
-
-                predicted_img = tensor_to_numpy_image(predicted_frame)
-
-                # Calculate MSE if next frame exists
-                mse_loss = None
-                if target_idx + 1 < len(session_state.get("observations", [])):
-                    next_obs = session_state["observations"][target_idx + 1]
-                    next_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
+                history_actions_with_future = history_actions_base + [clone_action(action)]
+                if actions_equal(action, recorded_action):
+                    predicted_frame_tensor = baseline_frame_tensor
+                    prediction_img = baseline_img
+                    mse_loss = baseline_mse
+                else:
                     with torch.no_grad():
-                        mse_loss = torch.nn.functional.mse_loss(predicted_frame, next_tensor).item()
+                        predicted_features = predictor(feature_history, history_actions_with_future)
+                        predicted_frame_tensor = decode_features_to_image(autoencoder, predicted_features)
+                    prediction_img = tensor_to_numpy_image(predicted_frame_tensor)
+                    if next_tensor is not None:
+                        with torch.no_grad():
+                            mse_loss = torch.nn.functional.mse_loss(predicted_frame_tensor, next_tensor).item()
+                    else:
+                        mse_loss = None
 
                 all_predictions.append({
                     "action": action,
-                    "image": predicted_img,
+                    "image": prediction_img,
                     "label": format_action_label(action),
-                    "mse": mse_loss
+                    "mse": mse_loss,
                 })
 
         display(Markdown("### Predictions for All Actions"))
-
         if all_predictions:
             cols = min(4, len(all_predictions))
             rows = math.ceil(len(all_predictions) / cols)
@@ -2304,24 +2442,91 @@ def on_run_predictor(_):
         else:
             display(Markdown("No actions available to visualize predictions."))
 
-        # Show predictor weight visualization
-        display(Markdown("### Predictor Network Weight Visualization"))
-        predictor_weight_stats = visualize_predictor_weights(predictor)
+        attention_data = compute_attention_visual_data(attn_info)
+        if attention_data:
+            metrics = attention_data["metrics"]
+            display(Markdown("### Attention Diagnostics"))
+            metric_lines = [
+                f"- **APA**: {metrics['APA']:.4f}",
+                f"- **ALF**: {metrics['ALF']:.4f}",
+                f"- **TTAR**: {metrics['TTAR']:.4f}",
+                f"- **RI@16**: {metrics['RI@16']:.4f}",
+                f"- **Entropy**: {metrics['Entropy']:.4f}",
+                f"- **Uniform Baseline**: {metrics['UniformBaseline']:.4f}",
+            ]
+            display(Markdown("\n".join(metric_lines)))
+            plot_attention_heatmap(attention_data["heatmap"], attention_data["token_types"])
+            plot_attention_breakdown(attention_data["breakdown"])
 
-        # Display predictor weight statistics
-        if predictor_weight_stats:
-            stats_lines = ["**Predictor Weight Statistics:**"]
-            if 'action_embed_mean' in predictor_weight_stats:
-                stats_lines.append(f"- Action Embed: Mean={predictor_weight_stats['action_embed_mean']:.6f}, Std={predictor_weight_stats['action_embed_std']:.6f}")
-            if 'pos_embed_mean' in predictor_weight_stats:
-                stats_lines.append(f"- Position Embed: Mean={predictor_weight_stats['pos_embed_mean']:.6f}, Std={predictor_weight_stats['pos_embed_std']:.6f}")
-            if 'first_self_attn_mean' in predictor_weight_stats:
-                stats_lines.append(f"- First Self-Attn: Mean={predictor_weight_stats['first_self_attn_mean']:.6f}, Std={predictor_weight_stats['first_self_attn_std']:.6f}")
-            if 'first_linear1_mean' in predictor_weight_stats:
-                stats_lines.append(f"- First Linear1: Mean={predictor_weight_stats['first_linear1_mean']:.6f}, Std={predictor_weight_stats['first_linear1_std']:.6f}")
-            if 'output_head_mean' in predictor_weight_stats:
-                stats_lines.append(f"- Output Head: Mean={predictor_weight_stats['output_head_mean']:.6f}, Std={predictor_weight_stats['output_head_std']:.6f}")
-            display(Markdown("\n".join(stats_lines)))
+        variants = build_action_variants(recorded_action, action_space)
+        if variants:
+            max_variants = min(len(variants), 7)
+            variants = variants[:max_variants]
+            variant_results = []
+            variant_images = []
+            for variant in variants:
+                history_variant = history_actions_base + [clone_action(variant)]
+                if actions_equal(variant, recorded_action):
+                    variant_tensor = baseline_frame_tensor
+                    variant_img = baseline_img
+                else:
+                    with torch.no_grad():
+                        variant_features = predictor(feature_history, history_variant)
+                        variant_tensor = decode_features_to_image(autoencoder, variant_features)
+                    variant_img = tensor_to_numpy_image(variant_tensor)
+                diff_map = np.abs(variant_img - baseline_img).mean(axis=-1)
+                variant_results.append({
+                    "action": variant,
+                    "image": variant_img,
+                    "diff": diff_map,
+                })
+                variant_images.append(variant_img)
+
+            if variant_images:
+                diversity_score = float(np.std(np.stack(variant_images, axis=0)).mean())
+                display(Markdown("### Action Space Sweep"))
+                display(Markdown(f"- **Variants evaluated:** {len(variant_results)}"))
+                display(Markdown(f"- **Image-space variance:** {diversity_score:.6f}"))
+
+                rows = 2
+                cols = len(variant_results)
+                fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 6))
+                if cols == 1:
+                    axes = np.array([[axes[0]], [axes[1]]])
+                for idx, result in enumerate(variant_results):
+                    axes[0, idx].imshow(result["image"])
+                    axes[0, idx].set_title(format_action_label(result["action"]), fontsize=8)
+                    axes[0, idx].axis("off")
+                    axes[1, idx].imshow(result["diff"], cmap="magma")
+                    axes[1, idx].set_title("Delta vs recorded", fontsize=8)
+                    axes[1, idx].axis("off")
+                plt.tight_layout()
+                plt.show()
+
+        if next_tensor is not None:
+            baseline_loss = adaptive_world_model.eval_predictor_loss(
+                predictor,
+                feature_history,
+                actions_for_baseline,
+                next_tensor,
+            )
+            shuffle_loss = adaptive_world_model.eval_predictor_loss(
+                predictor,
+                feature_history,
+                actions_for_baseline,
+                next_tensor,
+                override_actions="shuffle",
+            )
+            zero_loss = adaptive_world_model.eval_predictor_loss(
+                predictor,
+                feature_history,
+                actions_for_baseline,
+                next_tensor,
+                override_actions="zero",
+            )
+            asg = shuffle_loss - baseline_loss
+            azg = zero_loss - baseline_loss
+            display(Markdown(f"**Counterfactual gaps:** ASG = {asg:.6f}, AZG = {azg:.6f}"))
 
 # Create model saving widgets
 autoencoder_save_path = widgets.Text(
@@ -2442,6 +2647,7 @@ display(widgets.HBox([training_widgets["pause_predictor_button"], training_widge
 display(training_widgets["predictor_status"])
 display(training_widgets["predictor_loss"])
 display(training_widgets["predictor_training_output"])
+
 
 
 # In[ ]:

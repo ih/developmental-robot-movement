@@ -40,6 +40,8 @@ This repository contains research code for developmental robot movement with a m
 
 ### Session Explorer Notebook
 - **session_explorer.ipynb**: Interactive Jupyter notebook for exploring recorded sessions and training models. Provides frame playback with action callouts, lets you run autoencoder/predictor checkpoints to compare predictions against ground truth, and includes training sections to improve models on specific frames or sequences.
+- **Attention introspection**: Visualize transformer attention patterns with heatmaps, breakdown charts, and quantitative metrics (APA, ALF, TTAR, RI@16, entropy)
+- **Action space sweep**: Predictions across full robot action space instead of +/-10% variants for comprehensive action effect analysis
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
@@ -53,6 +55,15 @@ This repository contains research code for developmental robot movement with a m
 - **Real-time visualization**: Training progress display showing current vs reconstructed frames
 - **Comprehensive experiment tracking**: Weights & Biases integration for reconstruction, predictor training, and timing metrics
 - **Learning progress persistence**: Automatic save/load of model weights, training progress, and history buffers
+- **Attention introspection**: TransformerActionConditionedPredictor returns per-layer attention maps when `return_attn=True` for analysis
+
+### Attention Analysis Infrastructure
+- **EncoderLayerWithAttn**: Custom transformer encoder layer that optionally captures and returns per-head attention weights
+- **Attention metrics**: APA (Attention to Previous Action), ALF (Attention to Last Frame), TTAR (Token-Type Attention Ratio), RI@16 (Recency Index), entropy
+- **Action sensitivity testing**: Build action variants across full action space to measure prediction diversity
+- **Counterfactual analysis**: Action shuffle/zero tests to validate that predictions meaningfully depend on action inputs
+- **Gradient flow tracking**: Monitor gradient magnitudes flowing through action-related parameters vs total network
+- **Token indexing**: Automatic derivation of frame/action/future token positions from sequence for robust metric calculation
 
 ### Action Space
 - **Duration-based actions**: Motor commands with automatic stopping after specified duration
