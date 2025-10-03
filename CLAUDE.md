@@ -42,13 +42,17 @@ This repository contains research code for developmental robot movement with a m
 - **Model saving capabilities**: Save trained autoencoder and predictor models with configurable paths, compatible with AdaptiveWorldModel checkpoint format
 - **Interactive training controls**: Pause and resume buttons for both autoencoder and predictor training with responsive UI updates and proper state management
 - **Attention introspection**: Visualize transformer attention patterns with heatmaps, breakdown charts, and quantitative metrics (APA, ALF, TTAR, RI@16, entropy)
-- **Action space sweep**: Predictions across full robot action space instead of +/-10% variants for comprehensive action effect analysis
+- **Action space sweep**: Predictions across full robot action space with MSE for each action, clearly labeled with action values and recorded action indicator
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
 - **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for better generalization
 - **TransformerActionConditionedPredictor**: Causal transformer that interleaves visual features with action tokens
-- **Fresh prediction training**: Predictors trained using fresh predictions with consistent loss calculation
+- **FiLM conditioning**: Feature-wise Linear Modulation integrates action information into transformer layers via learned affine transformations (gamma, beta)
+- **Action normalization**: All action channels mapped to [-1, 1] range before embedding for consistent FiLM conditioning
+- **ActionEmbedding module**: Learned MLP embedding of normalized actions for semantic action representation
+- **Delta latent prediction**: Predictors learn residual/delta features rather than absolute features, improving training stability
+- **Fresh prediction training**: Predictors trained using fresh predictions with consistent loss calculation (single training pass per error threshold)
 - **Dual loss training**: Combined patch-space reconstruction + latent-space prediction losses for encoder optimization
 - **Prediction-friendly representations**: Encoder learns features that are both visually meaningful and easy to predict
 - **Joint training architecture**: Autoencoder reconstruction loss + dual predictor losses with shared encoder gradients
@@ -64,7 +68,7 @@ This repository contains research code for developmental robot movement with a m
 - **Attention metrics**: APA (Attention to Previous Action), ALF (Attention to Last Frame), TTAR (Token-Type Attention Ratio), RI@16 (Recency Index), entropy
 - **Action sensitivity testing**: Build action variants across full action space to measure prediction diversity
 - **Counterfactual analysis**: Action shuffle/zero tests to validate that predictions meaningfully depend on action inputs
-- **Gradient flow tracking**: Monitor gradient magnitudes flowing through action-related parameters vs total network
+- **Gradient flow tracking**: L2 norm-based monitoring of gradients flowing through action-related parameters (action_embed, film_layers) vs total network
 - **Token indexing**: Automatic derivation of frame/action/future token positions from sequence for robust metric calculation
 
 ### Action Space
@@ -79,6 +83,9 @@ This repository contains research code for developmental robot movement with a m
 ### Configuration
 - **config.py**: Contains image transforms, constants, and adaptive world model parameters
 - **AdaptiveWorldModelConfig class**: Centralized configuration for all model parameters including thresholds, learning rates, and training intervals
+- **Action normalization config**: `ACTION_CHANNELS`, `ACTION_RANGES` define action space and normalization ranges for FiLM conditioning
+- **FiLM parameters**: `ACTION_EMBED_DIM` (64), `FILM_HIDDEN_DIM` (128), `FILM_BLOCK_IDS` ([0, 2]) control action conditioning architecture
+- **Delta latent flag**: `DELTA_LATENT` (True) enables residual prediction mode for improved training stability
 - **Recording configuration**: `RECORDING_MODE` boolean controls recording vs online mode, `RECORDING_MAX_DISK_GB` limits total disk usage
 - **IP addresses**: JetBot connection IPs specified in integration example (modify as needed)
 
@@ -152,7 +159,7 @@ Required Python packages:
 - `models/`: Neural network architectures directory
   - `models/__init__.py`: Module exports for clean imports
   - `models/autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
-  - `models/predictor.py`: TransformerActionConditionedPredictor with sequence length management and attention introspection
+  - `models/predictor.py`: TransformerActionConditionedPredictor with FiLM conditioning, delta latent prediction, and attention introspection
   - `models/encoder_layer_with_attn.py`: Custom transformer encoder layer that optionally returns attention maps
 - `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
@@ -220,10 +227,13 @@ To add support for a new robot:
   - Mask ratio bounds (MASK_RATIO_MIN=0.3, MASK_RATIO_MAX=0.85)
   - Learning rates (AUTOENCODER_LR=1e-4, PREDICTOR_LR=1e-4)
   - Quality thresholds (RECONSTRUCTION_THRESHOLD=0.0005, PREDICTION_THRESHOLD=0.0005)
+- **Action normalization parameters**: `ACTION_CHANNELS`, `ACTION_RANGES` define action space mapping to [-1, 1] for FiLM conditioning
+- **FiLM architecture parameters**: `ACTION_EMBED_DIM`, `FILM_HIDDEN_DIM`, `FILM_BLOCK_IDS` control action conditioning layer configuration
+- **Delta latent mode**: `DELTA_LATENT` flag enables residual prediction architecture for improved gradient flow
 - **Action timing**: Configurable delay between actions via `ACTION_DELAY` parameter for controlled execution timing
 - **Easy tuning**: Modify parameters in one location instead of scattered throughout the code
 - **Default values**: Reasonable defaults for all parameters (LOG_INTERVAL=100, ACTION_DELAY=0, etc.)
-- **Recent changes**: Tightened quality thresholds and unified learning rates for more consistent training
+- **Recent changes**: Added FiLM conditioning and delta latent prediction for improved action integration
 
 ### Logging and Monitoring
 - **Throttled logging frequency**: All metrics logged periodically (LOG_INTERVAL=100 steps) to reduce computational overhead

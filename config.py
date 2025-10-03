@@ -58,3 +58,16 @@ DEFAULT_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints"
 # Interactive mode setting
 INTERACTIVE_MODE = False  # Set to True to enable interactive action selection
 
+# Action Normalization and FiLM Configuration
+ACTION_CHANNELS = ["motor_left", "motor_right", "duration"]
+ACTION_RANGES = {  # min, max for scaling to [-1, 1]
+    "motor_left":  (0.0,  0.0),    # left motor fixed at 0
+    "motor_right": (0.0,  0.12),   # forward-only speeds used in sessions
+    "duration":    (0.2,  0.2),    # step duration in seconds
+}
+ACTION_EMBED_DIM = 64          # learned action embedding dimension
+FILM_HIDDEN_DIM  = 128         # hidden width inside Action MLP
+FILM_BLOCK_IDS   = [0, 2]      # apply FiLM in early & mid transformer layers
+DELTA_LATENT     = True        # switch on residual prediction
+
+

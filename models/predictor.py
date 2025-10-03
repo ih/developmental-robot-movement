@@ -6,6 +6,114 @@ import torch
 import torch.nn as nn
 
 from models.encoder_layer_with_attn import EncoderLayerWithAttn
+import config
+
+
+class ActionEmbedding(nn.Module):
+    """
+    Learns a compact embedding of normalized action vectors.
+
+    Takes normalized action channels (motor_left, motor_right, duration) in [-1, 1]
+    and produces a learned embedding suitable for FiLM conditioning.
+    """
+
+    def __init__(self, in_dim, emb_dim=None, hidden_dim=None):
+        """
+        Args:
+            in_dim: Number of input action channels (e.g., 3 for motor_left, motor_right, duration)
+            emb_dim: Output embedding dimension (default: config.ACTION_EMBED_DIM)
+            hidden_dim: Hidden layer width (default: config.FILM_HIDDEN_DIM)
+        """
+        super().__init__()
+        if emb_dim is None:
+            emb_dim = config.ACTION_EMBED_DIM
+        if hidden_dim is None:
+            hidden_dim = config.FILM_HIDDEN_DIM
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, emb_dim),
+            nn.GELU(),
+            nn.LayerNorm(emb_dim),
+        )
+
+    def forward(self, action_normalized):
+        """
+        Args:
+            action_normalized: (batch_size, in_dim) tensor in [-1, 1]
+
+        Returns:
+            action_embedding: (batch_size, emb_dim) learned action representation
+        """
+        return self.net(action_normalized)
+
+
+class FiLM(nn.Module):
+    """
+    Feature-wise Linear Modulation layer.
+
+    Produces per-channel affine transformation parameters (gamma, beta) from
+    action embeddings to condition feature representations on actions.
+
+    Applies: output = gamma * features + beta
+    """
+
+    def __init__(self, emb_dim, num_channels):
+        """
+        Args:
+            emb_dim: Dimension of input action embedding
+            num_channels: Number of feature channels to modulate
+        """
+        super().__init__()
+        self.to_gamma = nn.Linear(emb_dim, num_channels)
+        self.to_beta = nn.Linear(emb_dim, num_channels)
+
+        # Initialize near identity: gamma ~ 1, beta ~ 0
+        # This ensures FiLM starts as a near-identity transform
+        nn.init.zeros_(self.to_gamma.weight)
+        nn.init.zeros_(self.to_gamma.bias)
+        nn.init.zeros_(self.to_beta.weight)
+        nn.init.zeros_(self.to_beta.bias)
+
+    def forward(self, action_embedding):
+        """
+        Args:
+            action_embedding: (batch_size, emb_dim) action representation
+
+        Returns:
+            gamma: (batch_size, num_channels) scale parameters
+            beta: (batch_size, num_channels) shift parameters
+        """
+        gamma = 1.0 + self.to_gamma(action_embedding)  # Start near 1
+        beta = self.to_beta(action_embedding)          # Start near 0
+        return gamma, beta
+
+
+def film_apply(features, gamma, beta):
+    """
+    Apply FiLM affine transformation to features.
+
+    Args:
+        features: (batch_size, num_channels, ...) feature tensor
+        gamma: (batch_size, num_channels) scale parameters
+        beta: (batch_size, num_channels) shift parameters
+
+    Returns:
+        modulated_features: (batch_size, num_channels, ...) with same shape as features
+    """
+    if features.ndim < 2:
+        raise ValueError("features tensor must have at least 2 dimensions")
+    if gamma.shape[0] != features.shape[0] or beta.shape[0] != features.shape[0]:
+        raise ValueError("gamma and beta batch sizes must match features")
+    if gamma.shape[-1] != features.shape[-1] or beta.shape[-1] != features.shape[-1]:
+        raise ValueError("gamma and beta channel sizes must match features")
+
+    broadcast_shape = [gamma.shape[0]] + [1] * (features.ndim - 2) + [gamma.shape[-1]]
+    gamma = gamma.view(*broadcast_shape)
+    beta = beta.view(*broadcast_shape)
+
+    return features * gamma + beta
 
 
 class TransformerActionConditionedPredictor(nn.Module):
@@ -32,9 +140,26 @@ class TransformerActionConditionedPredictor(nn.Module):
         self.level = level
         self.max_lookahead = 10  # For compatibility with old interface
 
-        # Action embedding layer
-        self.action_embedding = nn.Linear(action_dim, embed_dim)
+        # New FiLM-based action conditioning
+        # ActionEmbedding: converts normalized actions to learned embeddings
+        num_action_channels = len(config.ACTION_CHANNELS)
+        self.action_embed = ActionEmbedding(
+            in_dim=num_action_channels,
+            emb_dim=config.ACTION_EMBED_DIM,
+            hidden_dim=config.FILM_HIDDEN_DIM
+        )
 
+        # FiLM layers: one per transformer layer that we want to modulate
+        self.film_layers = nn.ModuleDict()
+        for layer_id in config.FILM_BLOCK_IDS:
+            if layer_id < num_layers:
+                self.film_layers[str(layer_id)] = FiLM(
+                    emb_dim=config.ACTION_EMBED_DIM,
+                    num_channels=embed_dim  # Transformer uses embed_dim as channel dimension
+                )
+
+        # Projection to map action embeddings to transformer token dimension
+        self.action_token_proj = nn.Linear(config.ACTION_EMBED_DIM, embed_dim)
         # Positional embeddings for the full sequence
         self.position_embedding = nn.Embedding(max_sequence_length, embed_dim)
 
@@ -57,7 +182,7 @@ class TransformerActionConditionedPredictor(nn.Module):
             ]
         )
 
-        # Output head to predict next encoder features
+        # Output head to predict next encoder features (or delta features)
         self.output_head = nn.Linear(embed_dim, embed_dim)
 
         # Layer norm
@@ -65,18 +190,18 @@ class TransformerActionConditionedPredictor(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def encode_action(self, action_dict, device):
-        """Convert action dictionary to embedding vector."""
-        action_vector = torch.zeros(self.action_dim, device=device)
-
-        if 'motor_left' in action_dict:
-            action_vector[0] = action_dict['motor_left']
-        if 'motor_right' in action_dict:
-            action_vector[1] = action_dict['motor_right']
-        if 'duration' in action_dict:
-            action_vector[2] = action_dict['duration']
-
-        return action_vector
+    def _normalize_action(self, action_dict, device):
+        values = []
+        for key in config.ACTION_CHANNELS:
+            value = float(action_dict.get(key, 0.0))
+            min_val, max_val = config.ACTION_RANGES[key]
+            value = max(min(value, max_val), min_val)
+            if max_val == min_val:
+                scaled = 0.0
+            else:
+                scaled = 2.0 * (value - min_val) / (max_val - min_val) - 1.0
+            values.append(scaled)
+        return torch.tensor(values, device=device, dtype=torch.float32).unsqueeze(0)
 
     @staticmethod
     def create_causal_mask(seq_len, device):
@@ -85,7 +210,7 @@ class TransformerActionConditionedPredictor(nn.Module):
         mask = mask.masked_fill(mask == 1, float('-inf'))
         return mask
 
-    def forward(self, encoder_features_history, actions, return_attn=False):
+    def forward(self, encoder_features_history, actions, return_attn=False, action_normalized=None, last_features=None):
         """
         Forward pass with interleaved encoder features and actions.
 
@@ -93,9 +218,12 @@ class TransformerActionConditionedPredictor(nn.Module):
             encoder_features_history: list[Tensor] of shape [B, num_patches+1, D]
             actions: list of action dicts (length = len(encoder_features_history) - 1)
             return_attn: whether to record and return per-layer attention maps
+            action_normalized: (batch_size, num_action_channels) tensor in [-1, 1]
+                             If provided, uses FiLM conditioning instead of legacy action embedding
+            last_features: (batch_size, num_patches+1, D) features from current frame for delta prediction
 
         Returns:
-            predicted_features: [B, num_patches+1, D]
+            predicted_features: [B, num_patches+1, D] (absolute or delta, depending on config.DELTA_LATENT)
             attn_info (optional): dict with attention maps and token metadata when return_attn=True
         """
         # Handle empty history case by returning random features
@@ -111,6 +239,13 @@ class TransformerActionConditionedPredictor(nn.Module):
         batch_size = encoder_features_history[0].shape[0]
         device = encoder_features_history[0].device
 
+        # Compute action embedding once for FiLM conditioning (if using new path)
+        film_action_embedding = None
+        if action_normalized is not None:
+            if action_normalized.shape[0] != batch_size:
+                action_normalized = action_normalized.expand(batch_size, -1)
+            film_action_embedding = self.action_embed(action_normalized)  # (batch_size, ACTION_EMBED_DIM)
+
         # Create interleaved sequence: FEATURES0, ACT0, FEATURES1, ACT1, ..., FEATURESn
         sequence = []
         token_types = []
@@ -123,10 +258,10 @@ class TransformerActionConditionedPredictor(nn.Module):
 
             # Add action token (except for the last frame)
             if i < len(actions):
-                action_vec = self.encode_action(actions[i], device=device)
-                action_vectors = action_vec.expand(batch_size, -1)
-                action_embeds = self.action_embedding(action_vectors)
-                sequence.append(action_embeds)
+                action_norm = self._normalize_action(actions[i], device=device).expand(batch_size, -1)
+                action_embedding = self.action_embed(action_norm)
+                action_token = self.action_token_proj(action_embedding)
+                sequence.append(action_token)
                 token_types.append(1)
 
         # Add future query slots after the last action
@@ -161,18 +296,31 @@ class TransformerActionConditionedPredictor(nn.Module):
         # Create causal attention mask
         causal_mask = self.create_causal_mask(seq_len, device=device)
 
-        # Run transformer layers, optionally recording attention
+        # Run transformer layers with FiLM conditioning, optionally recording attention
         attn_records = [] if return_attn else None
-        for layer in self.transformer_layers:
+        for layer_idx, layer in enumerate(self.transformer_layers):
+            # Apply transformer layer
             x, attn = layer(x, attn_mask=causal_mask, record_attn=return_attn)
             if return_attn:
                 attn_records.append(attn)
+
+            # Apply FiLM conditioning after specified layers
+            if film_action_embedding is not None and str(layer_idx) in self.film_layers:
+                gamma, beta = self.film_layers[str(layer_idx)](film_action_embedding)
+                # x has shape (batch_size, seq_len, embed_dim)
+                # gamma, beta have shape (batch_size, embed_dim)
+                x = film_apply(x, gamma, beta)
 
         x = self.layer_norm(x)
 
         # Get predictions from the future query slots (the final N positions)
         pred_tokens = x[:, -num_patches_plus_one:, :]
         predicted_features = self.output_head(pred_tokens)
+
+        # Apply delta latent prediction if enabled
+        if config.DELTA_LATENT and last_features is not None:
+            # predicted_features is delta, add to last_features to get absolute prediction
+            predicted_features = last_features + predicted_features
 
         if not return_attn:
             return predicted_features
@@ -219,10 +367,25 @@ class TransformerActionConditionedPredictor(nn.Module):
         """
         self.train()  # Enable dropout
 
+        device = (
+            encoder_features_history[0].device
+            if encoder_features_history
+            else self.future_query.device
+        )
+        action_normalized = None
+        if actions:
+            action_normalized = self._normalize_action(actions[-1], device=device)
+        last_features = encoder_features_history[-1].detach() if encoder_features_history else None
+
         predictions = []
         for _ in range(num_samples):
             with torch.no_grad():
-                pred = self.forward(encoder_features_history, actions)
+                pred = self.forward(
+                    encoder_features_history,
+                    actions,
+                    action_normalized=action_normalized,
+                    last_features=last_features,
+                )
                 predictions.append(pred)
 
         predictions = torch.stack(predictions, dim=0)  # [num_samples, batch_size, num_patches+1, embed_dim]

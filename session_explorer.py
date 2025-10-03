@@ -31,7 +31,7 @@ from IPython.display import display, Markdown
 
 import config
 from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
-from adaptive_world_model import AdaptiveWorldModel
+from adaptive_world_model import AdaptiveWorldModel, normalize_action_dicts
 from robot_interface import RobotInterface
 
 # Additional imports for training
@@ -1620,7 +1620,21 @@ async def predictor_threshold_training(context, threshold, max_steps):
                     return
 
                 try:
-                    predicted_features = predictor(feature_history, history_actions_with_future)
+                    # Normalize action for FiLM conditioning
+                    if history_actions_with_future:
+                        action_normalized = normalize_action_dicts([history_actions_with_future[-1]]).to(device)
+                    else:
+                        action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=device)
+
+                    # Get last features for delta prediction
+                    last_features = feature_history[-1] if feature_history else None
+
+                    predicted_features = predictor(
+                        feature_history,
+                        history_actions_with_future,
+                        action_normalized=action_normalized,
+                        last_features=last_features
+                    )
                     loss = adaptive_world_model.train_predictor(
                         level=0,
                         current_frame_tensor=target_tensor,
@@ -1673,8 +1687,23 @@ async def predictor_threshold_training(context, threshold, max_steps):
 
         predictor.eval()
         autoencoder.eval()
+
+        # Normalize action for FiLM conditioning
+        if history_actions_with_future:
+            action_normalized = normalize_action_dicts([history_actions_with_future[-1]]).to(device)
+        else:
+            action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=device)
+
+        # Get last features for delta prediction
+        last_features = feature_history[-1] if feature_history else None
+
         with torch.no_grad():
-            predicted_features = predictor(feature_history, history_actions_with_future)
+            predicted_features = predictor(
+                feature_history,
+                history_actions_with_future,
+                action_normalized=action_normalized,
+                last_features=last_features
+            )
             predicted_frame = decode_features_to_image(autoencoder, predicted_features)
 
         predicted_img = tensor_to_numpy_image(predicted_frame)
@@ -1749,7 +1778,21 @@ async def predictor_steps_training(context, num_steps):
                     return
 
                 try:
-                    predicted_features = predictor(feature_history, history_actions_with_future)
+                    # Normalize action for FiLM conditioning
+                    if history_actions_with_future:
+                        action_normalized = normalize_action_dicts([history_actions_with_future[-1]]).to(device)
+                    else:
+                        action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=device)
+
+                    # Get last features for delta prediction
+                    last_features = feature_history[-1] if feature_history else None
+
+                    predicted_features = predictor(
+                        feature_history,
+                        history_actions_with_future,
+                        action_normalized=action_normalized,
+                        last_features=last_features
+                    )
                     loss = adaptive_world_model.train_predictor(
                         level=0,
                         current_frame_tensor=target_tensor,
@@ -1794,8 +1837,23 @@ async def predictor_steps_training(context, num_steps):
 
         predictor.eval()
         autoencoder.eval()
+
+        # Normalize action for FiLM conditioning
+        if history_actions_with_future:
+            action_normalized = normalize_action_dicts([history_actions_with_future[-1]]).to(device)
+        else:
+            action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=device)
+
+        # Get last features for delta prediction
+        last_features = feature_history[-1] if feature_history else None
+
         with torch.no_grad():
-            predicted_features = predictor(feature_history, history_actions_with_future)
+            predicted_features = predictor(
+                feature_history,
+                history_actions_with_future,
+                action_normalized=action_normalized,
+                last_features=last_features
+            )
             predicted_frame = decode_features_to_image(autoencoder, predicted_features)
 
         predicted_img = tensor_to_numpy_image(predicted_frame)
@@ -1878,7 +1936,21 @@ async def predictor_resume_training(resume_data):
                     return
 
                 try:
-                    predicted_features = predictor(feature_history, history_actions_with_future)
+                    # Normalize action for FiLM conditioning
+                    if history_actions_with_future:
+                        action_normalized = normalize_action_dicts([history_actions_with_future[-1]]).to(device)
+                    else:
+                        action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=device)
+
+                    # Get last features for delta prediction
+                    last_features = feature_history[-1] if feature_history else None
+
+                    predicted_features = predictor(
+                        feature_history,
+                        history_actions_with_future,
+                        action_normalized=action_normalized,
+                        last_features=last_features
+                    )
                     loss = adaptive_world_model.train_predictor(
                         level=0,
                         current_frame_tensor=target_tensor,
@@ -1998,325 +2070,253 @@ train_predictor_steps_button.on_click(on_train_predictor_steps)
 # In[8]:
 
 
-# Main Session Explorer Interface
-session_state = {}
-session_widgets = {}
-
-# Model saving functionality
-def on_save_autoencoder(_):
-    """Save the current autoencoder model"""
-    autoencoder = adaptive_world_model.autoencoder
-    save_path = session_widgets["autoencoder_save_path"].value
-
-    with session_widgets["save_output"]:
-        session_widgets["save_output"].clear_output()
-
-        if autoencoder is None:
-            display(Markdown("❌ **No autoencoder model loaded to save**"))
-            return
-
-        if not save_path.strip():
-            display(Markdown("❌ **Please specify a save path for the autoencoder**"))
-            return
-
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-            # Save model using the same format as AdaptiveWorldModel
-            checkpoint = {
-                'model_state_dict': autoencoder.state_dict(),
-                'step': adaptive_world_model.step if hasattr(adaptive_world_model, 'step') else 0,
-            }
-            torch.save(checkpoint, save_path)
-
-            display(Markdown(f"✅ **Autoencoder saved successfully to:** `{save_path}`"))
-
-        except Exception as e:
-            display(Markdown(f"❌ **Error saving autoencoder:** {str(e)}"))
-
-def on_save_predictor(_):
-    """Save the current predictor model"""
-    predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
-    save_path = session_widgets["predictor_save_path"].value
-
-    with session_widgets["save_output"]:
-        session_widgets["save_output"].clear_output()
-
-        if predictor is None:
-            display(Markdown("❌ **No predictor model loaded to save**"))
-            return
-
-        if not save_path.strip():
-            display(Markdown("❌ **Please specify a save path for the predictor**"))
-            return
-
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-            # Save model using the same format as AdaptiveWorldModel
-            checkpoint = {
-                'model_state_dict': predictor.state_dict(),
-                'level': getattr(predictor, 'level', 0),
-                'step': adaptive_world_model.step if hasattr(adaptive_world_model, 'step') else 0,
-            }
-            torch.save(checkpoint, save_path)
-
-            display(Markdown(f"✅ **Predictor saved successfully to:** `{save_path}`"))
-
-        except Exception as e:
-            display(Markdown(f"❌ **Error saving predictor:** {str(e)}"))
-
-def on_save_both(_):
-    """Save both autoencoder and predictor models"""
+def on_run_predictor(_):
     autoencoder = adaptive_world_model.autoencoder
     predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
-
-    with session_widgets["save_output"]:
-        session_widgets["save_output"].clear_output()
-
-        if autoencoder is None and predictor is None:
-            display(Markdown("❌ **No models loaded to save**"))
-            return
-
-        saved_models = []
-        errors = []
-
-        # Save autoencoder if loaded and path specified
-        if autoencoder is not None:
-            autoencoder_path = session_widgets["autoencoder_save_path"].value
-            if autoencoder_path.strip():
-                try:
-                    os.makedirs(os.path.dirname(autoencoder_path), exist_ok=True)
-                    checkpoint = {
-                        'model_state_dict': autoencoder.state_dict(),
-                        'step': adaptive_world_model.step if hasattr(adaptive_world_model, 'step') else 0,
-                    }
-                    torch.save(checkpoint, autoencoder_path)
-                    saved_models.append(f"Autoencoder → `{autoencoder_path}`")
-                except Exception as e:
-                    errors.append(f"Autoencoder: {str(e)}")
-            else:
-                errors.append("Autoencoder: No save path specified")
-
-        # Save predictor if loaded and path specified
-        if predictor is not None:
-            predictor_path = session_widgets["predictor_save_path"].value
-            if predictor_path.strip():
-                try:
-                    os.makedirs(os.path.dirname(predictor_path), exist_ok=True)
-                    checkpoint = {
-                        'model_state_dict': predictor.state_dict(),
-                        'level': getattr(predictor, 'level', 0),
-                        'step': adaptive_world_model.step if hasattr(adaptive_world_model, 'step') else 0,
-                    }
-                    torch.save(checkpoint, predictor_path)
-                    saved_models.append(f"Predictor → `{predictor_path}`")
-                except Exception as e:
-                    errors.append(f"Predictor: {str(e)}")
-            else:
-                errors.append("Predictor: No save path specified")
-
-        # Display results
-        if saved_models:
-            display(Markdown("✅ **Successfully saved:**"))
-            for model in saved_models:
-                display(Markdown(f"- {model}"))
-
-        if errors:
-            display(Markdown("❌ **Errors occurred:**"))
-            for error in errors:
-                display(Markdown(f"- {error}"))
-
-def on_load_session_change(change):
-    selected_session = change["new"]
-    if not selected_session:
-        return
-    session_dir = os.path.join(SESSIONS_BASE_DIR, selected_session)
-    if not os.path.exists(session_dir):
-        return
-
-    # Load session data
-    events = load_session_events(session_dir)
-    observations = extract_observations(events, session_dir)
-    actions = extract_actions(events)
-    metadata = load_session_metadata(session_dir)
-
-    # Update session state
-    session_state.clear()
-    session_state.update({
-        "session_dir": session_dir,
-        "session_name": selected_session,
-        "events": events,
-        "observations": observations,
-        "actions": actions,
-        "metadata": metadata,
-    })
-
-    # Update widgets
-    frame_slider = session_widgets.get("frame_slider")
-    frame_input = session_widgets.get("frame_input")
-    history_slider = session_widgets.get("history_slider")
-
-    if frame_slider:
-        frame_slider.max = max(0, len(observations) - 1)
-        frame_slider.value = min(frame_slider.value, frame_slider.max)
-        frame_slider.description = f"Frame (0-{frame_slider.max})"
-
-    if frame_input:
-        frame_input.min = 0
-        frame_input.max = max(0, len(observations) - 1)
-        target_value = frame_slider.value if frame_slider else frame_input.value
-        frame_input.value = max(frame_input.min, min(frame_input.max, target_value))
-
-    if history_slider:
-        history_slider.max = min(10, len(observations))
-        history_slider.value = min(history_slider.value, history_slider.max)
-
-    with session_widgets["output"]:
-        session_widgets["output"].clear_output()
-        display(Markdown(f"**Loaded session:** {selected_session}"))
-        display(Markdown(f"**Observations:** {len(observations)}"))
-        display(Markdown(f"**Actions:** {len(actions)}"))
-        if metadata:
-            display(Markdown(f"**Metadata:** {len(metadata)} keys"))
-
-def render_frame(idx):
-    observations = session_state.get("observations", [])
-    if not observations or idx < 0 or idx >= len(observations):
-        return
-
-    observation = observations[idx]
-    frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"])
-    frame_image = tensor_to_numpy_image(frame_tensor.unsqueeze(0))
-
-    with session_widgets["output"]:
-        session_widgets["output"].clear_output()
-
-        display(Markdown(f"**Frame {idx+1}/{len(observations)}** (step {observation['step']})"))
-        display(Markdown(f"**Timestamp:** {format_timestamp(observation.get('timestamp'))}"))
-
-        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-        ax.imshow(frame_image)
-        ax.set_title(f"Observation {idx+1} (step {observation['step']})")
-        ax.axis("off")
-        plt.tight_layout()
-        plt.show()
-
-
-def on_frame_change(change):
-    idx = change["new"]
-    frame_input = session_widgets.get("frame_input")
-    if frame_input is not None and frame_input.value != idx:
-        frame_input.value = idx
-    render_frame(idx)
-
-
-def on_frame_input_change(change):
-    frame_slider = session_widgets.get("frame_slider")
-    frame_input = session_widgets.get("frame_input")
-    if frame_slider is None or frame_input is None:
-        return
-
-    new_value = change["new"]
-    if new_value is None:
-        return
-
-    idx = int(new_value)
-    idx = max(frame_slider.min, min(frame_slider.max, idx))
-
-    if frame_input.value != idx:
-        frame_input.value = idx
-
-    if frame_slider.value != idx:
-        frame_slider.value = idx
-    else:
-        render_frame(idx)
-
-def on_load_models(_):
-    # Load models into AdaptiveWorldModel
-    autoencoder_path = session_widgets["autoencoder_path"].value
-    predictor_path = session_widgets["predictor_path"].value
-
-    with session_widgets["model_output"]:
-        session_widgets["model_output"].clear_output()
-
-        try:
-            # Load autoencoder if specified and exists
-            if autoencoder_path and os.path.exists(autoencoder_path):
-                adaptive_world_model.autoencoder = load_autoencoder_model(autoencoder_path, device)
-                display(Markdown(f"✅ **Loaded autoencoder** from {autoencoder_path}"))
-            elif autoencoder_path:
-                display(Markdown(f"❌ **Autoencoder file not found:** {autoencoder_path}"))
-            else:
-                display(Markdown("⚠️ **No autoencoder path specified**"))
-
-            # Load predictor if specified and exists
-            if predictor_path and os.path.exists(predictor_path):
-                predictor = load_predictor_model(predictor_path, device)
-                adaptive_world_model.predictors = [predictor]
-                display(Markdown(f"✅ **Loaded predictor** from {predictor_path}"))
-            elif predictor_path:
-                display(Markdown(f"❌ **Predictor file not found:** {predictor_path}"))
-            else:
-                display(Markdown("⚠️ **No predictor path specified**"))
-
-        except Exception as e:
-            display(Markdown(f"❌ **Error loading models:** {str(e)}"))
-
-def on_run_autoencoder(_):
-    autoencoder = adaptive_world_model.autoencoder
     frame_slider = session_widgets.get("frame_slider")
 
-    with session_widgets["autoencoder_output"]:
-        session_widgets["autoencoder_output"].clear_output()
+    with session_widgets["predictor_output"]:
+        session_widgets["predictor_output"].clear_output()
 
-        if autoencoder is None:
-            display(Markdown("Load the autoencoder checkpoint first."))
+        if autoencoder is None or predictor is None:
+            display(Markdown("Load both autoencoder and predictor checkpoints first."))
             return
         if frame_slider is None:
             display(Markdown("Load a session to select frames."))
             return
 
-        idx = frame_slider.value
-        observation = session_state.get("observations", [])[idx]
-        frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"]).unsqueeze(0).to(device)
+        target_idx = frame_slider.value
+        history_slider_widget = session_widgets.get("history_slider")
+        desired_history = history_slider_widget.value if history_slider_widget else 3
 
-        autoencoder.eval()
-        with torch.no_grad():
-            reconstructed = autoencoder.reconstruct(frame_tensor)
-            loss = torch.nn.functional.mse_loss(reconstructed, frame_tensor).item()
+        selected_obs, action_dicts, error = build_predictor_sequence(session_state, target_idx, desired_history)
+        if error:
+            display(Markdown(f"**Cannot run predictor:** {error}"))
+            return
 
-        original_img = tensor_to_numpy_image(frame_tensor)
-        reconstructed_img = tensor_to_numpy_image(reconstructed)
+        feature_history = []
+        history_images = []
+        for obs in selected_obs:
+            tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
+            autoencoder.eval()
+            with torch.no_grad():
+                encoded = autoencoder.encode(tensor).detach()
+            feature_history.append(encoded)
+            history_images.append(tensor_to_numpy_image(tensor))
 
-        display(Markdown(f"**Autoencoder Inference on Frame {idx+1} (step {observation['step']})**"))
-        display(Markdown(f"**Reconstruction Loss:** {loss:.6f}"))
+        display(Markdown(f"**Predictor Inference on History ending at Frame {target_idx+1} (step {selected_obs[-1]['step']})**"))
+        display(Markdown(f"**History length:** {len(selected_obs)} frames"))
 
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        axes[0].imshow(original_img)
-        axes[0].set_title("Original")
-        axes[0].axis("off")
-        axes[1].imshow(reconstructed_img)
-        axes[1].set_title(f"Reconstructed (Loss: {loss:.6f})")
-        axes[1].axis("off")
+        fig, axes = plt.subplots(1, len(history_images), figsize=(3 * len(history_images), 3))
+        if len(history_images) == 1:
+            axes = [axes]
+        for i, img in enumerate(history_images):
+            axes[i].imshow(img)
+            axes[i].set_title(f"Frame {selected_obs[i]['observation_index']+1}")
+            axes[i].axis("off")
         plt.tight_layout()
         plt.show()
 
-        # Show autoencoder weight visualization
-        display(Markdown("### Autoencoder Network Weight Visualization"))
-        autoencoder_weight_stats = visualize_autoencoder_weights(autoencoder)
+        recorded_action, action_source = get_future_action_for_prediction(session_state, target_idx)
+        if recorded_action is None:
+            display(Markdown("*No recorded action between current and next frame; using empty action.*"))
+            recorded_action = {}
+        elif action_source == "previous":
+            display(Markdown("*Using the most recent action prior to the current frame.*"))
 
-        # Display autoencoder weight statistics
-        if autoencoder_weight_stats:
-            stats_text = f"""
-**Autoencoder Weight Statistics:**
-- Patch Embed: Mean={autoencoder_weight_stats['patch_embed_mean']:.6f}, Std={autoencoder_weight_stats['patch_embed_std']:.6f}
-- CLS Token: Mean={autoencoder_weight_stats['cls_token_mean']:.6f}, Std={autoencoder_weight_stats['cls_token_std']:.6f}
-- Position Embed: Mean={autoencoder_weight_stats['pos_embed_mean']:.6f}, Std={autoencoder_weight_stats['pos_embed_std']:.6f}
-            """
-            display(Markdown(stats_text))
+        next_tensor = None
+        if target_idx + 1 < len(session_state.get("observations", [])):
+            next_obs = session_state["observations"][target_idx + 1]
+            next_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
+
+        history_actions_base = [clone_action(a) for a in action_dicts]
+        actions_for_baseline = history_actions_base + [clone_action(recorded_action)]
+
+        predictor.eval()
+        last_features = feature_history[-1] if feature_history else None
+        baseline_action_norm = normalize_action_dicts([actions_for_baseline[-1]]).to(device)
+        with torch.no_grad():
+            baseline_features, attn_info = predictor(
+                feature_history,
+                actions_for_baseline,
+                return_attn=True,
+                action_normalized=baseline_action_norm,
+                last_features=last_features
+            )
+            baseline_frame_tensor = decode_features_to_image(autoencoder, baseline_features)
+        baseline_img = tensor_to_numpy_image(baseline_frame_tensor)
+        baseline_mse = None
+        if next_tensor is not None:
+            with torch.no_grad():
+                baseline_mse = torch.nn.functional.mse_loss(baseline_frame_tensor, next_tensor).item()
+
+        action_space = get_action_space(session_state)
+        all_predictions = []
+
+        if action_space:
+            for action in action_space:
+                history_actions_with_future = history_actions_base + [clone_action(action)]
+                variant_action_norm = normalize_action_dicts([history_actions_with_future[-1]]).to(device)
+                if actions_equal(action, recorded_action):
+                    predicted_frame_tensor = baseline_frame_tensor
+                    prediction_img = baseline_img
+                    mse_loss = baseline_mse
+                else:
+                    with torch.no_grad():
+                        predicted_features = predictor(
+                            feature_history,
+                            history_actions_with_future,
+                            action_normalized=variant_action_norm,
+                            last_features=last_features
+                        )
+                        predicted_frame_tensor = decode_features_to_image(autoencoder, predicted_features)
+                    prediction_img = tensor_to_numpy_image(predicted_frame_tensor)
+                    if next_tensor is not None:
+                        with torch.no_grad():
+                            mse_loss = torch.nn.functional.mse_loss(predicted_frame_tensor, next_tensor).item()
+                    else:
+                        mse_loss = None
+
+                all_predictions.append({
+                    "action": action,
+                    "image": prediction_img,
+                    "label": format_action_label(action),
+                    "mse": mse_loss,
+                })
+
+        display(Markdown("### Predictions for All Actions"))
+        if all_predictions:
+            cols = min(4, len(all_predictions))
+            rows = math.ceil(len(all_predictions) / cols)
+            fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows))
+            axes = np.array(axes).reshape(rows, cols)
+            for idx, prediction in enumerate(all_predictions):
+                ax = axes[idx // cols][idx % cols]
+                ax.imshow(prediction["image"])
+                title = prediction["label"]
+                if actions_equal(prediction["action"], recorded_action):
+                    title += " (recorded)"
+                if prediction["mse"] is not None:
+                    title += f" MSE: {prediction['mse']:.6f}"
+                ax.set_title(title, fontsize=9)
+                ax.axis("off")
+            for idx in range(len(all_predictions), rows * cols):
+                axes[idx // cols][idx % cols].axis("off")
+            plt.tight_layout()
+            plt.show()
+        else:
+            display(Markdown("No actions available to visualize predictions."))
+
+        attention_data = compute_attention_visual_data(attn_info)
+        if attention_data:
+            metrics = attention_data["metrics"]
+            display(Markdown("### Attention Diagnostics"))
+            metric_lines = [
+                f"- **APA**: {metrics['APA']:.4f}",
+                f"- **ALF**: {metrics['ALF']:.4f}",
+                f"- **TTAR**: {metrics['TTAR']:.4f}",
+                f"- **RI@16**: {metrics['RI@16']:.4f}",
+                f"- **Entropy**: {metrics['Entropy']:.4f}",
+                f"- **Uniform Baseline**: {metrics['UniformBaseline']:.4f}",
+            ]
+            display(Markdown("\n".join(metric_lines)))
+            plot_attention_heatmap(attention_data["heatmap"], attention_data["token_types"])
+            plot_attention_breakdown(attention_data["breakdown"])
+
+        variants = build_action_variants(recorded_action, action_space)
+        if variants:
+            max_variants = min(len(variants), 7)
+            variants = variants[:max_variants]
+            variant_results = []
+            variant_images = []
+            for variant in variants:
+                history_variant = history_actions_base + [clone_action(variant)]
+                variant_norm = normalize_action_dicts([history_variant[-1]]).to(device)
+                if actions_equal(variant, recorded_action):
+                    variant_tensor = baseline_frame_tensor
+                    variant_img = baseline_img
+                else:
+                    with torch.no_grad():
+                        variant_features = predictor(
+                            feature_history,
+                            history_variant,
+                            action_normalized=variant_norm,
+                            last_features=last_features
+                        )
+                        variant_tensor = decode_features_to_image(autoencoder, variant_features)
+                    variant_img = tensor_to_numpy_image(variant_tensor)
+                diff_map = np.abs(variant_img - baseline_img).mean(axis=-1)
+                variant_results.append({
+                    "action": variant,
+                    "image": variant_img,
+                    "diff": diff_map,
+                })
+                variant_images.append(variant_img)
+
+            if variant_images:
+                diversity_score = float(np.std(np.stack(variant_images, axis=0)).mean())
+                display(Markdown("### Action Space Sweep"))
+                display(Markdown(f"- **Variants evaluated:** {len(variant_results)}"))
+                display(Markdown(f"- **Image-space variance:** {diversity_score:.6f}"))
+
+                rows = 2
+                cols = len(variant_results)
+                fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 6))
+                if cols == 1:
+                    axes = np.array([[axes[0]], [axes[1]]])
+                for idx, result in enumerate(variant_results):
+                    axes[0, idx].imshow(result["image"])
+                    axes[0, idx].set_title(format_action_label(result["action"]), fontsize=8)
+                    axes[0, idx].axis("off")
+                    axes[1, idx].imshow(result["diff"], cmap="magma")
+                    axes[1, idx].set_title("Delta vs recorded", fontsize=8)
+                    axes[1, idx].axis("off")
+                plt.tight_layout()
+                plt.show()
+
+        if next_tensor is not None:
+            baseline_loss = adaptive_world_model.eval_predictor_loss(
+                predictor,
+                feature_history,
+                actions_for_baseline,
+                next_tensor,
+            )
+            shuffle_loss = adaptive_world_model.eval_predictor_loss(
+                predictor,
+                feature_history,
+                actions_for_baseline,
+                next_tensor,
+                override_actions="shuffle",
+            )
+            zero_loss = adaptive_world_model.eval_predictor_loss(
+                predictor,
+                feature_history,
+                actions_for_baseline,
+                next_tensor,
+                override_actions="zero",
+            )
+            asg = shuffle_loss - baseline_loss
+            azg = zero_loss - baseline_loss
+            display(Markdown(f"**Counterfactual gaps:** ASG = {asg:.6f}, AZG = {azg:.6f}"))
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+# In[24]:
 
 
 def on_run_predictor(_):
@@ -2382,8 +2382,16 @@ def on_run_predictor(_):
         actions_for_baseline = history_actions_base + [clone_action(recorded_action)]
 
         predictor.eval()
+        last_features = feature_history[-1] if feature_history else None
+        baseline_action_norm = normalize_action_dicts([actions_for_baseline[-1]]).to(device)
         with torch.no_grad():
-            baseline_features, attn_info = predictor(feature_history, actions_for_baseline, return_attn=True)
+            baseline_features, attn_info = predictor(
+                feature_history,
+                actions_for_baseline,
+                return_attn=True,
+                action_normalized=baseline_action_norm,
+                last_features=last_features
+            )
             baseline_frame_tensor = decode_features_to_image(autoencoder, baseline_features)
         baseline_img = tensor_to_numpy_image(baseline_frame_tensor)
         baseline_mse = None
@@ -2397,13 +2405,19 @@ def on_run_predictor(_):
         if action_space:
             for action in action_space:
                 history_actions_with_future = history_actions_base + [clone_action(action)]
+                variant_action_norm = normalize_action_dicts([history_actions_with_future[-1]]).to(device)
                 if actions_equal(action, recorded_action):
                     predicted_frame_tensor = baseline_frame_tensor
                     prediction_img = baseline_img
                     mse_loss = baseline_mse
                 else:
                     with torch.no_grad():
-                        predicted_features = predictor(feature_history, history_actions_with_future)
+                        predicted_features = predictor(
+                            feature_history,
+                            history_actions_with_future,
+                            action_normalized=variant_action_norm,
+                            last_features=last_features
+                        )
                         predicted_frame_tensor = decode_features_to_image(autoencoder, predicted_features)
                     prediction_img = tensor_to_numpy_image(predicted_frame_tensor)
                     if next_tensor is not None:
@@ -2466,12 +2480,18 @@ def on_run_predictor(_):
             variant_images = []
             for variant in variants:
                 history_variant = history_actions_base + [clone_action(variant)]
+                variant_norm = normalize_action_dicts([history_variant[-1]]).to(device)
                 if actions_equal(variant, recorded_action):
                     variant_tensor = baseline_frame_tensor
                     variant_img = baseline_img
                 else:
                     with torch.no_grad():
-                        variant_features = predictor(feature_history, history_variant)
+                        variant_features = predictor(
+                            feature_history,
+                            history_variant,
+                            action_normalized=variant_norm,
+                            last_features=last_features
+                        )
                         variant_tensor = decode_features_to_image(autoencoder, variant_features)
                     variant_img = tensor_to_numpy_image(variant_tensor)
                 diff_map = np.abs(variant_img - baseline_img).mean(axis=-1)
@@ -2528,132 +2548,1207 @@ def on_run_predictor(_):
             azg = zero_loss - baseline_loss
             display(Markdown(f"**Counterfactual gaps:** ASG = {asg:.6f}, AZG = {azg:.6f}"))
 
-# Create model saving widgets
-autoencoder_save_path = widgets.Text(
-    value=os.path.join(config.DEFAULT_CHECKPOINT_DIR, "autoencoder_trained.pth"),
-    description="Save to:",
-    style={'description_width': '100px'}
-)
-predictor_save_path = widgets.Text(
-    value=os.path.join(config.DEFAULT_CHECKPOINT_DIR, "predictor_0_trained.pth"),
-    description="Save to:",
-    style={'description_width': '100px'}
-)
 
-save_autoencoder_button = widgets.Button(description="Save Autoencoder", button_style="primary", icon="save")
-save_predictor_button = widgets.Button(description="Save Predictor", button_style="primary", icon="save")
-save_both_button = widgets.Button(description="Save Both Models", button_style="success", icon="save")
+# In[25]:
 
-save_output = widgets.Output()
 
-# Create session selection widgets
-session_dirs = list_session_dirs(SESSIONS_BASE_DIR)
-load_session_dropdown = widgets.Dropdown(
-    options=[""] + session_dirs,
-    value="",
-    description="Session:",
-    style={'description_width': '100px'}
-)
+# Interactive controls and callbacks
+session_state = {
+    "session_name": None,
+    "session_dir": None,
+    "metadata": {},
+    "events": [],
+    "observations": [],
+    "actions": [],
+    "autoencoder": None,
+    "predictor": None,
+    "feature_cache": {},
+    "action_space": [],
+}
 
-frame_slider = widgets.IntSlider(value=0, min=0, max=0, description="Frame (0-0)", style={'description_width': '100px'})
-frame_input = widgets.BoundedIntText(value=0, min=0, max=0, description="Go to:", layout=widgets.Layout(width="140px"), style={'description_width': '60px'})
-history_slider = widgets.IntSlider(value=3, min=2, max=10, description="History", style={'description_width': '100px'})
+session_widgets = {}
 
-# Create model loading widgets
-autoencoder_path = widgets.Text(value=DEFAULT_AUTOENCODER_PATH, description="Autoencoder:", style={'description_width': '100px'})
-predictor_path = widgets.Text(value=DEFAULT_PREDICTOR_PATH, description="Predictor:", style={'description_width': '100px'})
-load_models_button = widgets.Button(description="Load Models", button_style="primary", icon="download")
+def reset_feature_cache():
+    session_state["feature_cache"] = {}
 
-# Create inference buttons
+def on_refresh_sessions(_=None):
+    options = list_session_dirs(SESSIONS_BASE_DIR)
+    current = session_widgets["session_dropdown"].value if "session_dropdown" in session_widgets else None
+    session_widgets["session_dropdown"].options = options
+    if not options:
+        session_widgets["session_dropdown"].value = None
+    elif current in options:
+        session_widgets["session_dropdown"].value = current
+    else:
+        session_widgets["session_dropdown"].value = options[-1]
+
+def on_load_session(_):
+    dropdown = session_widgets["session_dropdown"]
+    session_name = dropdown.value
+    if not session_name:
+        return
+    session_dir = os.path.join(SESSIONS_BASE_DIR, session_name)
+    metadata = load_session_metadata(session_dir)
+    events = load_session_events(session_dir)
+    observations = extract_observations(events, session_dir)
+    actions = extract_actions(events)
+
+    session_state.update({
+        "session_name": session_name,
+        "session_dir": session_dir,
+        "metadata": metadata,
+        "events": events,
+        "observations": observations,
+        "actions": actions,
+    })
+    session_state["action_space"] = get_action_space(session_state)
+    reset_feature_cache()
+    tensor_cache.clear()
+    load_frame_bytes.cache_clear()
+
+    with session_widgets["session_area"]:
+        session_widgets["session_area"].clear_output()
+        if not observations:
+            display(Markdown(f"**{session_name}** has no observation frames."))
+            return
+        details = [
+            f"**Session:** {session_name}",
+            f"**Total events:** {len(events)}",
+            f"**Observations:** {len(observations)}",
+            f"**Actions:** {len(actions)}",
+        ]
+        if metadata:
+            start_time = metadata.get("start_time")
+            if start_time:
+                details.append(f"**Start:** {start_time}")
+            robot_type = metadata.get("robot_type")
+            if robot_type:
+                details.append(f"**Robot:** {robot_type}")
+        display(Markdown("<br>".join(details)))
+
+        frame_slider = widgets.IntSlider(value=0, min=0, max=len(observations) - 1, description="Frame", continuous_update=False)
+        play_widget = widgets.Play(interval=100, value=0, min=0, max=len(observations) - 1, step=1, description="Play")
+        widgets.jslink((play_widget, "value"), (frame_slider, "value"))
+
+        frame_image = widgets.Image(format="jpg")
+        frame_image.layout.width = "448px"
+        frame_info = widgets.HTML()
+        history_preview = widgets.Output()
+
+        session_widgets["frame_slider"] = frame_slider
+        session_widgets["play_widget"] = play_widget
+        session_widgets["frame_image"] = frame_image
+        session_widgets["frame_info"] = frame_info
+        session_widgets["history_preview"] = history_preview
+
+        def update_history_preview(idx):
+            if "history_preview" not in session_widgets:
+                return
+            history_slider_widget = session_widgets.get("history_slider")
+            requested = history_slider_widget.value if history_slider_widget else 3
+            requested = max(1, requested)
+            requested = min(requested, idx + 1)
+            start = max(0, idx - requested + 1)
+            obs_slice = observations[start: idx + 1]
+            events_local = session_state.get("events", [])
+            display_items = []
+            for offset, obs in enumerate(obs_slice):
+                frame_bytes = load_frame_bytes(obs["full_path"])
+                border_color = "#4caf50" if (start + offset) == idx else "#cccccc"
+                image = widgets.Image(value=frame_bytes, format="jpg", layout=widgets.Layout(width="160px", height="120px", border=f"2px solid {border_color}"))
+                label_text = f"Step {obs['step']}"
+                if (start + offset) == idx:
+                    label_text += " (current)"
+                label = widgets.HTML(value=f"<div style='text-align:center; font-size:10px'>{label_text}</div>")
+                display_items.append(widgets.VBox([image, label]))
+                if offset < len(obs_slice) - 1:
+                    next_obs = obs_slice[offset + 1]
+                    actions_between = [events_local[i] for i in range(obs["event_index"] + 1, next_obs["event_index"]) if events_local[i].get("type") == "action"]
+                    if actions_between:
+                        action_text = "; ".join(format_action_label(act.get("data", {})) for act in actions_between)
+                    else:
+                        action_text = "No action"
+                    action_label = widgets.HTML(value=f"<div style='font-size:10px; padding:0 6px;'>Action: {action_text}</div>", layout=widgets.Layout(height="120px", display="flex", align_items="center", justify_content="center"))
+                    display_items.append(action_label)
+            session_widgets["history_preview"].clear_output()
+            with session_widgets["history_preview"]:
+                if display_items:
+                    layout = widgets.Layout(display="flex", flex_flow="row", align_items="center")
+                    display(widgets.HBox(display_items, layout=layout))
+                else:
+                    display(Markdown("History preview unavailable for this frame."))
+
+        session_widgets["update_history_preview"] = update_history_preview
+
+        def update_frame(change):
+            idx_local = change["new"] if isinstance(change, dict) else change
+            observation = observations[idx_local]
+            frame_image.value = load_frame_bytes(observation["full_path"])
+            frame_info.value = f"<b>Observation {idx_local + 1} / {len(observations)}</b><br>Step: {observation['step']}<br>Timestamp: {format_timestamp(observation['timestamp'])}"
+            update_history_preview(idx_local)
+
+        frame_slider.observe(update_frame, names="value")
+        update_frame({"new": frame_slider.value})
+
+        display(widgets.VBox([
+            widgets.HBox([play_widget, frame_slider]),
+            frame_image,
+            frame_info,
+            widgets.HTML("<b>History preview</b>"),
+            history_preview,
+        ]))
+
+    session_widgets["model_status"].value = ""
+    session_widgets["autoencoder_output"].clear_output()
+    session_widgets["predictor_output"].clear_output()
+
+def on_load_models(_):
+    messages = []
+    auto_path = session_widgets["autoencoder_path"].value.strip()
+    predictor_path = session_widgets["predictor_path"].value.strip()
+
+    if auto_path:
+        if os.path.exists(auto_path):
+            try:
+                session_state["autoencoder"] = load_autoencoder_model(auto_path, device)
+                reset_feature_cache()
+                messages.append(f"Autoencoder loaded from `{auto_path}`.")
+            except Exception as exc:
+                session_state["autoencoder"] = None
+                messages.append(f"<span style='color:red'>Failed to load autoencoder: {exc}</span>")
+        else:
+            session_state["autoencoder"] = None
+            messages.append(f"<span style='color:red'>Autoencoder path not found: {auto_path}</span>")
+    else:
+        session_state["autoencoder"] = None
+        messages.append("Autoencoder path is empty; skipping load.")
+
+    if predictor_path:
+        if os.path.exists(predictor_path):
+            try:
+                session_state["predictor"] = load_predictor_model(predictor_path, device)
+                messages.append(f"Predictor loaded from `{predictor_path}`.")
+            except Exception as exc:
+                session_state["predictor"] = None
+                messages.append(f"<span style='color:red'>Failed to load predictor: {exc}</span>")
+        else:
+            session_state["predictor"] = None
+            messages.append(f"<span style='color:red'>Predictor path not found: {predictor_path}</span>")
+    else:
+        session_state["predictor"] = None
+        messages.append("Predictor path is empty; skipping load.")
+
+    session_widgets["model_status"].value = "<br>".join(messages)
+
+def on_run_autoencoder(_):
+    autoencoder = session_state.get("autoencoder")
+    if autoencoder is None:
+        with session_widgets["autoencoder_output"]:
+            session_widgets["autoencoder_output"].clear_output()
+            display(Markdown("Load the autoencoder checkpoint first."))
+        return
+    frame_slider = session_widgets.get("frame_slider")
+    if frame_slider is None:
+        with session_widgets["autoencoder_output"]:
+            session_widgets["autoencoder_output"].clear_output()
+            display(Markdown("Load a session to select frames."))
+        return
+
+    idx = frame_slider.value
+    observation = session_state.get("observations", [])[idx]
+    frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"]).unsqueeze(0).to(device)
+
+    autoencoder.eval()
+    with torch.no_grad():
+        reconstructed = autoencoder.reconstruct(frame_tensor)
+    mse = torch.nn.functional.mse_loss(reconstructed, frame_tensor).item()
+
+    original_img = tensor_to_numpy_image(frame_tensor)
+    reconstructed_img = tensor_to_numpy_image(reconstructed)
+
+    with session_widgets["autoencoder_output"]:
+        session_widgets["autoencoder_output"].clear_output()
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+        axes[0].imshow(original_img)
+        axes[0].set_title("Input")
+        axes[0].axis("off")
+        axes[1].imshow(reconstructed_img)
+        axes[1].set_title(f"Reconstruction MSE: {mse:.6f}")
+        axes[1].axis("off")
+        plt.tight_layout()
+        plt.show()
+
+def on_run_predictor(_):
+    autoencoder = session_state.get("autoencoder")
+    predictor = session_state.get("predictor")
+    frame_slider = session_widgets.get("frame_slider")
+
+    with session_widgets["predictor_output"]:
+        session_widgets["predictor_output"].clear_output()
+        if autoencoder is None or predictor is None:
+            display(Markdown("Load both autoencoder and predictor checkpoints first."))
+            return
+        if frame_slider is None:
+            display(Markdown("Load a session to select frames."))
+            return
+
+        target_idx = frame_slider.value
+        history_slider_widget = session_widgets.get("history_slider")
+        desired_history = history_slider_widget.value if history_slider_widget else 3
+
+        selected_obs, action_dicts, error = build_predictor_sequence(session_state, target_idx, desired_history)
+        if error:
+            display(Markdown(f"**Cannot run predictor:** {error}"))
+            return
+
+        actual_history = len(selected_obs)
+        if history_slider_widget and actual_history != history_slider_widget.value:
+            history_slider_widget.value = actual_history
+
+        feature_history = []
+        for obs in selected_obs:
+            cached = session_state["feature_cache"].get(obs["frame_path"])
+            if cached is None:
+                tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
+                autoencoder.eval()
+                with torch.no_grad():
+                    encoded = autoencoder.encode(tensor)
+                session_state["feature_cache"][obs["frame_path"]] = encoded.detach().cpu()
+                cached = session_state["feature_cache"][obs["frame_path"]]
+            feature_history.append(cached)
+
+        feature_history_gpu = [feat.to(device) for feat in feature_history]
+
+        recorded_future_action, action_source = get_future_action_for_prediction(session_state, target_idx)
+        recorded_action = clone_action(recorded_future_action) if recorded_future_action is not None else {}
+
+        predictor.eval()
+        autoencoder.eval()
+
+        if recorded_future_action is None:
+            display(Markdown("No recorded action between current and next frame; using an empty action for comparison."))
+        elif action_source == "previous":
+            display(Markdown("Using the most recent action prior to the current frame for comparison."))
+        predictor.eval()
+        autoencoder.eval()
+
+        if recorded_future_action is None:
+            display(Markdown("No recorded action between current and next frame; using an empty action for comparison."))
+
+        def predict_for_action(action_dict):
+            history_actions = [clone_action(act) for act in action_dicts]
+            if action_dict is not None:
+                history_actions.append(clone_action(action_dict))
+            else:
+                history_actions.append({})
+            
+            # Normalize action for FiLM conditioning
+            if history_actions:
+                action_normalized = normalize_action_dicts([history_actions[-1]]).to(device)
+            else:
+                action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=device)
+            
+            # Get last features for delta prediction
+            last_features = feature_history_gpu[-1] if feature_history_gpu else None
+            
+            pred_features = predictor(
+                feature_history_gpu,
+                history_actions,
+                action_normalized=action_normalized,
+                last_features=last_features
+            )
+            decoded_candidate = decode_features_to_image(autoencoder, pred_features)
+            return decoded_candidate
+
+        next_obs = session_state["observations"][target_idx + 1] if target_idx + 1 < len(session_state["observations"]) else None
+        actual_tensor_cpu = None
+        actual_tensor_gpu = None
+        actual_img = None
+        if next_obs is not None:
+            actual_tensor_cpu = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0)
+            actual_tensor_gpu = actual_tensor_cpu.to(device)
+            actual_img = tensor_to_numpy_image(actual_tensor_cpu)
+
+        all_predictions = []
+        with torch.no_grad():
+            recorded_pred_tensor = predict_for_action(recorded_action if recorded_future_action is not None else None)
+            recorded_img = tensor_to_numpy_image(recorded_pred_tensor)
+            recorded_mse = None
+            if actual_tensor_gpu is not None:
+                recorded_mse = torch.nn.functional.mse_loss(recorded_pred_tensor, actual_tensor_gpu).item()
+            recorded_label = f"Recorded action: {format_action_label(recorded_action)}" if recorded_future_action is not None else "Recorded action (none)"
+            all_predictions.append({
+                "label": recorded_label,
+                "action": clone_action(recorded_action),
+                "image": recorded_img,
+                "mse": recorded_mse,
+            })
+
+            for idx, action in enumerate(session_state.get("action_space", [])):
+                if actions_equal(action, recorded_action):
+                    continue
+                pred_tensor = predict_for_action(action)
+                pred_img = tensor_to_numpy_image(pred_tensor)
+                mse_value = None
+                if actual_tensor_gpu is not None:
+                    mse_value = torch.nn.functional.mse_loss(pred_tensor, actual_tensor_gpu).item()
+                all_predictions.append({
+                    "label": f"{idx + 1}. {format_action_label(action)}",
+                    "action": clone_action(action),
+                    "image": pred_img,
+                    "mse": mse_value,
+                })
+
+        history_steps_text = ", ".join(str(obs["step"]) for obs in selected_obs)
+        action_lines = []
+        for idx, action in enumerate(action_dicts, 1):
+            action_lines.append(f"{idx}. {format_action_label(action)}")
+        if not action_lines:
+            action_lines.append("(No actions in window)")
+
+        display(Markdown(f"**History steps:** {history_steps_text}"))
+        display(Markdown("**Recorded actions:**<br>" + "<br>".join(action_lines)))
+
+        history_fig, history_axes = plt.subplots(1, len(selected_obs), figsize=(3 * len(selected_obs), 3))
+        if isinstance(history_axes, np.ndarray):
+            axes_list = history_axes.flatten()
+        else:
+            axes_list = [history_axes]
+        for idx, (obs, ax) in enumerate(zip(selected_obs, axes_list)):
+            img = np.array(load_frame_image(obs["full_path"]))
+            ax.imshow(img)
+            ax.set_title(f"Step {obs['step']}")
+            ax.axis("off")
+            if idx < len(action_dicts):
+                ax.set_xlabel(format_action_label(action_dicts[idx]), fontsize=9)
+        plt.tight_layout()
+        plt.show()
+
+        display(Markdown(f"## Predictions for step {selected_obs[-1]['step']}"))
+
+        if all_predictions:
+            cols = min(4, len(all_predictions))
+            rows = math.ceil(len(all_predictions) / cols)
+            fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows))
+            axes = np.array(axes).reshape(rows, cols)
+            for idx, prediction in enumerate(all_predictions):
+                ax = axes[idx // cols][idx % cols]
+                ax.imshow(prediction["image"])
+                title = prediction["label"]
+                if prediction["mse"] is not None:
+                    title += f"MSE: {prediction['mse']:.6f}"
+                ax.set_title(title, fontsize=9)
+                ax.axis("off")
+            for idx in range(len(all_predictions), rows * cols):
+                axes[idx // cols][idx % cols].axis("off")
+            plt.tight_layout()
+            plt.show()
+        else:
+            display(Markdown("No actions available to visualize predictions."))
+
+def on_history_slider_change(_):
+    if "frame_slider" in session_widgets and "update_history_preview" in session_widgets:
+        session_widgets["update_history_preview"](session_widgets["frame_slider"].value)
+
+session_dropdown = widgets.Dropdown(description="Session", layout=widgets.Layout(width="300px"))
+session_widgets["session_dropdown"] = session_dropdown
+
+refresh_button = widgets.Button(description="Refresh", icon="refresh")
+load_session_button = widgets.Button(description="Load Session", button_style="primary")
+
+session_area = widgets.Output()
+session_widgets["session_area"] = session_area
+
+autoencoder_path = widgets.Text(value=DEFAULT_AUTOENCODER_PATH, description="Autoencoder", layout=widgets.Layout(width="520px"))
+predictor_path = widgets.Text(value=DEFAULT_PREDICTOR_PATH, description="Predictor", layout=widgets.Layout(width="520px"))
+session_widgets["autoencoder_path"] = autoencoder_path
+session_widgets["predictor_path"] = predictor_path
+
+model_status = widgets.HTML()
+session_widgets["model_status"] = model_status
+
 run_autoencoder_button = widgets.Button(description="Run Autoencoder", button_style="success", icon="play")
-run_predictor_button = widgets.Button(description="Run Predictor", button_style="info", icon="play")
-
-# Create output widgets
-session_output = widgets.Output()
-model_output = widgets.Output()
 autoencoder_output = widgets.Output()
+session_widgets["autoencoder_output"] = autoencoder_output
+
+history_slider = widgets.IntSlider(value=3, min=2, max=8, description="History", continuous_update=False)
+session_widgets["history_slider"] = history_slider
+history_slider.observe(on_history_slider_change, names="value")
+
+run_predictor_button = widgets.Button(description="Run Predictor", button_style="info", icon="forward")
 predictor_output = widgets.Output()
+session_widgets["predictor_output"] = predictor_output
 
-# Store widgets in global dict
-session_widgets.update({
-    "load_session_dropdown": load_session_dropdown,
-    "frame_slider": frame_slider,
-    "frame_input": frame_input,
-    "history_slider": history_slider,
-    "autoencoder_path": autoencoder_path,
-    "predictor_path": predictor_path,
-    "autoencoder_save_path": autoencoder_save_path,
-    "predictor_save_path": predictor_save_path,
-    "save_output": save_output,
-    "output": session_output,
-    "model_output": model_output,
-    "autoencoder_output": autoencoder_output,
-    "predictor_output": predictor_output,
-})
-
-# Connect event handlers
-load_session_dropdown.observe(on_load_session_change, names="value")
-frame_slider.observe(on_frame_change, names="value")
-frame_input.observe(on_frame_input_change, names="value")
+refresh_button.on_click(on_refresh_sessions)
+load_session_button.on_click(on_load_session)
+load_models_button = widgets.Button(description="Load Models", button_style="primary", icon="upload")
 load_models_button.on_click(on_load_models)
 run_autoencoder_button.on_click(on_run_autoencoder)
 run_predictor_button.on_click(on_run_predictor)
-save_autoencoder_button.on_click(on_save_autoencoder)
-save_predictor_button.on_click(on_save_predictor)
-save_both_button.on_click(on_save_both)
 
-# Display interface
-display(Markdown("## Session Explorer Interface"))
+on_refresh_sessions()
 
-display(Markdown("### Session Selection"))
-display(widgets.HBox([load_session_dropdown]))
-display(widgets.HBox([frame_slider, frame_input, history_slider]))
-display(session_output)
-
-display(Markdown("### Model Loading"))
-display(widgets.VBox([autoencoder_path, predictor_path]))
-display(load_models_button)
-display(model_output)
-
-display(Markdown("### Model Saving"))
-display(widgets.VBox([autoencoder_save_path, predictor_save_path]))
-display(widgets.HBox([save_autoencoder_button, save_predictor_button, save_both_button]))
-display(save_output)
-
-display(Markdown("### Inference"))
-display(widgets.HBox([run_autoencoder_button, run_predictor_button]))
-
-display(Markdown("### Autoencoder Results"))
-display(autoencoder_output)
-
-display(Markdown("### Predictor Results"))
-display(predictor_output)
-
-display(Markdown("### Training Sections"))
-display(Markdown("#### Autoencoder Training"))
-display(widgets.HBox([training_widgets["autoencoder_threshold"], training_widgets["autoencoder_max_steps"]]))
-display(widgets.HBox([training_widgets["autoencoder_steps"]]))
-display(widgets.HBox([train_autoencoder_threshold_button, train_autoencoder_steps_button]))
-display(widgets.HBox([training_widgets["pause_autoencoder_button"], training_widgets["resume_autoencoder_button"]]))
-display(training_widgets["autoencoder_status"])
-display(training_widgets["autoencoder_loss"])
-display(training_widgets["autoencoder_training_output"])
-
-display(Markdown("#### Predictor Training"))
-display(widgets.HBox([training_widgets["predictor_threshold"], training_widgets["predictor_max_steps"]]))
-display(widgets.HBox([training_widgets["predictor_steps"]]))
-display(widgets.HBox([train_predictor_threshold_button, train_predictor_steps_button]))
-display(widgets.HBox([training_widgets["pause_predictor_button"], training_widgets["resume_predictor_button"]]))
-display(training_widgets["predictor_status"])
-display(training_widgets["predictor_loss"])
-display(training_widgets["predictor_training_output"])
-
+display(widgets.VBox([
+    widgets.HBox([session_dropdown, refresh_button, load_session_button]),
+    session_area,
+    widgets.HTML("<hr><b>Model Checkpoints</b>"),
+    autoencoder_path,
+    predictor_path,
+    load_models_button,
+    model_status,
+    widgets.HTML("<hr>"),
+    widgets.VBox([
+        widgets.HTML("<b>Autoencoder Inference</b>"),
+        widgets.HTML("Uses the currently selected frame."),
+        run_autoencoder_button,
+        autoencoder_output,
+    ]),
+    widgets.HTML("<hr>"),
+    widgets.VBox([
+        widgets.HTML("<b>Predictor Inference</b>"),
+        widgets.HTML("History uses frames leading up to the current selection to predict the next observation."),
+        history_slider,
+        run_predictor_button,
+        predictor_output,
+    ]),
+    widgets.HTML("<hr>"),
+    widgets.VBox([
+        widgets.HTML("<b>Autoencoder Training (AdaptiveWorldModel)</b>"),
+        widgets.HTML("Train the autoencoder using AdaptiveWorldModel.train_autoencoder() with randomized masking."),
+        widgets.HBox([autoencoder_threshold, autoencoder_max_steps]),
+        widgets.HBox([train_autoencoder_threshold_button, train_autoencoder_steps_button, autoencoder_steps]),
+        autoencoder_training_output,
+    ]),
+    widgets.HTML("<hr>"),
+    widgets.VBox([
+        widgets.HTML("<b>Predictor Training (AdaptiveWorldModel)</b>"),
+        widgets.HTML("Train the predictor using AdaptiveWorldModel.train_predictor() with joint autoencoder training."),
+        widgets.HBox([predictor_threshold, predictor_max_steps]),
+        widgets.HBox([train_predictor_threshold_button, train_predictor_steps_button, predictor_steps]),
+        predictor_training_output,
+    ]),
+]))
 
 
 # In[ ]:
 
 
+# In[8]:
 
+
+def on_run_predictor(_):
+    autoencoder = adaptive_world_model.autoencoder
+    predictor = adaptive_world_model.predictors[0] if adaptive_world_model.predictors else None
+    frame_slider = session_widgets.get("frame_slider")
+
+    with session_widgets["predictor_output"]:
+        session_widgets["predictor_output"].clear_output()
+
+        if autoencoder is None or predictor is None:
+            display(Markdown("Load both autoencoder and predictor checkpoints first."))
+            return
+        if frame_slider is None:
+            display(Markdown("Load a session to select frames."))
+            return
+
+        target_idx = frame_slider.value  # This is the CURRENT frame we want to predict
+        history_slider_widget = session_widgets.get("history_slider")
+        desired_history = history_slider_widget.value if history_slider_widget else 3
+
+        # Build history ending at target_idx - 1 (the past before current frame)
+        # We want to predict the CURRENT frame (target_idx) from this past
+        selected_obs, action_dicts, error = build_predictor_sequence(session_state, target_idx, desired_history)
+
+        if error:
+            display(Markdown(f"**Cannot run predictor:** {error}"))
+            return
+
+        # Remove the last observation (target_idx) from history - we'll predict it
+        if len(selected_obs) < 2:
+            display(Markdown("**Cannot run predictor:** Need at least 2 frames (one past frame and the current frame to predict)"))
+            return
+
+        past_obs = selected_obs[:-1]  # Frames up to t-1
+        current_obs = selected_obs[-1]  # Frame at t (to predict)
+
+        # Actions: action_dicts has transitions between frames
+        # The last action in action_dicts is the one that leads to current_obs
+        if len(action_dicts) < 1:
+            display(Markdown("**Cannot run predictor:** Need at least one action in history"))
+            return
+
+        past_actions = action_dicts[:-1] if len(action_dicts) > 1 else []
+        recorded_current_action = action_dicts[-1]  # The action that led to current frame
+
+        # Encode the PAST frames (not including current)
+        past_feature_history = []
+        past_images = []
+        for obs in past_obs:
+            tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
+            autoencoder.eval()
+            with torch.no_grad():
+                encoded = autoencoder.encode(tensor).detach()
+            past_feature_history.append(encoded)
+            past_images.append(tensor_to_numpy_image(tensor))
+
+        # Get the ACTUAL current frame
+        current_tensor = get_frame_tensor(session_state["session_dir"], current_obs["frame_path"]).unsqueeze(0).to(device)
+        current_img = tensor_to_numpy_image(current_tensor)
+
+        display(Markdown(f"**Predictor Inference: Predicting CURRENT Frame {target_idx+1} from Past**"))
+        display(Markdown(f"**Past context length:** {len(past_obs)} frames"))
+
+        # Show past context
+        fig, axes = plt.subplots(1, len(past_images), figsize=(3 * len(past_images), 3))
+        if len(past_images) == 1:
+            axes = [axes]
+        for i, img in enumerate(past_images):
+            axes[i].imshow(img)
+            axes[i].set_title(f"Past Frame {past_obs[i]['observation_index']+1}")
+            axes[i].axis("off")
+        plt.tight_layout()
+        plt.show()
+
+        # =========================================================================
+        # PART 1: Prediction of CURRENT frame using recorded action
+        # =========================================================================
+        display(Markdown("## Prediction of CURRENT Frame (uses only past)"))
+
+        predictor.eval()
+
+        # Prepare inputs for predicting current frame
+        actions_for_current = past_actions + [clone_action(recorded_current_action)]
+
+        # Normalize the action that leads to current
+        current_action_norm = normalize_action_dicts([recorded_current_action]).to(device)
+
+        # Last features = last past frame (t-1)
+        last_past_features = past_feature_history[-1] if past_feature_history else None
+
+        with torch.no_grad():
+            # Predict CURRENT frame (t) from past (t-1) + recorded action
+            predicted_current_features, attn_info = predictor(
+                past_feature_history,
+                actions_for_current,
+                return_attn=True,
+                action_normalized=current_action_norm,
+                last_features=last_past_features
+            )
+            predicted_current_tensor = decode_features_to_image(autoencoder, predicted_current_features)
+
+        predicted_current_img = tensor_to_numpy_image(predicted_current_tensor)
+
+        # Compute MSE between predicted and actual current
+        with torch.no_grad():
+            current_mse = torch.nn.functional.mse_loss(predicted_current_tensor, current_tensor).item()
+
+        # Display side-by-side
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        axes[0].imshow(current_img)
+        axes[0].set_title(f"Actual Current (Frame {target_idx+1})")
+        axes[0].axis("off")
+        axes[1].imshow(predicted_current_img)
+        axes[1].set_title(f"Predicted Current from Past\nMSE: {current_mse:.6f}")
+        axes[1].axis("off")
+        plt.tight_layout()
+        plt.show()
+
+        # =========================================================================
+        # PART 2: Action sweep - counterfactual predictions of CURRENT frame
+        # =========================================================================
+        display(Markdown("## Action Sweep (Counterfactual Predictions of CURRENT Frame)"))
+        display(Markdown("*Each prediction shows what the current frame would look like under a different action.*"))
+
+        action_space = get_action_space(session_state)
+
+        if not action_space:
+            display(Markdown("No action space available for sweep."))
+        else:
+            counterfactual_predictions = []
+
+            for action in action_space:
+                actions_variant = past_actions + [clone_action(action)]
+                variant_action_norm = normalize_action_dicts([action]).to(device)
+
+                # Check if this is the recorded action (reuse previous prediction)
+                if actions_equal(action, recorded_current_action):
+                    cf_tensor = predicted_current_tensor
+                    cf_img = predicted_current_img
+                    cf_mse = current_mse
+                else:
+                    with torch.no_grad():
+                        cf_features = predictor(
+                            past_feature_history,
+                            actions_variant,
+                            action_normalized=variant_action_norm,
+                            last_features=last_past_features
+                        )
+                        cf_tensor = decode_features_to_image(autoencoder, cf_features)
+                    cf_img = tensor_to_numpy_image(cf_tensor)
+                    with torch.no_grad():
+                        cf_mse = torch.nn.functional.mse_loss(cf_tensor, current_tensor).item()
+
+                counterfactual_predictions.append({
+                    "action": action,
+                    "image": cf_img,
+                    "label": format_action_label(action),
+                    "mse": cf_mse,
+                    "is_recorded": actions_equal(action, recorded_current_action)
+                })
+
+            # Grid of all counterfactual predictions
+            display(Markdown("### All Candidate Actions (Counterfactual Sweep)"))
+            cols = min(4, len(counterfactual_predictions))
+            rows = math.ceil(len(counterfactual_predictions) / cols)
+            fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows))
+            axes = np.array(axes).reshape(rows, cols) if rows > 1 or cols > 1 else np.array([[axes]])
+
+            for idx, pred in enumerate(counterfactual_predictions):
+                ax = axes[idx // cols][idx % cols]
+                ax.imshow(pred["image"])
+                title = pred["label"]
+                if pred["is_recorded"]:
+                    title += " (recorded)"
+                title += f"\nMSE: {pred['mse']:.6f}"
+                ax.set_title(title, fontsize=9)
+                ax.axis("off")
+
+            # Hide unused subplots
+            for idx in range(len(counterfactual_predictions), rows * cols):
+                axes[idx // cols][idx % cols].axis("off")
+
+            plt.tight_layout()
+            plt.show()
+
+        # =========================================================================
+        # Attention Diagnostics
+        # =========================================================================
+        attention_data = compute_attention_visual_data(attn_info)
+        if attention_data:
+            metrics = attention_data["metrics"]
+            display(Markdown("## Attention Diagnostics"))
+            metric_lines = [
+                f"- **APA (Attention to Previous Action)**: {metrics['APA']:.4f}",
+                f"- **ALF (Attention to Last Frame)**: {metrics['ALF']:.4f}",
+                f"- **TTAR (Token-Type Attention Ratio)**: {metrics['TTAR']:.4f}",
+                f"- **RI@16 (Recency Index)**: {metrics['RI@16']:.4f}",
+                f"- **Entropy**: {metrics['Entropy']:.4f}",
+                f"- **Uniform Baseline**: {metrics['UniformBaseline']:.4f}",
+            ]
+            display(Markdown("\n".join(metric_lines)))
+            plot_attention_heatmap(attention_data["heatmap"], attention_data["token_types"])
+            plot_attention_breakdown(attention_data["breakdown"])
+
+        # =========================================================================
+        # Counterfactual testing (shuffle/zero actions)
+        # =========================================================================
+        display(Markdown("## Counterfactual Testing"))
+
+        baseline_loss = adaptive_world_model.eval_predictor_loss(
+            predictor,
+            past_feature_history,
+            actions_for_current,
+            current_tensor,
+        )
+        shuffle_loss = adaptive_world_model.eval_predictor_loss(
+            predictor,
+            past_feature_history,
+            actions_for_current,
+            current_tensor,
+            override_actions="shuffle",
+        )
+        zero_loss = adaptive_world_model.eval_predictor_loss(
+            predictor,
+            past_feature_history,
+            actions_for_current,
+            current_tensor,
+            override_actions="zero",
+        )
+
+        asg = shuffle_loss - baseline_loss
+        azg = zero_loss - baseline_loss
+        display(Markdown(f"**Counterfactual gaps:** ASG (shuffle) = {asg:.6f}, AZG (zero) = {azg:.6f}"))
+
+
+# In[9]:
+
+
+# Interactive controls and callbacks
+session_state = {
+    "session_name": None,
+    "session_dir": None,
+    "metadata": {},
+    "events": [],
+    "observations": [],
+    "actions": [],
+    "autoencoder": None,
+    "predictor": None,
+    "feature_cache": {},
+    "action_space": [],
+}
+
+session_widgets = {}
+
+def reset_feature_cache():
+    session_state["feature_cache"] = {}
+
+def on_refresh_sessions(_=None):
+    options = list_session_dirs(SESSIONS_BASE_DIR)
+    current = session_widgets["session_dropdown"].value if "session_dropdown" in session_widgets else None
+    session_widgets["session_dropdown"].options = options
+    if not options:
+        session_widgets["session_dropdown"].value = None
+    elif current in options:
+        session_widgets["session_dropdown"].value = current
+    else:
+        session_widgets["session_dropdown"].value = options[-1]
+
+def on_load_session(_):
+    dropdown = session_widgets["session_dropdown"]
+    session_name = dropdown.value
+    if not session_name:
+        return
+    session_dir = os.path.join(SESSIONS_BASE_DIR, session_name)
+    metadata = load_session_metadata(session_dir)
+    events = load_session_events(session_dir)
+    observations = extract_observations(events, session_dir)
+    actions = extract_actions(events)
+
+    session_state.update({
+        "session_name": session_name,
+        "session_dir": session_dir,
+        "metadata": metadata,
+        "events": events,
+        "observations": observations,
+        "actions": actions,
+    })
+    session_state["action_space"] = get_action_space(session_state)
+    reset_feature_cache()
+    tensor_cache.clear()
+    load_frame_bytes.cache_clear()
+
+    with session_widgets["session_area"]:
+        session_widgets["session_area"].clear_output()
+        if not observations:
+            display(Markdown(f"**{session_name}** has no observation frames."))
+            return
+        details = [
+            f"**Session:** {session_name}",
+            f"**Total events:** {len(events)}",
+            f"**Observations:** {len(observations)}",
+            f"**Actions:** {len(actions)}",
+        ]
+        if metadata:
+            start_time = metadata.get("start_time")
+            if start_time:
+                details.append(f"**Start:** {start_time}")
+            robot_type = metadata.get("robot_type")
+            if robot_type:
+                details.append(f"**Robot:** {robot_type}")
+        display(Markdown("<br>".join(details)))
+
+        frame_slider = widgets.IntSlider(value=0, min=0, max=len(observations) - 1, description="Frame", continuous_update=False)
+        play_widget = widgets.Play(interval=100, value=0, min=0, max=len(observations) - 1, step=1, description="Play")
+        widgets.jslink((play_widget, "value"), (frame_slider, "value"))
+
+        frame_image = widgets.Image(format="jpg")
+        frame_image.layout.width = "448px"
+        frame_info = widgets.HTML()
+        history_preview = widgets.Output()
+
+        session_widgets["frame_slider"] = frame_slider
+        session_widgets["play_widget"] = play_widget
+        session_widgets["frame_image"] = frame_image
+        session_widgets["frame_info"] = frame_info
+        session_widgets["history_preview"] = history_preview
+
+        def update_history_preview(idx):
+            if "history_preview" not in session_widgets:
+                return
+            history_slider_widget = session_widgets.get("history_slider")
+            requested = history_slider_widget.value if history_slider_widget else 3
+            requested = max(1, requested)
+            requested = min(requested, idx + 1)
+            start = max(0, idx - requested + 1)
+            obs_slice = observations[start: idx + 1]
+            events_local = session_state.get("events", [])
+            display_items = []
+            for offset, obs in enumerate(obs_slice):
+                frame_bytes = load_frame_bytes(obs["full_path"])
+                border_color = "#4caf50" if (start + offset) == idx else "#cccccc"
+                image = widgets.Image(value=frame_bytes, format="jpg", layout=widgets.Layout(width="160px", height="120px", border=f"2px solid {border_color}"))
+                label_text = f"Step {obs['step']}"
+                if (start + offset) == idx:
+                    label_text += " (current)"
+                label = widgets.HTML(value=f"<div style='text-align:center; font-size:10px'>{label_text}</div>")
+                display_items.append(widgets.VBox([image, label]))
+                if offset < len(obs_slice) - 1:
+                    next_obs = obs_slice[offset + 1]
+                    actions_between = [events_local[i] for i in range(obs["event_index"] + 1, next_obs["event_index"]) if events_local[i].get("type") == "action"]
+                    if actions_between:
+                        action_text = "; ".join(format_action_label(act.get("data", {})) for act in actions_between)
+                    else:
+                        action_text = "No action"
+                    action_label = widgets.HTML(value=f"<div style='font-size:10px; padding:0 6px;'>Action: {action_text}</div>", layout=widgets.Layout(height="120px", display="flex", align_items="center", justify_content="center"))
+                    display_items.append(action_label)
+            session_widgets["history_preview"].clear_output()
+            with session_widgets["history_preview"]:
+                if display_items:
+                    layout = widgets.Layout(display="flex", flex_flow="row", align_items="center")
+                    display(widgets.HBox(display_items, layout=layout))
+                else:
+                    display(Markdown("History preview unavailable for this frame."))
+
+        session_widgets["update_history_preview"] = update_history_preview
+
+        def update_frame(change):
+            idx_local = change["new"] if isinstance(change, dict) else change
+            observation = observations[idx_local]
+            frame_image.value = load_frame_bytes(observation["full_path"])
+            frame_info.value = f"<b>Observation {idx_local + 1} / {len(observations)}</b><br>Step: {observation['step']}<br>Timestamp: {format_timestamp(observation['timestamp'])}"
+            update_history_preview(idx_local)
+
+        frame_slider.observe(update_frame, names="value")
+        update_frame({"new": frame_slider.value})
+
+        display(widgets.VBox([
+            widgets.HBox([play_widget, frame_slider]),
+            frame_image,
+            frame_info,
+            widgets.HTML("<b>History preview</b>"),
+            history_preview,
+        ]))
+
+    session_widgets["model_status"].value = ""
+    session_widgets["autoencoder_output"].clear_output()
+    session_widgets["predictor_output"].clear_output()
+
+def on_load_models(_):
+    messages = []
+    auto_path = session_widgets["autoencoder_path"].value.strip()
+    predictor_path = session_widgets["predictor_path"].value.strip()
+
+    if auto_path:
+        if os.path.exists(auto_path):
+            try:
+                session_state["autoencoder"] = load_autoencoder_model(auto_path, device)
+                reset_feature_cache()
+                messages.append(f"Autoencoder loaded from `{auto_path}`.")
+            except Exception as exc:
+                session_state["autoencoder"] = None
+                messages.append(f"<span style='color:red'>Failed to load autoencoder: {exc}</span>")
+        else:
+            session_state["autoencoder"] = None
+            messages.append(f"<span style='color:red'>Autoencoder path not found: {auto_path}</span>")
+    else:
+        session_state["autoencoder"] = None
+        messages.append("Autoencoder path is empty; skipping load.")
+
+    if predictor_path:
+        if os.path.exists(predictor_path):
+            try:
+                session_state["predictor"] = load_predictor_model(predictor_path, device)
+                messages.append(f"Predictor loaded from `{predictor_path}`.")
+            except Exception as exc:
+                session_state["predictor"] = None
+                messages.append(f"<span style='color:red'>Failed to load predictor: {exc}</span>")
+        else:
+            session_state["predictor"] = None
+            messages.append(f"<span style='color:red'>Predictor path not found: {predictor_path}</span>")
+    else:
+        session_state["predictor"] = None
+        messages.append("Predictor path is empty; skipping load.")
+
+    session_widgets["model_status"].value = "<br>".join(messages)
+
+def on_run_autoencoder(_):
+    autoencoder = session_state.get("autoencoder")
+    if autoencoder is None:
+        with session_widgets["autoencoder_output"]:
+            session_widgets["autoencoder_output"].clear_output()
+            display(Markdown("Load the autoencoder checkpoint first."))
+        return
+    frame_slider = session_widgets.get("frame_slider")
+    if frame_slider is None:
+        with session_widgets["autoencoder_output"]:
+            session_widgets["autoencoder_output"].clear_output()
+            display(Markdown("Load a session to select frames."))
+        return
+
+    idx = frame_slider.value
+    observation = session_state.get("observations", [])[idx]
+    frame_tensor = get_frame_tensor(session_state["session_dir"], observation["frame_path"]).unsqueeze(0).to(device)
+
+    autoencoder.eval()
+    with torch.no_grad():
+        reconstructed = autoencoder.reconstruct(frame_tensor)
+    mse = torch.nn.functional.mse_loss(reconstructed, frame_tensor).item()
+
+    original_img = tensor_to_numpy_image(frame_tensor)
+    reconstructed_img = tensor_to_numpy_image(reconstructed)
+
+    with session_widgets["autoencoder_output"]:
+        session_widgets["autoencoder_output"].clear_output()
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+        axes[0].imshow(original_img)
+        axes[0].set_title("Input")
+        axes[0].axis("off")
+        axes[1].imshow(reconstructed_img)
+        axes[1].set_title(f"Reconstruction MSE: {mse:.6f}")
+        axes[1].axis("off")
+        plt.tight_layout()
+        plt.show()
+
+def on_run_predictor(_):
+    autoencoder = session_state.get("autoencoder")
+    predictor = session_state.get("predictor")
+    frame_slider = session_widgets.get("frame_slider")
+
+    with session_widgets["predictor_output"]:
+        session_widgets["predictor_output"].clear_output()
+        if autoencoder is None or predictor is None:
+            display(Markdown("Load both autoencoder and predictor checkpoints first."))
+            return
+        if frame_slider is None:
+            display(Markdown("Load a session to select frames."))
+            return
+
+        target_idx = frame_slider.value
+        history_slider_widget = session_widgets.get("history_slider")
+        desired_history = history_slider_widget.value if history_slider_widget else 3
+
+        selected_obs, action_dicts, error = build_predictor_sequence(session_state, target_idx, desired_history)
+        if error:
+            display(Markdown(f"**Cannot run predictor:** {error}"))
+            return
+
+        actual_history = len(selected_obs)
+        if history_slider_widget and actual_history != history_slider_widget.value:
+            history_slider_widget.value = actual_history
+
+        feature_history = []
+        for obs in selected_obs:
+            cached = session_state["feature_cache"].get(obs["frame_path"])
+            if cached is None:
+                tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
+                autoencoder.eval()
+                with torch.no_grad():
+                    encoded = autoencoder.encode(tensor)
+                session_state["feature_cache"][obs["frame_path"]] = encoded.detach().cpu()
+                cached = session_state["feature_cache"][obs["frame_path"]]
+            feature_history.append(cached)
+
+        feature_history_gpu = [feat.to(device) for feat in feature_history]
+
+        recorded_future_action, action_source = get_future_action_for_prediction(session_state, target_idx)
+        recorded_action = clone_action(recorded_future_action) if recorded_future_action is not None else {}
+
+        predictor.eval()
+        autoencoder.eval()
+
+        if recorded_future_action is None:
+            display(Markdown("No recorded action between current and next frame; using an empty action for comparison."))
+        elif action_source == "previous":
+            display(Markdown("Using the most recent action prior to the current frame for comparison."))
+        predictor.eval()
+        autoencoder.eval()
+
+        if recorded_future_action is None:
+            display(Markdown("No recorded action between current and next frame; using an empty action for comparison."))
+
+        def predict_for_action(action_dict):
+            history_actions = [clone_action(act) for act in action_dicts]
+            if action_dict is not None:
+                history_actions.append(clone_action(action_dict))
+            else:
+                history_actions.append({})
+            
+            # Normalize action for FiLM conditioning
+            if history_actions:
+                action_normalized = normalize_action_dicts([history_actions[-1]]).to(device)
+            else:
+                action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=device)
+            
+            # Get last features for delta prediction
+            last_features = feature_history_gpu[-1] if feature_history_gpu else None
+            
+            pred_features = predictor(
+                feature_history_gpu,
+                history_actions,
+                action_normalized=action_normalized,
+                last_features=last_features
+            )
+            decoded_candidate = decode_features_to_image(autoencoder, pred_features)
+            return decoded_candidate
+
+        next_obs = session_state["observations"][target_idx + 1] if target_idx + 1 < len(session_state["observations"]) else None
+        actual_tensor_cpu = None
+        actual_tensor_gpu = None
+        actual_img = None
+        if next_obs is not None:
+            actual_tensor_cpu = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0)
+            actual_tensor_gpu = actual_tensor_cpu.to(device)
+            actual_img = tensor_to_numpy_image(actual_tensor_cpu)
+
+        all_predictions = []
+        with torch.no_grad():
+            recorded_pred_tensor = predict_for_action(recorded_action if recorded_future_action is not None else None)
+            recorded_img = tensor_to_numpy_image(recorded_pred_tensor)
+            recorded_mse = None
+            if actual_tensor_gpu is not None:
+                recorded_mse = torch.nn.functional.mse_loss(recorded_pred_tensor, actual_tensor_gpu).item()
+            recorded_label = f"Recorded action: {format_action_label(recorded_action)}" if recorded_future_action is not None else "Recorded action (none)"
+            all_predictions.append({
+                "label": recorded_label,
+                "action": clone_action(recorded_action),
+                "image": recorded_img,
+                "mse": recorded_mse,
+            })
+
+            for idx, action in enumerate(session_state.get("action_space", [])):
+                if actions_equal(action, recorded_action):
+                    continue
+                pred_tensor = predict_for_action(action)
+                pred_img = tensor_to_numpy_image(pred_tensor)
+                mse_value = None
+                if actual_tensor_gpu is not None:
+                    mse_value = torch.nn.functional.mse_loss(pred_tensor, actual_tensor_gpu).item()
+                all_predictions.append({
+                    "label": f"{idx + 1}. {format_action_label(action)}",
+                    "action": clone_action(action),
+                    "image": pred_img,
+                    "mse": mse_value,
+                })
+
+        history_steps_text = ", ".join(str(obs["step"]) for obs in selected_obs)
+        action_lines = []
+        for idx, action in enumerate(action_dicts, 1):
+            action_lines.append(f"{idx}. {format_action_label(action)}")
+        if not action_lines:
+            action_lines.append("(No actions in window)")
+
+        display(Markdown(f"**History steps:** {history_steps_text}"))
+        display(Markdown("**Recorded actions:**<br>" + "<br>".join(action_lines)))
+
+        history_fig, history_axes = plt.subplots(1, len(selected_obs), figsize=(3 * len(selected_obs), 3))
+        if isinstance(history_axes, np.ndarray):
+            axes_list = history_axes.flatten()
+        else:
+            axes_list = [history_axes]
+        for idx, (obs, ax) in enumerate(zip(selected_obs, axes_list)):
+            img = np.array(load_frame_image(obs["full_path"]))
+            ax.imshow(img)
+            ax.set_title(f"Step {obs['step']}")
+            ax.axis("off")
+            if idx < len(action_dicts):
+                ax.set_xlabel(format_action_label(action_dicts[idx]), fontsize=9)
+        plt.tight_layout()
+        plt.show()
+
+        display(Markdown(f"## Predictions for step {selected_obs[-1]['step']}"))
+
+        if all_predictions:
+            cols = min(4, len(all_predictions))
+            rows = math.ceil(len(all_predictions) / cols)
+            fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows))
+            axes = np.array(axes).reshape(rows, cols)
+            for idx, prediction in enumerate(all_predictions):
+                ax = axes[idx // cols][idx % cols]
+                ax.imshow(prediction["image"])
+                title = prediction["label"]
+                if prediction["mse"] is not None:
+                    title += f"MSE: {prediction['mse']:.6f}"
+                ax.set_title(title, fontsize=9)
+                ax.axis("off")
+            for idx in range(len(all_predictions), rows * cols):
+                axes[idx // cols][idx % cols].axis("off")
+            plt.tight_layout()
+            plt.show()
+        else:
+            display(Markdown("No actions available to visualize predictions."))
+
+def on_history_slider_change(_):
+    if "frame_slider" in session_widgets and "update_history_preview" in session_widgets:
+        session_widgets["update_history_preview"](session_widgets["frame_slider"].value)
+
+session_dropdown = widgets.Dropdown(description="Session", layout=widgets.Layout(width="300px"))
+session_widgets["session_dropdown"] = session_dropdown
+
+refresh_button = widgets.Button(description="Refresh", icon="refresh")
+load_session_button = widgets.Button(description="Load Session", button_style="primary")
+
+session_area = widgets.Output()
+session_widgets["session_area"] = session_area
+
+autoencoder_path = widgets.Text(value=DEFAULT_AUTOENCODER_PATH, description="Autoencoder", layout=widgets.Layout(width="520px"))
+predictor_path = widgets.Text(value=DEFAULT_PREDICTOR_PATH, description="Predictor", layout=widgets.Layout(width="520px"))
+session_widgets["autoencoder_path"] = autoencoder_path
+session_widgets["predictor_path"] = predictor_path
+
+model_status = widgets.HTML()
+session_widgets["model_status"] = model_status
+
+run_autoencoder_button = widgets.Button(description="Run Autoencoder", button_style="success", icon="play")
+autoencoder_output = widgets.Output()
+session_widgets["autoencoder_output"] = autoencoder_output
+
+history_slider = widgets.IntSlider(value=3, min=2, max=8, description="History", continuous_update=False)
+session_widgets["history_slider"] = history_slider
+history_slider.observe(on_history_slider_change, names="value")
+
+run_predictor_button = widgets.Button(description="Run Predictor", button_style="info", icon="forward")
+predictor_output = widgets.Output()
+session_widgets["predictor_output"] = predictor_output
+
+refresh_button.on_click(on_refresh_sessions)
+load_session_button.on_click(on_load_session)
+load_models_button = widgets.Button(description="Load Models", button_style="primary", icon="upload")
+load_models_button.on_click(on_load_models)
+run_autoencoder_button.on_click(on_run_autoencoder)
+run_predictor_button.on_click(on_run_predictor)
+
+on_refresh_sessions()
+
+display(widgets.VBox([
+    widgets.HBox([session_dropdown, refresh_button, load_session_button]),
+    session_area,
+    widgets.HTML("<hr><b>Model Checkpoints</b>"),
+    autoencoder_path,
+    predictor_path,
+    load_models_button,
+    model_status,
+    widgets.HTML("<hr>"),
+    widgets.VBox([
+        widgets.HTML("<b>Autoencoder Inference</b>"),
+        widgets.HTML("Uses the currently selected frame."),
+        run_autoencoder_button,
+        autoencoder_output,
+    ]),
+    widgets.HTML("<hr>"),
+    widgets.VBox([
+        widgets.HTML("<b>Predictor Inference</b>"),
+        widgets.HTML("History uses frames leading up to the current selection to predict the next observation."),
+        history_slider,
+        run_predictor_button,
+        predictor_output,
+    ]),
+    widgets.HTML("<hr>"),
+    widgets.VBox([
+        widgets.HTML("<b>Autoencoder Training (AdaptiveWorldModel)</b>"),
+        widgets.HTML("Train the autoencoder using AdaptiveWorldModel.train_autoencoder() with randomized masking."),
+        widgets.HBox([autoencoder_threshold, autoencoder_max_steps]),
+        widgets.HBox([train_autoencoder_threshold_button, train_autoencoder_steps_button, autoencoder_steps]),
+        autoencoder_training_output,
+    ]),
+    widgets.HTML("<hr>"),
+    widgets.VBox([
+        widgets.HTML("<b>Predictor Training (AdaptiveWorldModel)</b>"),
+        widgets.HTML("Train the predictor using AdaptiveWorldModel.train_predictor() with joint autoencoder training."),
+        widgets.HBox([predictor_threshold, predictor_max_steps]),
+        widgets.HBox([train_predictor_threshold_button, train_predictor_steps_button, predictor_steps]),
+        predictor_training_output,
+    ]),
+]))
 
 
 # In[ ]:

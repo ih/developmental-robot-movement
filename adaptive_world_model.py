@@ -12,6 +12,49 @@ import signal
 import copy
 from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
 from config import AdaptiveWorldModelConfig
+import config
+
+
+def normalize_action_dicts(action_dicts):
+    """
+    Convert action dictionaries to normalized tensor in [-1, 1].
+
+    Each action channel (motor_left, motor_right, duration) is independently
+    scaled from its natural range (defined in config.ACTION_RANGES) to [-1, 1].
+
+    Args:
+        action_dicts: list[dict] with keys matching config.ACTION_CHANNELS
+                     e.g., [{'motor_left': 0, 'motor_right': 0.12, 'duration': 0.2}]
+
+    Returns:
+        torch.Tensor: (batch_size, num_channels) tensor with values in [-1, 1]
+    """
+    batch_size = len(action_dicts)
+    num_action_channels = len(config.ACTION_CHANNELS)
+    normalized_actions = torch.zeros(batch_size, num_action_channels, dtype=torch.float32)
+
+    for batch_idx, action_dict in enumerate(action_dicts):
+        for channel_idx, channel_name in enumerate(config.ACTION_CHANNELS):
+            # Extract raw value from action dict (default to 0 if missing)
+            raw_value = float(action_dict.get(channel_name, 0.0))
+
+            # Get the natural range for this channel
+            min_val, max_val = config.ACTION_RANGES[channel_name]
+
+            # Clip value to valid range
+            clipped_value = max(min(raw_value, max_val), min_val)
+
+            # Scale from [min_val, max_val] to [-1, 1]
+            if max_val == min_val:
+                # Handle degenerate case (constant channel)
+                scaled_value = 0.0
+            else:
+                # Linear scaling: [min, max] -> [-1, 1]
+                scaled_value = 2.0 * (clipped_value - min_val) / (max_val - min_val) - 1.0
+
+            normalized_actions[batch_idx, channel_idx] = scaled_value
+
+    return normalized_actions
 
 class AdaptiveWorldModel:
     def __init__(self, robot_interface, interactive=False, wandb_project=None, checkpoint_dir="checkpoints", autoencoder_lr=None, predictor_lr=None, action_selector=None):
@@ -117,19 +160,39 @@ class AdaptiveWorldModel:
             return AdaptiveWorldModelConfig.PREDICTOR_LR
     
     def _compute_grad_action_ratio(self, predictor):
-        """Compute ratio of gradient magnitude flowing through action-related parameters."""
-        total_grad = 0.0
-        action_grad = 0.0
+        """
+        Compute ratio of gradient L2 norm flowing through action-related parameters.
+
+        Returns ||∂loss/∂(action_params)|| / ||∂loss/∂(all_params)||
+
+        Action-related parameters include:
+        - action_embed (ActionEmbedding MLP)
+        - film_layers (FiLM gamma/beta generators)
+        """
+        total_grad_sq = 0.0
+        action_grad_sq = 0.0
+
         for name, param in predictor.named_parameters():
             if param.grad is None:
                 continue
-            grad_mean = param.grad.detach().abs().mean().item()
-            total_grad += grad_mean
-            if 'action' in name.lower():
-                action_grad += grad_mean
-        if total_grad <= 0.0:
+
+            # Sum of squared gradients for this parameter
+            param_grad_sq_sum = (param.grad ** 2).sum().item()
+            total_grad_sq += param_grad_sq_sum
+
+            # Check if this is an action-related parameter
+            # Matches: action_embed.*, film_layers.*
+            if 'action_embed' in name or 'film_layers' in name:
+                action_grad_sq += param_grad_sq_sum
+
+        if total_grad_sq <= 0.0:
             return 0.0
-        return action_grad / (total_grad + 1e-8)
+
+        # Compute L2 norms and return ratio
+        total_grad_norm = torch.sqrt(torch.tensor(total_grad_sq)).item()
+        action_grad_norm = torch.sqrt(torch.tensor(action_grad_sq)).item()
+
+        return action_grad_norm / (total_grad_norm + 1e-12)
 
     def _compute_attention_metrics(self, attn_info):
         """Aggregate attention metrics from predictor attention payload."""
@@ -219,8 +282,24 @@ class AdaptiveWorldModel:
         """Evaluate predictor loss with optional action overrides without affecting training state."""
         features = [feat.to(self.device) for feat in (history_features or [])]
         actions = self._prepare_actions(history_actions, override=override_actions)
+
+        # Normalize actions for FiLM conditioning
+        if actions:
+            last_action = actions[-1]
+            action_normalized = normalize_action_dicts([last_action]).to(self.device)
+        else:
+            action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=self.device)
+
+        # Get last features for delta prediction
+        last_features = features[-1] if features else None
+
         with torch.no_grad():
-            pred_features = predictor.forward(features, actions)
+            pred_features = predictor.forward(
+                features,
+                actions,
+                action_normalized=action_normalized,
+                last_features=last_features
+            )
             total_loss, *_ = self._compute_prediction_losses_eval(
                 pred_features,
                 current_frame_tensor,
@@ -265,7 +344,17 @@ class AdaptiveWorldModel:
             for variant in variants:
                 actions_variant = [copy.deepcopy(a) for a in history_actions]
                 actions_variant[-1] = variant
-                pred_variant = predictor.forward(features, actions_variant)
+
+                # Normalize action for FiLM conditioning
+                action_normalized = normalize_action_dicts([variant]).to(self.device)
+                last_features = features[-1] if features else None
+
+                pred_variant = predictor.forward(
+                    features,
+                    actions_variant,
+                    action_normalized=action_normalized,
+                    last_features=last_features
+                )
                 _, _, _, pred_patches, _, target_patches, target_latent = self._compute_prediction_losses_eval(
                     pred_variant,
                     current_frame_tensor,
@@ -287,10 +376,26 @@ class AdaptiveWorldModel:
         features = [feat.detach().to(self.device) for feat in history_features]
         actions = [copy.deepcopy(action) for action in history_actions]
 
+        # Normalize actions for FiLM conditioning
+        if actions:
+            last_action = actions[-1]
+            action_normalized = normalize_action_dicts([last_action]).to(self.device)
+        else:
+            action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=self.device)
+
+        # Get last features for delta prediction
+        last_features = features[-1] if features else None
+
         with torch.no_grad():
             was_training = predictor.training
             predictor.eval()
-            pred_features, attn_info = predictor.forward(features, actions, return_attn=True)
+            pred_features, attn_info = predictor.forward(
+                features,
+                actions,
+                return_attn=True,
+                action_normalized=action_normalized,
+                last_features=last_features
+            )
             total_loss, loss_patch, loss_latent, pred_patches, ids_restore, target_patches, target_latent = self._compute_prediction_losses_eval(
                 pred_features,
                 current_frame_tensor,
@@ -560,46 +665,52 @@ class AdaptiveWorldModel:
                 # Get prediction context for fresh predictions
                 history_features, history_actions = self.get_prediction_context()
 
-                predictor_training_iterations = 0
-                while True:  # Keep training until all fresh prediction errors are below threshold
-                    predictor_training_iterations += 1
-                    # Make fresh predictions with current context
-                    fresh_predictions = []
-                    for predictor in self.predictors:
-                        with torch.no_grad():
-                            prediction = predictor.forward(history_features, history_actions)
-                            fresh_predictions.append(prediction)
+                # Make fresh predictions with current context
+                # Normalize actions for FiLM conditioning
+                if history_actions:
+                    last_action = history_actions[-1]
+                    action_normalized = normalize_action_dicts([last_action]).to(self.device)
+                else:
+                    action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=self.device)
 
-                    # Evaluate fresh predictions using same loss as training
-                    prediction_errors = self.evaluate_fresh_predictions(fresh_predictions, frame_tensor)
+                # Get last features for delta prediction
+                last_features = history_features[-1] if history_features else None
 
-                    # Log prediction errors to wandb (periodically)
-                    if self.wandb_enabled and self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
-                        log_dict = {}
+                fresh_predictions = []
+                for predictor in self.predictors:
+                    with torch.no_grad():
+                        prediction = predictor.forward(
+                            history_features,
+                            history_actions,
+                            action_normalized=action_normalized,
+                            last_features=last_features
+                        )
+                        fresh_predictions.append(prediction)
 
-                        # Log individual predictor errors with grouping
-                        for level, error in enumerate(prediction_errors):
-                            log_dict[f"prediction_errors/level_{level}"] = error
+                # Evaluate fresh predictions using same loss as training
+                prediction_errors = self.evaluate_fresh_predictions(fresh_predictions, frame_tensor)
 
-                        wandb.log(log_dict)
+                # Log prediction errors to wandb (periodically)
+                if self.wandb_enabled and self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+                    log_dict = {}
 
-                    prediction_threshold = AdaptiveWorldModelConfig.PREDICTION_THRESHOLD
-                    if all(error < prediction_threshold for error in prediction_errors):
-                        # All fresh predictions accurate - ready to proceed
-                        if self.wandb_enabled:
-                            wandb.log({"predictor_training_iterations": predictor_training_iterations})
-                        break
-                    else:
-                        # Train predictors that had errors using the same predictions we evaluated
-                        for level, error in enumerate(prediction_errors):
-                            if error > prediction_threshold:
-                                self.train_predictor(
-                                    level,
-                                    frame_tensor,
-                                    fresh_predictions[level],
-                                    history_features,
-                                    history_actions
-                                )
+                    # Log individual predictor errors with grouping
+                    for level, error in enumerate(prediction_errors):
+                        log_dict[f"prediction_errors/level_{level}"] = error
+
+                    wandb.log(log_dict)
+
+                # Train once on predictors that have errors above threshold
+                prediction_threshold = AdaptiveWorldModelConfig.PREDICTION_THRESHOLD
+                for level, error in enumerate(prediction_errors):
+                    if error > prediction_threshold:
+                        self.train_predictor(
+                            level,
+                            frame_tensor,
+                            fresh_predictions[level],
+                            history_features,
+                            history_actions
+                        )
 
                 # Adjust lookahead based on accuracy horizon
                 self.lookahead = self.find_accurate_prediction_horizon()
@@ -874,14 +985,22 @@ class AdaptiveWorldModel:
         
         with torch.no_grad():  # No gradients needed for action scoring and frame previews
             for action in self.get_available_actions():
+                # Normalize action for FiLM conditioning
+                action_normalized = normalize_action_dicts([action]).to(self.device)
+
+                # Get last features for delta prediction
+                last_features = history_features[-1] if history_features else None
+
                 # Predict next states for this action
                 predictions = []
                 prediction_frames = []
-                
+
                 for predictor in self.predictors:
                     next_state = predictor.forward(
-                        history_features, 
-                        history_actions + [action]
+                        history_features,
+                        history_actions + [action],
+                        action_normalized=action_normalized,
+                        last_features=last_features
                     )
                     predictions.append(next_state)
                     
@@ -1061,7 +1180,25 @@ class AdaptiveWorldModel:
         history_features_for_forward = [feat.detach().to(self.device) for feat in (history_features_for_forward or [])]
         history_actions_for_forward = list(history_actions_for_forward or [])
 
-        predicted_features = predictor.forward(history_features_for_forward, history_actions_for_forward)
+        # Normalize actions for FiLM conditioning
+        # Use the last action in history (the one that led to current frame)
+        if history_actions_for_forward:
+            last_action = history_actions_for_forward[-1]
+            action_normalized = normalize_action_dicts([last_action]).to(self.device)
+        else:
+            # If no actions in history, use zero action
+            action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=self.device)
+
+        # Get last features for delta prediction
+        last_features = history_features_for_forward[-1] if history_features_for_forward else None
+
+        # Forward pass with FiLM conditioning and delta latent support
+        predicted_features = predictor.forward(
+            history_features_for_forward,
+            history_actions_for_forward,
+            action_normalized=action_normalized,
+            last_features=last_features
+        )
 
         # Initialize target patches from actual frame (same as evaluation)
         target_patches = self.patchify(current_frame_tensor)
@@ -1275,15 +1412,23 @@ class AdaptiveWorldModel:
         
         history_features, history_actions = self.get_prediction_context()
         history_actions.append(action)
-        
+
+        # Normalize action for FiLM conditioning
+        action_normalized = normalize_action_dicts([action]).to(self.device)
+
+        # Get last features for delta prediction
+        last_features = history_features[-1] if history_features else None
+
         # Store the predicted frame for the first predictor (level 0) for visualization
         self.last_predicted_frame = None
         self.last_action = action
-        
+
         for level, predictor in enumerate(self.predictors):
             prediction = predictor.forward(
                 history_features,
-                history_actions
+                history_actions,
+                action_normalized=action_normalized,
+                last_features=last_features
             ).detach()
             
             # Generate predicted frame for visualization (store the first predictor's prediction)
