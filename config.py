@@ -1,4 +1,4 @@
-import torchvision.transforms as transforms
+﻿import torchvision.transforms as transforms
 
 # Image transformation pipeline
 TRANSFORM = transforms.Compose([
@@ -23,8 +23,8 @@ class AdaptiveWorldModelConfig:
     MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking
 
     # Prediction loss weights
-    PRED_PATCH_W = 1.0  # Weight for patch-space reconstruction loss
-    PRED_LATENT_W = 0.1  # Weight for latent-space prediction loss
+    PRED_PATCH_W = .2  # Weight for patch-space reconstruction loss
+    PRED_LATENT_W = 0.8  # Weight for latent-space prediction loss
 
     # Logging and checkpointing
     LOG_INTERVAL = 20  # Log every N steps
@@ -43,7 +43,7 @@ class AdaptiveWorldModelConfig:
 # Root auxiliary directory for checkpoints and recordings
 AUX_DIR = "saved"
 # Recording and Replay Parameters
-RECORDING_MODE = True  # Set to False for online mode without recording
+RECORDING_MODE = False  # Set to False for online mode without recording
 REPLAY_SESSION_DIR = f"{AUX_DIR}/sessions/session_20250921_142133"
 RECORDING_BASE_DIR = f"{AUX_DIR}/sessions"  # Base directory for new recordings
 
@@ -56,7 +56,7 @@ RECORDING_SESSION_NAME = None  # Auto-generate if None (timestamp-based)
 DEFAULT_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints"
 
 # Interactive mode setting
-INTERACTIVE_MODE = False  # Set to True to enable interactive action selection
+INTERACTIVE_MODE = True  # Set to True to enable interactive action selection
 
 # Action Normalization and FiLM Configuration
 ACTION_CHANNELS = ["motor_left", "motor_right", "duration"]
