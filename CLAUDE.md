@@ -38,6 +38,7 @@ This repository contains research code for developmental robot movement with a m
 
 ### Session Explorer Notebook
 - **session_explorer.ipynb**: Interactive Jupyter notebook for exploring recorded sessions and training models. Browse recorded sessions with frame-by-frame playback, run autoencoder/predictor checkpoints against stored frames, and train models on specific frames or sequences using authentic AdaptiveWorldModel methods.
+- **Action distribution analysis**: Automatic table showing action usage statistics when loading sessions, comparing current session vs all sessions with counts and percentages for each action in the action space
 - **Comprehensive weight visualization**: Real-time visualization of both autoencoder and predictor network weights during inference and training, including weight distribution histograms, layer norms, and detailed change tracking for transformer components (action embeddings, position embeddings, self-attention, MLP layers)
 - **Model saving capabilities**: Save trained autoencoder and predictor models with configurable paths, compatible with AdaptiveWorldModel checkpoint format
 - **Interactive training controls**: Pause and resume buttons for both autoencoder and predictor training with responsive UI updates and proper state management
@@ -52,7 +53,7 @@ This repository contains research code for developmental robot movement with a m
 - **Action normalization**: All action channels mapped to [-1, 1] range before embedding for consistent FiLM conditioning
 - **ActionEmbedding module**: Learned MLP embedding of normalized actions for semantic action representation
 - **Delta latent prediction**: Predictors learn residual/delta features rather than absolute features, improving training stability
-- **Action reconstruction loss**: Predictors must classify which discrete action was taken from predicted features, strengthening action awareness
+- **Action reconstruction loss**: Predictors must classify which discrete action was taken from pixel-level differences between predicted and previous frames, learning action-aware visual representations through convolutional classification of image changes
 - **Fresh prediction training**: Predictors trained using fresh predictions with consistent loss calculation (single training pass per error threshold)
 - **Triple loss training**: Combined patch-space reconstruction + latent-space prediction + action classification losses for encoder optimization
 - **Prediction-friendly representations**: Encoder learns features that are both visually meaningful and easy to predict
@@ -87,7 +88,8 @@ This repository contains research code for developmental robot movement with a m
 - **Action normalization config**: `ACTION_CHANNELS`, `ACTION_RANGES` define action space and normalization ranges for FiLM conditioning
 - **FiLM parameters**: `ACTION_EMBED_DIM` (64), `FILM_HIDDEN_DIM` (128), `FILM_BLOCK_IDS` ([0, 2]) control action conditioning architecture
 - **Delta latent flag**: `DELTA_LATENT` (True) enables residual prediction mode for improved training stability
-- **Prediction loss weights**: `PRED_PATCH_W` (0.2), `PRED_LATENT_W` (0.8), `PRED_ACTION_W` (0.5) balance visual quality, latent prediction, and action classification
+- **Prediction loss weights**: `PRED_PATCH_W` (0.2), `PRED_LATENT_W` (0.8), `PRED_ACTION_W` (1.0) balance visual quality, latent prediction, and action classification
+- **Prediction history size**: `PREDICTION_HISTORY_SIZE` (3) controls number of recent frames used for context in predictions
 - **Recording configuration**: `RECORDING_MODE` boolean controls recording vs online mode, `RECORDING_MAX_DISK_GB` limits total disk usage
 - **IP addresses**: JetBot connection IPs specified in integration example (modify as needed)
 
@@ -161,7 +163,7 @@ Required Python packages:
 - `models/`: Neural network architectures directory
   - `models/__init__.py`: Module exports for clean imports
   - `models/autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
-  - `models/predictor.py`: TransformerActionConditionedPredictor with FiLM conditioning, delta latent prediction, and attention introspection
+  - `models/predictor.py`: TransformerActionConditionedPredictor with FiLM conditioning, delta latent prediction, image-based action classification, and attention introspection
   - `models/encoder_layer_with_attn.py`: Custom transformer encoder layer that optionally returns attention maps
 - `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
@@ -235,7 +237,7 @@ To add support for a new robot:
 - **Action timing**: Configurable delay between actions via `ACTION_DELAY` parameter for controlled execution timing
 - **Easy tuning**: Modify parameters in one location instead of scattered throughout the code
 - **Default values**: Reasonable defaults for all parameters (LOG_INTERVAL=100, ACTION_DELAY=0, etc.)
-- **Recent changes**: Added FiLM conditioning, delta latent prediction, and action reconstruction loss for improved action integration
+- **Recent changes**: Image-based action classification from pixel differences, increased action loss weight (PRED_ACTION_W=1.0), reduced prediction history (PREDICTION_HISTORY_SIZE=3) for stronger action-aware learning
 
 ### Logging and Monitoring
 - **Throttled logging frequency**: All metrics logged periodically (LOG_INTERVAL=100 steps) to reduce computational overhead

@@ -175,6 +175,7 @@ class TransformerActionConditionedPredictor(nn.Module):
         dropout=0.1,
         level=0,
         num_actions=2,  # Number of discrete actions in the action space
+        autoencoder=None,  # Reference to autoencoder for decoding features to images
     ):
         super().__init__()
 
@@ -184,6 +185,7 @@ class TransformerActionConditionedPredictor(nn.Module):
         self.level = level
         self.max_lookahead = 10  # For compatibility with old interface
         self.num_actions = num_actions
+        self.autoencoder = autoencoder
 
         # New FiLM-based action conditioning
         # ActionEmbedding: converts normalized actions to learned embeddings
@@ -230,11 +232,16 @@ class TransformerActionConditionedPredictor(nn.Module):
         # Output head to predict next encoder features (or delta features)
         self.output_head = nn.Linear(embed_dim, embed_dim)
 
-        # Action reconstruction head - recovers which action was taken from predicted features
+        # Action reconstruction head - recovers which action was taken from reconstructed image diff
+        # Input: (batch_size, 3, 224, 224) - diff between predicted and last reconstructed images
         self.action_classifier = nn.Sequential(
-            nn.Linear(embed_dim, 128),
+            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),  # Downsample
             nn.ReLU(),
-            nn.Linear(128, num_actions)
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),  # Global pool to (B, 32, 1, 1)
+            nn.Flatten(),
+            nn.Linear(32, num_actions)
         )
 
         # Layer norm
@@ -376,15 +383,28 @@ class TransformerActionConditionedPredictor(nn.Module):
             # predicted_features is delta, add to last_features to get absolute prediction
             predicted_features = last_features + predicted_features
 
-        # Compute action classification logits from future query tokens
+        # Compute action classification logits from image diff
         action_logits = None
         if return_action_logits:
-            # Get the future query predictions (last N tokens)
-            num_future_tokens = num_patches_plus_one
-            future_predictions = predicted_features[:, -num_future_tokens:, :]
+            if self.autoencoder is None or last_features is None:
+                raise ValueError("autoencoder and last_features must be provided when return_action_logits=True")
 
-            # Pool across future predictions
-            action_logits = self.action_classifier(future_predictions.mean(dim=1))
+            # Decode predicted features to image
+            B, seq_len, _ = predicted_features.shape
+            L = seq_len - 1  # Remove CLS token count
+            ids_restore = torch.arange(L, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
+            pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
+            decoded_pred = self.autoencoder.unpatchify(pred_patches)
+
+            # Decode last features to image
+            last_patches = self.autoencoder.forward_decoder(last_features, ids_restore)
+            decoded_last = self.autoencoder.unpatchify(last_patches)
+
+            # Compute pixel diff
+            pixel_diff = decoded_pred - decoded_last  # (B, 3, H, W)
+
+            # Classify action from diff
+            action_logits = self.action_classifier(pixel_diff)
 
         if not return_attn and not return_action_logits:
             return predicted_features

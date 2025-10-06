@@ -11,7 +11,7 @@ class AdaptiveWorldModelConfig:
     # Core parameters
     LOOKAHEAD = 1
     MAX_LOOKAHEAD_MARGIN = 5
-    PREDICTION_HISTORY_SIZE = 10
+    PREDICTION_HISTORY_SIZE = 3
     UNCERTAINTY_THRESHOLD = 0.7
     RECONSTRUCTION_THRESHOLD = 0.001
     PREDICTION_THRESHOLD = 0.001  # Threshold for prediction errors (slightly higher than reconstruction)
@@ -25,7 +25,7 @@ class AdaptiveWorldModelConfig:
     # Prediction loss weights
     PRED_PATCH_W = .2  # Weight for patch-space reconstruction loss
     PRED_LATENT_W = 0.8  # Weight for latent-space prediction loss
-    PRED_ACTION_W = 0.5  # Weight for action reconstruction loss (classifying which action was taken)
+    PRED_ACTION_W = 1  # Weight for action reconstruction loss (classifying which action was taken)
 
     # Logging and checkpointing
     LOG_INTERVAL = 20  # Log every N steps

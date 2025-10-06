@@ -109,7 +109,7 @@ class AdaptiveWorldModel:
 
         # Core components
         self.autoencoder = MaskedAutoencoderViT().to(self.device)
-        self.predictors = [TransformerActionConditionedPredictor(num_actions=len(self.base_actions)).to(self.device)]  # Start with one predictor
+        self.predictors = [TransformerActionConditionedPredictor(num_actions=len(self.base_actions), autoencoder=self.autoencoder).to(self.device)]  # Start with one predictor
         self.action_encoders = []  # For future hierarchical actions
         self.action_decoders = []
 
