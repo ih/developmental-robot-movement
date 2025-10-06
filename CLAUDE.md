@@ -52,10 +52,11 @@ This repository contains research code for developmental robot movement with a m
 - **Action normalization**: All action channels mapped to [-1, 1] range before embedding for consistent FiLM conditioning
 - **ActionEmbedding module**: Learned MLP embedding of normalized actions for semantic action representation
 - **Delta latent prediction**: Predictors learn residual/delta features rather than absolute features, improving training stability
+- **Action reconstruction loss**: Predictors must classify which discrete action was taken from predicted features, strengthening action awareness
 - **Fresh prediction training**: Predictors trained using fresh predictions with consistent loss calculation (single training pass per error threshold)
-- **Dual loss training**: Combined patch-space reconstruction + latent-space prediction losses for encoder optimization
+- **Triple loss training**: Combined patch-space reconstruction + latent-space prediction + action classification losses for encoder optimization
 - **Prediction-friendly representations**: Encoder learns features that are both visually meaningful and easy to predict
-- **Joint training architecture**: Autoencoder reconstruction loss + dual predictor losses with shared encoder gradients
+- **Joint training architecture**: Autoencoder reconstruction loss + triple predictor losses (patch, latent, action) with shared encoder gradients
 - **Sequence length management**: Handles long histories (4096 token capacity with clipping for GPU safety)
 - **Quality gating**: Robot stops acting when reconstruction loss > threshold, focuses on vision training
 - **Real-time visualization**: Training progress display showing current vs reconstructed frames
@@ -86,6 +87,7 @@ This repository contains research code for developmental robot movement with a m
 - **Action normalization config**: `ACTION_CHANNELS`, `ACTION_RANGES` define action space and normalization ranges for FiLM conditioning
 - **FiLM parameters**: `ACTION_EMBED_DIM` (64), `FILM_HIDDEN_DIM` (128), `FILM_BLOCK_IDS` ([0, 2]) control action conditioning architecture
 - **Delta latent flag**: `DELTA_LATENT` (True) enables residual prediction mode for improved training stability
+- **Prediction loss weights**: `PRED_PATCH_W` (0.2), `PRED_LATENT_W` (0.8), `PRED_ACTION_W` (0.5) balance visual quality, latent prediction, and action classification
 - **Recording configuration**: `RECORDING_MODE` boolean controls recording vs online mode, `RECORDING_MAX_DISK_GB` limits total disk usage
 - **IP addresses**: JetBot connection IPs specified in integration example (modify as needed)
 
@@ -193,7 +195,7 @@ To add support for a new robot:
 ### Experiment Tracking
 - **Weights & Biases integration**: Pass `wandb_project` parameter to `AdaptiveWorldModel` constructor to enable logging
 - **Core metrics**: `reconstruction_loss`, `autoencoder_training_loss`, `predictor_training_loss`, `step`, `training_step`
-- **Dual loss components**: `predictor_patch_loss` (visual quality anchor), `predictor_latent_loss` (prediction-friendly encoder training)
+- **Triple loss components**: `predictor_patch_loss` (visual quality anchor), `predictor_latent_loss` (prediction-friendly encoder training), `predictor_action_loss` (action classification from predicted features)
 - **Predictor quality**: `predictor_explained_variance` (R² in patch space - scale-invariant metric showing predictor improvement over baseline)
 - **Training metrics**: `predictor_grad_norm`, `predictor_lr`, `predictor_uwr_95th`, `mask_ratio`
 - **Action timing statistics**: `action_timing/mean_interval`, `action_timing/median_interval`, `action_timing/min_interval`, `action_timing/max_interval`, `action_timing/std_interval`
@@ -233,7 +235,7 @@ To add support for a new robot:
 - **Action timing**: Configurable delay between actions via `ACTION_DELAY` parameter for controlled execution timing
 - **Easy tuning**: Modify parameters in one location instead of scattered throughout the code
 - **Default values**: Reasonable defaults for all parameters (LOG_INTERVAL=100, ACTION_DELAY=0, etc.)
-- **Recent changes**: Added FiLM conditioning and delta latent prediction for improved action integration
+- **Recent changes**: Added FiLM conditioning, delta latent prediction, and action reconstruction loss for improved action integration
 
 ### Logging and Monitoring
 - **Throttled logging frequency**: All metrics logged periodically (LOG_INTERVAL=100 steps) to reduce computational overhead

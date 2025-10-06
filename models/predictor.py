@@ -9,6 +9,49 @@ from models.encoder_layer_with_attn import EncoderLayerWithAttn
 import config
 
 
+def action_dict_to_index(action_dict, action_space):
+    """
+    Convert an action dictionary to its index in the action space.
+
+    Maps a continuous action dictionary to the closest discrete action index.
+    This is used for action reconstruction loss, where the predictor must
+    identify which discrete action was taken from the predicted features.
+
+    Args:
+        action_dict: Dictionary with action parameters (motor_left, motor_right, duration)
+                    Example: {'motor_left': 0, 'motor_right': 0.12, 'duration': 0.2}
+        action_space: List of action dictionaries defining the discrete action space
+                     Example: [{'motor_left': 0, 'motor_right': 0, 'duration': 0.2},
+                               {'motor_right': 0, 'motor_right': 0.12, 'duration': 0.2}]
+
+    Returns:
+        int: Index of the action in action_space
+             For the examples above, action_dict would return index 1
+             Returns -1 if action not found in action space
+
+    Example:
+        >>> action_space = [
+        ...     {'motor_left': 0, 'motor_right': 0, 'duration': 0.2},      # index 0: stop
+        ...     {'motor_left': 0, 'motor_right': 0.12, 'duration': 0.2}   # index 1: forward
+        ... ]
+        >>> action = {'motor_left': 0, 'motor_right': 0.12, 'duration': 0.2}
+        >>> action_dict_to_index(action, action_space)
+        1
+    """
+    for idx, space_action in enumerate(action_space):
+        # Check if all relevant keys match (with tolerance for floating point comparison)
+        match = True
+        for key in config.ACTION_CHANNELS:
+            action_val = action_dict.get(key, 0.0)
+            space_val = space_action.get(key, 0.0)
+            if abs(action_val - space_val) > 1e-6:
+                match = False
+                break
+        if match:
+            return idx
+    return -1  # Action not found in action space
+
+
 class ActionEmbedding(nn.Module):
     """
     Learns a compact embedding of normalized action vectors.
@@ -131,6 +174,7 @@ class TransformerActionConditionedPredictor(nn.Module):
         max_sequence_length=4096,
         dropout=0.1,
         level=0,
+        num_actions=2,  # Number of discrete actions in the action space
     ):
         super().__init__()
 
@@ -139,6 +183,7 @@ class TransformerActionConditionedPredictor(nn.Module):
         self.max_sequence_length = max_sequence_length
         self.level = level
         self.max_lookahead = 10  # For compatibility with old interface
+        self.num_actions = num_actions
 
         # New FiLM-based action conditioning
         # ActionEmbedding: converts normalized actions to learned embeddings
@@ -185,6 +230,13 @@ class TransformerActionConditionedPredictor(nn.Module):
         # Output head to predict next encoder features (or delta features)
         self.output_head = nn.Linear(embed_dim, embed_dim)
 
+        # Action reconstruction head - recovers which action was taken from predicted features
+        self.action_classifier = nn.Sequential(
+            nn.Linear(embed_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_actions)
+        )
+
         # Layer norm
         self.layer_norm = nn.LayerNorm(embed_dim)
 
@@ -210,7 +262,7 @@ class TransformerActionConditionedPredictor(nn.Module):
         mask = mask.masked_fill(mask == 1, float('-inf'))
         return mask
 
-    def forward(self, encoder_features_history, actions, return_attn=False, action_normalized=None, last_features=None):
+    def forward(self, encoder_features_history, actions, return_attn=False, action_normalized=None, last_features=None, return_action_logits=False):
         """
         Forward pass with interleaved encoder features and actions.
 
@@ -221,9 +273,11 @@ class TransformerActionConditionedPredictor(nn.Module):
             action_normalized: (batch_size, num_action_channels) tensor in [-1, 1]
                              If provided, uses FiLM conditioning instead of legacy action embedding
             last_features: (batch_size, num_patches+1, D) features from current frame for delta prediction
+            return_action_logits: whether to return action classification logits
 
         Returns:
             predicted_features: [B, num_patches+1, D] (absolute or delta, depending on config.DELTA_LATENT)
+            action_logits (optional): [B, num_actions] when return_action_logits=True
             attn_info (optional): dict with attention maps and token metadata when return_attn=True
         """
         # Handle empty history case by returning random features
@@ -322,8 +376,21 @@ class TransformerActionConditionedPredictor(nn.Module):
             # predicted_features is delta, add to last_features to get absolute prediction
             predicted_features = last_features + predicted_features
 
-        if not return_attn:
+        # Compute action classification logits from future query tokens
+        action_logits = None
+        if return_action_logits:
+            # Get the future query predictions (last N tokens)
+            num_future_tokens = num_patches_plus_one
+            future_predictions = predicted_features[:, -num_future_tokens:, :]
+
+            # Pool across future predictions
+            action_logits = self.action_classifier(future_predictions.mean(dim=1))
+
+        if not return_attn and not return_action_logits:
             return predicted_features
+
+        if return_action_logits and not return_attn:
+            return predicted_features, action_logits
 
         # Derive token indices for downstream analysis
         token_types_t = token_type_tensor
@@ -355,6 +422,8 @@ class TransformerActionConditionedPredictor(nn.Module):
             'last_frame_idx': last_frame_idx,
         }
 
+        if return_action_logits:
+            return predicted_features, action_logits, attn_info
         return predicted_features, attn_info
 
     def predict_uncertainty(self, encoder_features_history, actions, num_samples=10):

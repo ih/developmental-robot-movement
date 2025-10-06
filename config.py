@@ -25,6 +25,7 @@ class AdaptiveWorldModelConfig:
     # Prediction loss weights
     PRED_PATCH_W = .2  # Weight for patch-space reconstruction loss
     PRED_LATENT_W = 0.8  # Weight for latent-space prediction loss
+    PRED_ACTION_W = 0.5  # Weight for action reconstruction loss (classifying which action was taken)
 
     # Logging and checkpointing
     LOG_INTERVAL = 20  # Log every N steps

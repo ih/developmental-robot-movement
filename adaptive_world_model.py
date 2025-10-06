@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import torch
+import torch.nn.functional as F
 import wandb
 import os
 import pickle
@@ -11,6 +12,7 @@ import random
 import signal
 import copy
 from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
+from models.predictor import action_dict_to_index
 from config import AdaptiveWorldModelConfig
 import config
 
@@ -93,6 +95,7 @@ class AdaptiveWorldModel:
                 "mask_ratio_max": AdaptiveWorldModelConfig.MASK_RATIO_MAX,
                 "pred_patch_w": AdaptiveWorldModelConfig.PRED_PATCH_W,
                 "pred_latent_w": AdaptiveWorldModelConfig.PRED_LATENT_W,
+                "pred_action_w": AdaptiveWorldModelConfig.PRED_ACTION_W,
                 "max_history_size": AdaptiveWorldModelConfig.MAX_HISTORY_SIZE,
                 "checkpoint_history_limit": AdaptiveWorldModelConfig.CHECKPOINT_HISTORY_LIMIT,
             })
@@ -100,25 +103,26 @@ class AdaptiveWorldModel:
         else:
             self.wandb_enabled = False
         
+        # The action space is retrieved from the robot interface first
+        # (needed for predictor initialization)
+        self.base_actions = self.robot.action_space
+
         # Core components
         self.autoencoder = MaskedAutoencoderViT().to(self.device)
-        self.predictors = [TransformerActionConditionedPredictor().to(self.device)]  # Start with one predictor
+        self.predictors = [TransformerActionConditionedPredictor(num_actions=len(self.base_actions)).to(self.device)]  # Start with one predictor
         self.action_encoders = []  # For future hierarchical actions
         self.action_decoders = []
-        
+
         # Parameters from config
         self.lookahead = AdaptiveWorldModelConfig.LOOKAHEAD
         self.max_lookahead_margin = AdaptiveWorldModelConfig.MAX_LOOKAHEAD_MARGIN
         self.prediction_history_size = AdaptiveWorldModelConfig.PREDICTION_HISTORY_SIZE
         self.uncertainty_threshold = AdaptiveWorldModelConfig.UNCERTAINTY_THRESHOLD
         self.interactive = interactive
-        
+
         # Matplotlib figure for persistent display
         self.fig = None
         self.axes = None
-        
-        # The action space is now retrieved from the robot interface
-        self.base_actions = self.robot.action_space
         
         # History buffers
         self.frame_features_history = []
@@ -1192,12 +1196,13 @@ class AdaptiveWorldModel:
         # Get last features for delta prediction
         last_features = history_features_for_forward[-1] if history_features_for_forward else None
 
-        # Forward pass with FiLM conditioning and delta latent support
-        predicted_features = predictor.forward(
+        # Forward pass with FiLM conditioning, delta latent support, and action reconstruction
+        predicted_features, action_logits = predictor.forward(
             history_features_for_forward,
             history_actions_for_forward,
             action_normalized=action_normalized,
-            last_features=last_features
+            last_features=last_features,
+            return_action_logits=True
         )
 
         # Initialize target patches from actual frame (same as evaluation)
@@ -1225,10 +1230,25 @@ class AdaptiveWorldModel:
             target_latent[:, 1:, :]        # Exclude CLS token
         )
 
+        # Calculate action reconstruction loss
+        # The predictor must correctly classify which action led to the current frame
+        if history_actions_for_forward:
+            action_index = action_dict_to_index(last_action, self.base_actions)
+            if action_index >= 0:
+                action_target = torch.tensor([action_index], dtype=torch.long, device=self.device)
+                loss_action = F.cross_entropy(action_logits, action_target)
+            else:
+                # Action not in action space, skip action loss
+                loss_action = torch.tensor(0.0, device=self.device)
+        else:
+            # No actions in history, skip action loss
+            loss_action = torch.tensor(0.0, device=self.device)
+
         # Combine losses with weights
         w_patch = AdaptiveWorldModelConfig.PRED_PATCH_W
         w_latent = AdaptiveWorldModelConfig.PRED_LATENT_W
-        prediction_loss = w_patch * loss_patch + w_latent * loss_latent
+        w_action = AdaptiveWorldModelConfig.PRED_ACTION_W
+        prediction_loss = w_patch * loss_patch + w_latent * loss_latent + w_action * loss_action
 
         # Backward pass - this will train both predictor and autoencoder!
         prediction_loss.backward()
@@ -1257,6 +1277,7 @@ class AdaptiveWorldModel:
                     "predictor_training_loss": prediction_loss.item(),
                     "predictor_patch_loss": loss_patch.item(),
                     "predictor_latent_loss": loss_latent.item(),
+                    "predictor_action_loss": loss_action.item(),
                     "predictor_explained_variance": detailed_metrics['explained_variance'].item(),
                     "predictor_training_step": self.predictor_training_step,
                     "predictor_grad_norm": grad_norm,
