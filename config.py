@@ -44,8 +44,14 @@ class AdaptiveWorldModelConfig:
 # Root auxiliary directory for checkpoints and recordings
 AUX_DIR = "saved"
 # Recording and Replay Parameters
-RECORDING_MODE = False  # Set to False for online mode without recording
+RECORDING_MODE = True  # Set to False for online mode without recording
 REPLAY_SESSION_DIR = f"{AUX_DIR}/sessions/session_20250921_142133"
+
+# Robot-specific recording directories
+JETBOT_RECORDING_DIR = f"{AUX_DIR}/sessions/jetbot"
+TOROIDAL_DOT_RECORDING_DIR = f"{AUX_DIR}/sessions/toroidal_dot"
+
+# Legacy - kept for backward compatibility
 RECORDING_BASE_DIR = f"{AUX_DIR}/sessions"  # Base directory for new recordings
 
 # Recording Configuration
@@ -56,10 +62,29 @@ RECORDING_SESSION_NAME = None  # Auto-generate if None (timestamp-based)
 # Default checkpoint directory
 DEFAULT_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints"
 
+# Robot-specific checkpoint directories (separate due to different action spaces)
+JETBOT_CHECKPOINT_DIR = f"{DEFAULT_CHECKPOINT_DIR}/jetbot"
+TOROIDAL_DOT_CHECKPOINT_DIR = f"{DEFAULT_CHECKPOINT_DIR}/toroidal_dot"
+
 # Interactive mode setting
-INTERACTIVE_MODE = True  # Set to True to enable interactive action selection
+INTERACTIVE_MODE = False  # Set to True to enable interactive action selection
+
+# Toroidal Dot Environment Configuration
+class ToroidalDotConfig:
+    # Environment parameters
+    IMG_SIZE = 224              # Size of square image
+    DOT_RADIUS = 5              # Radius of white dot in pixels
+    DOT_MOVE_PIXELS = 27         # Horizontal movement per action=1
+    DOT_ACTION_DELAY = 0.0      # Delay between actions in seconds
+
+    # Action space for toroidal dot (use these when running with ToroidalDotRobot)
+    ACTION_CHANNELS_DOT = ["action"]
+    ACTION_RANGES_DOT = {
+        "action": (0, 1)        # Binary action: 0=stay, 1=move right
+    }
 
 # Action Normalization and FiLM Configuration
+# NOTE: Switch to ToroidalDotConfig.ACTION_CHANNELS_DOT and ACTION_RANGES_DOT when using ToroidalDotRobot
 ACTION_CHANNELS = ["motor_left", "motor_right", "duration"]
 ACTION_RANGES = {  # min, max for scaling to [-1, 1]
     "motor_left":  (0.0,  0.0),    # left motor fixed at 0

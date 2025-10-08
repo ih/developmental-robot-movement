@@ -8,8 +8,9 @@ This repository contains research code for developmental robot movement with a m
 
 1. **RobotInterface** (`robot_interface.py`) - Abstract base class defining robot interaction contract
 2. **JetBot Implementation** (`jetbot_interface.py`, `jetbot_remote_client.py`) - Concrete JetBot robot interface
-3. **Adaptive World Model** (`adaptive_world_model.py`) - Hierarchical world model with uncertainty-based action selection
-4. **Integration Example** (`jetbot_world_model_example.py`) - Shows how to connect world model with JetBot
+3. **Toroidal Dot Environment** (`toroidal_dot_env.py`, `toroidal_dot_interface.py`) - Simulated environment with white dot on black background for testing and debugging
+4. **Adaptive World Model** (`adaptive_world_model.py`) - Hierarchical world model with uncertainty-based action selection
+5. **Integration Examples** (`jetbot_world_model_example.py`, `toroidal_dot_world_model_example.py`) - Shows how to connect world model with different robots/environments
 
 ## Architecture
 
@@ -21,8 +22,17 @@ This repository contains research code for developmental robot movement with a m
 ### JetBot Implementation
 - **RemoteJetBot class**: Handles RPyC connections, camera capture, and motor control
 - **JetBotInterface**: Wrapper implementing RobotInterface for JetBot robots
-- **Live video feed**: Real-time display using OpenCV windows  
+- **Live video feed**: Real-time display using OpenCV windows
 - **Connection**: Connects to JetBot at configurable IP on port 18861
+
+### Toroidal Dot Environment
+- **ToroidalDotEnvironment**: Simple 224x224 simulated environment with a white dot on black background
+- **Toroidal wrapping**: Horizontal movement wraps around at image edges (x-axis is toroidal)
+- **Binary action space**: Action 0 (stay), Action 1 (move right by configurable pixels)
+- **Random initialization**: Each session starts with dot at random (x, y) position
+- **ToroidalDotRobot class**: Implements RobotInterface for simulated environment
+- **Fast iteration**: No hardware needed, perfect for debugging and testing world model
+- **Configurable parameters**: Dot radius, movement speed, image size via ToroidalDotConfig
 
 ### Adaptive World Model
 - **Dependency injection**: Takes RobotInterface in constructor for modularity
@@ -38,6 +48,8 @@ This repository contains research code for developmental robot movement with a m
 
 ### Session Explorer Notebook
 - **session_explorer.ipynb**: Interactive Jupyter notebook for exploring recorded sessions and training models. Browse recorded sessions with frame-by-frame playback, run autoencoder/predictor checkpoints against stored frames, and train models on specific frames or sequences using authentic AdaptiveWorldModel methods.
+- **Multi-robot support**: Automatically detects robot type from session metadata and loads appropriate checkpoints (JetBot or toroidal dot)
+- **Robot-agnostic exploration**: Works seamlessly with sessions from any robot type, dynamically adapting action space and model paths
 - **Action distribution analysis**: Automatic table showing action usage statistics when loading sessions, comparing current session vs all sessions with counts and percentages for each action in the action space
 - **Comprehensive weight visualization**: Real-time visualization of both autoencoder and predictor network weights during inference and training, including weight distribution histograms, layer norms, and detailed change tracking for transformer components (action embeddings, position embeddings, self-attention, MLP layers)
 - **Model saving capabilities**: Save trained autoencoder and predictor models with configurable paths, compatible with AdaptiveWorldModel checkpoint format
@@ -85,7 +97,13 @@ This repository contains research code for developmental robot movement with a m
 ### Configuration
 - **config.py**: Contains image transforms, constants, and adaptive world model parameters
 - **AdaptiveWorldModelConfig class**: Centralized configuration for all model parameters including thresholds, learning rates, and training intervals
+- **Robot-specific directories**:
+  - `JETBOT_CHECKPOINT_DIR = saved/checkpoints/jetbot/` - JetBot model checkpoints
+  - `TOROIDAL_DOT_CHECKPOINT_DIR = saved/checkpoints/toroidal_dot/` - Toroidal dot model checkpoints
+  - `JETBOT_RECORDING_DIR = saved/sessions/jetbot/` - JetBot session recordings
+  - `TOROIDAL_DOT_RECORDING_DIR = saved/sessions/toroidal_dot/` - Toroidal dot session recordings
 - **Action normalization config**: `ACTION_CHANNELS`, `ACTION_RANGES` define action space and normalization ranges for FiLM conditioning
+- **ToroidalDotConfig class**: Configuration for simulated environment (IMG_SIZE, DOT_RADIUS, DOT_MOVE_PIXELS, ACTION_CHANNELS_DOT, ACTION_RANGES_DOT)
 - **FiLM parameters**: `ACTION_EMBED_DIM` (64), `FILM_HIDDEN_DIM` (128), `FILM_BLOCK_IDS` ([0, 2]) control action conditioning architecture
 - **Delta latent flag**: `DELTA_LATENT` (True) enables residual prediction mode for improved training stability
 - **Prediction loss weights**: `PRED_PATCH_W` (0.2), `PRED_LATENT_W` (0.8), `PRED_ACTION_W` (1.0) balance visual quality, latent prediction, and action classification
@@ -124,19 +142,35 @@ python adaptive_world_model.py
 - All ML components are stubs - only tests main loop logic
 - No physical robot required
 
+### Toroidal Dot Environment
+```bash
+python toroidal_dot_world_model_example.py
+```
+- Integrates AdaptiveWorldModel with simulated toroidal dot environment
+- Perfect for debugging and fast iteration without hardware
+- Uses separate checkpoint directory (`saved/checkpoints/toroidal_dot/`)
+- Records to separate session directory (`saved/sessions/toroidal_dot/`)
+- Binary action space: 0 (stay), 1 (move right)
+- Configurable via `ToroidalDotConfig` in `config.py`
+- **Interactive notebook**: `test_toroidal_dot_actions.ipynb` for testing and visualization
+
 ### Recording and Replay System
 ```bash
-# Record a session (set RECORDING_MODE = True in config.py)
+# Record a JetBot session (set RECORDING_MODE = True in config.py)
 python jetbot_world_model_example.py
+
+# Record a toroidal dot session (set RECORDING_MODE = True in config.py)
+python toroidal_dot_world_model_example.py
 
 # Replay all recorded sessions
 python replay_session_example.py
 ```
 - **Recording mode**: Captures robot observations and actions with automatic disk space management
+- **Robot-specific directories**: JetBot and toroidal dot sessions stored separately for organization
 - **Replay mode**: Replays all recorded sessions using the exact same main loop, enabling GPU utilization for predictor training
 - **Robot-agnostic replay**: Can replay any robot's recorded sessions regardless of robot type
-- **Checkpoint sharing**: All modes (online, record, replay) share the same checkpoint directory for continuous learning
-- **Disk space management**: Automatic cleanup of oldest sessions when total recordings exceed configurable disk limit (default 10 GB)
+- **Isolated checkpoints**: Each robot type maintains separate model checkpoints due to different action space dimensionality
+- **Disk space management**: Automatic cleanup of oldest sessions when total recordings exceed configurable disk limit (default 10 GB per robot type)
 
 ## Dependencies
 
@@ -160,6 +194,8 @@ Required Python packages:
 - `robot_interface.py`: Abstract base class defining robot interaction contract
 - `jetbot_interface.py`: JetBot implementation of RobotInterface with duration-based actions
 - `jetbot_remote_client.py`: Low-level JetBot RPyC client with live feed capability
+- `toroidal_dot_env.py`: Simulated 224x224 toroidal environment with white dot
+- `toroidal_dot_interface.py`: ToroidalDotRobot implementation of RobotInterface
 - `models/`: Neural network architectures directory
   - `models/__init__.py`: Module exports for clean imports
   - `models/autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
@@ -167,15 +203,17 @@ Required Python packages:
   - `models/encoder_layer_with_attn.py`: Custom transformer encoder layer that optionally returns attention maps
 - `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
+- `toroidal_dot_world_model_example.py`: Integration example connecting toroidal dot environment with world model
 - `recording_writer.py`: Recording system with automatic disk space management
 - `recording_reader.py`: Reads recorded sessions with smart observation/action sequencing
 - `replay_robot.py`: Robot interface replacement for replaying recorded sessions
 - `recorded_policy.py`: Action selector factory for recorded action playback
 - `replay_session_example.py`: Robot-agnostic replay script for recorded sessions
-- `session_explorer.ipynb`: Interactive Jupyter notebook for session exploration with attention introspection and action space analysis
+- `session_explorer.ipynb`: Interactive Jupyter notebook for multi-robot session exploration with automatic robot type detection
 - `session_explorer.py`: Python script version of session explorer notebook with identical functionality
 - `test_jetbot_actions.ipynb`: Jupyter notebook for interactive JetBot action space testing
-- `config.py`: Shared configuration, image transforms, and adaptive world model parameters
+- `test_toroidal_dot_actions.ipynb`: Jupyter notebook for interactive toroidal dot environment testing
+- `config.py`: Shared configuration, image transforms, robot-specific directories, and adaptive world model parameters
 - `requirements.txt`: Python package dependencies
 - `.gitignore`: Excludes `.claude/` directory, `CLAUDE.md`, wandb logs, checkpoints, and common Python artifacts
 
