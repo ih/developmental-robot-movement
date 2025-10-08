@@ -48,7 +48,8 @@ This repository contains research code for developmental robot movement with a m
 - **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for improved generalization
 - **TransformerActionConditionedPredictor**: Causal transformer that interleaves visual features with action tokens
 - **Fresh prediction training**: Predictors trained using fresh predictions with consistent loss calculation
-- **Dual loss training**: Combined patch-space reconstruction + latent-space prediction losses for encoder optimization
+- **Dual loss training**: Combined patch-space reconstruction + latent-space prediction losses for encoder optimization (current weights: 1.0 patch, 0.2 latent)
+- **Action reconstruction loss**: Optional action classification from predicted features (currently disabled with weight 0)
 - **Joint training architecture**: Autoencoder reconstruction loss + action predictor gradient flow with shared encoder
 - **Sequence length management**: Handles long histories (4096 token capacity with clipping for GPU safety)
 - **Quality gating**: Robot stops acting when reconstruction loss > threshold, focuses on vision training
@@ -119,9 +120,16 @@ python jetbot_world_model_example.py
 
 # Replay all recorded sessions
 python replay_session_example.py
+
+# Replay only specific actions (e.g., only forward movement)
+python replay_session_example.py --filter-action motor_right=0.12
+
+# Replay only stop actions
+python replay_session_example.py --filter-action motor_right=0
 ```
 - **Recording mode**: Captures robot observations and actions with automatic disk space management
 - **Replay mode**: Replays all recorded sessions using the exact same main loop, enabling GPU utilization for predictor training
+- **Action filtering**: Optional command-line filtering to replay only specific actions (e.g., `--filter-action motor_right=0.12`)
 - **Robot-agnostic replay**: Can replay any robot's recorded sessions regardless of robot type
 - **Checkpoint sharing**: All modes (online, record, replay) share the same checkpoint directory for continuous learning
 - **Disk space management**: Automatic cleanup of oldest sessions when total recordings exceed configurable disk limit (default 10 GB)
@@ -179,8 +187,8 @@ Required Python packages:
 - `recording_writer.py`: Recording system with automatic disk space management
 - `recording_reader.py`: Reads recorded sessions with smart observation/action sequencing
 - `replay_robot.py`: Robot interface replacement for replaying recorded sessions
-- `recorded_policy.py`: Action selector factory for recorded action playback
-- `replay_session_example.py`: Robot-agnostic replay script for recorded sessions
+- `recorded_policy.py`: Action selector factory for recorded action playback with optional filtering
+- `replay_session_example.py`: Robot-agnostic replay script with command-line action filtering
 - `session_explorer.ipynb`: Interactive session exploration and training notebook with AdaptiveWorldModel integration
 - `test_jetbot_actions.ipynb`: Interactive Jupyter notebook for JetBot action space testing
 - `config.py`: Shared configuration, image transforms, and adaptive world model parameters
@@ -244,9 +252,10 @@ The following metrics are automatically logged when wandb is enabled:
 - **`mask_ratio`**: Dynamic mask ratio used during autoencoder training (0.3-0.85 range)
 
 **Prediction System:**
-- **`predictor_training_loss`**: Combined patch + latent loss for predictor training
-- **`predictor_patch_loss`**: Patch-space reconstruction loss (anchors visual quality)
-- **`predictor_latent_loss`**: Latent-space prediction loss (trains encoder for predictability)
+- **`predictor_training_loss`**: Combined patch + latent loss for predictor training (action loss currently disabled)
+- **`predictor_patch_loss`**: Patch-space reconstruction loss (anchors visual quality, weight=1.0)
+- **`predictor_latent_loss`**: Latent-space prediction loss (trains encoder for predictability, weight=0.2)
+- **`predictor_action_loss`**: Action classification loss (currently disabled, weight=0)
 - **`predictor_explained_variance`**: R² in patch space - scale-invariant predictor quality metric (target: >0.2 indicates meaningful learning)
 - **`predictor_training_step`**: Dedicated counter for predictor training iterations
 - **`predictor_grad_norm`**: Global gradient norm for predictor parameters
@@ -260,7 +269,8 @@ The following metrics are automatically logged when wandb is enabled:
 
 **Dual Loss Training Approach:**
 - **Patch loss (weight=1.0)**: Maintains visual reconstruction quality and prevents representation collapse
-- **Latent loss (weight=0.1)**: Encourages encoder to learn prediction-friendly representations
+- **Latent loss (weight=0.2)**: Encourages encoder to learn prediction-friendly representations
+- **Action loss (weight=0.0)**: Action classification from predicted features (currently disabled)
 - **Combined approach**: Encoder gradients flow from both predictor and reconstruction tasks
 
 **Interpreting Explained Variance (R²):**

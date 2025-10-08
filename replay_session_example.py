@@ -14,6 +14,8 @@ import wandb
 import sys
 import os
 import glob
+import argparse
+from typing import Dict, Any, Optional
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +25,43 @@ logger = logging.getLogger(__name__)
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.getLogger('PIL').setLevel(logging.WARNING)
 
-def replay_single_session(session_dir, checkpoint_dir):
+def create_action_filter(filter_spec: Optional[str]) -> Optional[callable]:
+    """Create action filter function from specification string.
+
+    Args:
+        filter_spec: Filter specification in format "key=value" (e.g., "motor_right=0.12")
+                     or None to replay all actions
+
+    Returns:
+        Filter function that returns True if action should be replayed, or None for no filtering
+    """
+    if filter_spec is None:
+        return None
+
+    try:
+        key, value_str = filter_spec.split('=', 1)
+        key = key.strip()
+
+        # Try to parse value as float, then int, otherwise keep as string
+        try:
+            value = float(value_str)
+            if value == int(value):
+                value = int(value)
+        except ValueError:
+            value = value_str.strip()
+
+        def filter_fn(action: Dict[str, Any]) -> bool:
+            return action.get(key) == value
+
+        logger.info(f"Action filter created: {key}={value}")
+        return filter_fn
+
+    except ValueError:
+        logger.error(f"Invalid filter specification: '{filter_spec}'. Expected format: key=value")
+        sys.exit(1)
+
+
+def replay_single_session(session_dir, checkpoint_dir, action_filter=None):
     """Replay a single session directory"""
     logger.info(f"Loading session from: {session_dir}")
 
@@ -32,7 +70,7 @@ def replay_single_session(session_dir, checkpoint_dir):
         reader = RecordingReader(session_dir)
         action_space = reader.get_action_space()
         robot = ReplayRobot(reader, action_space)
-        action_selector = create_recorded_action_selector(reader)
+        action_selector = create_recorded_action_selector(reader, action_filter=action_filter)
 
         session_info = reader.get_session_info()
         robot_type = session_info.get('robot_type', 'unknown')
@@ -40,6 +78,9 @@ def replay_single_session(session_dir, checkpoint_dir):
         logger.info(f"Replay setup complete: {reader.total_steps} steps loaded")
         logger.info(f"Robot type: {robot_type}")
         logger.info(f"Action space has {len(action_space)} actions")
+
+        if action_filter is not None:
+            logger.info("Action filtering enabled - only matching actions will be replayed")
 
     except Exception as e:
         logger.error(f"Failed to load replay session: {e}")
@@ -109,6 +150,34 @@ def get_all_session_dirs(base_dir):
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description='Replay recorded robot sessions with optional action filtering',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Replay all actions
+  python replay_session_example.py
+
+  # Only replay actions with motor_right=0.12
+  python replay_session_example.py --filter-action motor_right=0.12
+
+  # Only replay stop actions (motor_right=0)
+  python replay_session_example.py --filter-action motor_right=0
+        """
+    )
+    parser.add_argument(
+        '--filter-action',
+        type=str,
+        default=None,
+        metavar='KEY=VALUE',
+        help='Filter actions by key=value (e.g., motor_right=0.12). If not specified, all actions are replayed.'
+    )
+    args = parser.parse_args()
+
+    # Create action filter from command-line argument
+    action_filter = create_action_filter(args.filter_action)
+
     # Configuration
     SESSIONS_BASE_DIR = config.RECORDING_BASE_DIR
     CHECKPOINT_DIR = config.DEFAULT_CHECKPOINT_DIR  # Shared checkpoint directory
@@ -137,7 +206,7 @@ def main():
         logger.info(f"{'='*60}")
 
         try:
-            success = replay_single_session(session_dir, CHECKPOINT_DIR)
+            success = replay_single_session(session_dir, CHECKPOINT_DIR, action_filter)
             if success:
                 successful_replays += 1
                 logger.info(f"✓ Session {session_name} completed successfully")

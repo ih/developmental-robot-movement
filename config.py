@@ -23,9 +23,9 @@ class AdaptiveWorldModelConfig:
     MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking
 
     # Prediction loss weights
-    PRED_PATCH_W = .2  # Weight for patch-space reconstruction loss
-    PRED_LATENT_W = 0.8  # Weight for latent-space prediction loss
-    PRED_ACTION_W = 1  # Weight for action reconstruction loss (classifying which action was taken)
+    PRED_PATCH_W = 1  # Weight for patch-space reconstruction loss
+    PRED_LATENT_W = .2  # Weight for latent-space prediction loss
+    PRED_ACTION_W = 0  # Weight for action reconstruction loss (classifying which action was taken)
 
     # Logging and checkpointing
     LOG_INTERVAL = 20  # Log every N steps
