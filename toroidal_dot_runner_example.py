@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-Example script showing how to integrate ToroidalDotRobot with AdaptiveWorldModel
-using the RobotInterface abstraction.
+Example script showing how to run ToroidalDotRobot with RobotRunner
+using deterministic action selectors.
 
-This demonstrates the world model learning in a simple simulated environment.
+This demonstrates running a robot with pre-defined policies without
+any learning or world model components.
 """
 
 from toroidal_dot_interface import ToroidalDotRobot
-from adaptive_world_model import AdaptiveWorldModel
+from robot_runner import RobotRunner
+from toroidal_action_selectors import (
+    create_constant_action_selector,
+    create_sequence_action_selector,
+    SEQUENCE_ALWAYS_MOVE,
+    SEQUENCE_ALWAYS_STAY,
+    SEQUENCE_ALTERNATE,
+    SEQUENCE_DOUBLE_MOVE,
+    SEQUENCE_TRIPLE_MOVE,
+    TOROIDAL_ACTION_STAY,
+    TOROIDAL_ACTION_MOVE
+)
 from recording_writer import RecordingWriter
 from recording_robot import RecordingRobot
-from toroidal_action_selectors import create_sequence_action_selector, SEQUENCE_ALWAYS_MOVE
 import config
 import logging
-import wandb
 import sys
 
 # Setup logging
@@ -24,16 +34,13 @@ logger = logging.getLogger(__name__)
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.getLogger('PIL').setLevel(logging.WARNING)
 
+
 def main():
     # Configuration - use toroidal dot parameters
     logger.info("Using Toroidal Dot Environment Configuration:")
     logger.info(f"  Image size: {config.ToroidalDotConfig.IMG_SIZE}x{config.ToroidalDotConfig.IMG_SIZE}")
     logger.info(f"  Dot radius: {config.ToroidalDotConfig.DOT_RADIUS} pixels")
     logger.info(f"  Movement per action: {config.ToroidalDotConfig.DOT_MOVE_PIXELS} pixels")
-
-    # Optional: Override learning rates (leave as None to use saved optimizer rates or config defaults)
-    AUTOENCODER_LR = None    # Use saved optimizer rate or config default
-    PREDICTOR_LR = None      # Use saved optimizer rate or config default
 
     # Create ToroidalDotRobot interface
     logger.info("Creating ToroidalDotRobot...")
@@ -78,47 +85,44 @@ def main():
         logger.info("Starting in ONLINE mode...")
         robot = toroidal_robot
 
-    # Temporarily override ACTION_CHANNELS and ACTION_RANGES for toroidal dot
-    original_action_channels = config.ACTION_CHANNELS
-    original_action_ranges = config.ACTION_RANGES
-    config.ACTION_CHANNELS = config.ToroidalDotConfig.ACTION_CHANNELS_DOT
-    config.ACTION_RANGES = config.ToroidalDotConfig.ACTION_RANGES_DOT
+    # Choose action selector
+    # Options: SEQUENCE_ALWAYS_MOVE, SEQUENCE_ALWAYS_STAY, SEQUENCE_ALTERNATE,
+    #          SEQUENCE_DOUBLE_MOVE, SEQUENCE_TRIPLE_MOVE
+    # Or create custom:
+    #   - create_constant_action_selector(TOROIDAL_ACTION_MOVE)
+    #   - create_sequence_action_selector([{'action': 0}, {'action': 1}, {'action': 1}])
 
-    # Create action selector that always moves right
     logger.info("Creating action selector: SEQUENCE_ALWAYS_MOVE")
     action_selector = create_sequence_action_selector(SEQUENCE_ALWAYS_MOVE)
 
-    # Create world model with appropriate robot interface
-    logger.info("Initializing AdaptiveWorldModel...")
-    logger.info(f"Action space: {robot.action_space}")
-    logger.info(f"Checkpoint directory: {config.TOROIDAL_DOT_CHECKPOINT_DIR}")
+    # Alternative examples (uncomment to try):
+    # action_selector = create_sequence_action_selector(SEQUENCE_ALTERNATE)
+    # action_selector = create_sequence_action_selector(SEQUENCE_TRIPLE_MOVE)
+    # action_selector = create_constant_action_selector(TOROIDAL_ACTION_STAY)
+    # custom_sequence = [{'action': 0}, {'action': 0}, {'action': 1}, {'action': 1}, {'action': 1}]
+    # action_selector = create_sequence_action_selector(custom_sequence)
 
-    world_model = AdaptiveWorldModel(
-        robot,
+    # Create robot runner
+    logger.info("Initializing RobotRunner...")
+    logger.info(f"Action space: {robot.action_space}")
+
+    runner = RobotRunner(
+        robot_interface=robot,
+        action_selector=action_selector,
         interactive=config.INTERACTIVE_MODE,
-        wandb_project="toroidal-dot-developmental-learning",
-        checkpoint_dir=config.TOROIDAL_DOT_CHECKPOINT_DIR,
-        autoencoder_lr=AUTOENCODER_LR,
-        predictor_lr=PREDICTOR_LR,
-        action_selector=action_selector
+        display_interval=1,  # Update display every 10 steps
+        action_delay=0.1  # 0.1 second delay between actions
     )
 
     try:
-        logger.info("Starting world model main loop...")
+        logger.info("Starting robot runner main loop...")
         logger.info("Press Ctrl+C to stop")
-        world_model.main_loop()
+        runner.main_loop()
 
     except KeyboardInterrupt:
         logger.info("Stopped by user")
 
     finally:
-        # Restore original action config
-        config.ACTION_CHANNELS = original_action_channels
-        config.ACTION_RANGES = original_action_ranges
-
-        logger.info("Saving final checkpoint...")
-        world_model.save_checkpoint()
-
         # Show recording stats if in record mode
         if config.RECORDING_MODE:
             stats = robot.get_recording_stats()
@@ -130,9 +134,7 @@ def main():
 
         logger.info("Cleaning up...")
         robot.cleanup()
-        # Clean up wandb run
-        if world_model.wandb_enabled:
-            wandb.finish()
+
 
 if __name__ == "__main__":
     main()
