@@ -8,6 +8,10 @@ TRANSFORM = transforms.Compose([
 
 # Adaptive World Model Parameters
 class AdaptiveWorldModelConfig:
+    # Architecture selection
+    AUTOENCODER_TYPE = "cnn"  # Options: "vit" (Vision Transformer MAE), "cnn" (Convolutional)
+    PREDICTOR_TYPE = "lstm"  # Options: "transformer", "lstm"
+
     # Core parameters
     LOOKAHEAD = 1
     MAX_LOOKAHEAD_MARGIN = 5
@@ -19,20 +23,23 @@ class AdaptiveWorldModelConfig:
     # Training parameters
     AUTOENCODER_LR = 1e-4
     PREDICTOR_LR = 1e-4
-    MASK_RATIO_MIN = 0.3  # Minimum mask ratio for randomized masking
-    MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking
+    MASK_RATIO_MIN = 0.3  # Minimum mask ratio for randomized masking (ViT only)
+    MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking (ViT only)
 
     # Prediction loss weights
     PRED_PATCH_W = 1  # Weight for patch-space reconstruction loss
     PRED_LATENT_W = .2  # Weight for latent-space prediction loss
     PRED_ACTION_W = 0  # Weight for action reconstruction loss (classifying which action was taken)
 
+    # Action classification
+    ENABLE_ACTION_CLASSIFIER = False  # Enable separate action classification module
+
     # Logging and checkpointing
     LOG_INTERVAL = 20  # Log every N steps
     VISUALIZATION_UPLOAD_INTERVAL = 100  # Upload visualizations every N steps
     CHECKPOINT_SAVE_INTERVAL = 500  # Save every N predictor training steps
-    DISPLAY_TRAINING_INTERVAL = 25  # Show training visualization every N steps
-    DISPLAY_INTERVAL = 10  # Update display every N main loop iterations
+    DISPLAY_TRAINING_INTERVAL = 1  # Show training visualization every N steps
+    DISPLAY_INTERVAL = 1  # Update display every N main loop iterations
     
     # History management
     MAX_HISTORY_SIZE = 1000

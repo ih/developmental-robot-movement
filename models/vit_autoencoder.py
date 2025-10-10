@@ -5,9 +5,10 @@ Masked Autoencoder Vision Transformer for visual encoding/decoding.
 import torch
 import torch.nn as nn
 import timm
+from models.base_autoencoder import BaseAutoencoder
 
 
-class MaskedAutoencoderViT(nn.Module):
+class MaskedAutoencoderViT(BaseAutoencoder):
     """
     A Vision Transformer (ViT) based Masked Autoencoder (MAE)
     with a POWERFUL encoder and a LIGHTWEIGHT MLP decoder.
@@ -16,11 +17,17 @@ class MaskedAutoencoderViT(nn.Module):
                  decoder_embed_dim=128, depth=5, num_heads=4, mlp_ratio=4.):
         super().__init__()
 
+        # Store dimensions for base class interface
+        self.embed_dim = embed_dim
+        self.image_size = image_size
+        self.patch_size = patch_size
+
         # --------------------------------------------------------------------------
         # MAE ENCODER (Powerful Transformer)
         # This part remains the same as before.
         self.patch_embed = timm.models.vision_transformer.PatchEmbed(image_size, patch_size, 3, embed_dim)
         num_patches = self.patch_embed.num_patches
+        self.num_tokens = num_patches + 1  # +1 for CLS token
         self.grid_size = image_size // patch_size
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)
@@ -185,6 +192,91 @@ class MaskedAutoencoderViT(nn.Module):
         x = torch.einsum('nhwpqc->nchpwq', x)
         imgs = x.reshape(x.shape[0], 3, h * patch_size, w * patch_size)
         return imgs
+
+    def decode_from_latent(self, latent_features):
+        """
+        Decode latent features back to images (BaseAutoencoder interface).
+
+        Args:
+            latent_features: (batch_size, num_tokens, embed_dim) tensor
+
+        Returns:
+            decoded_imgs: (batch_size, 3, H, W) tensor
+        """
+        # Use the existing decode method
+        return self.decode(latent_features)
+
+    def compute_reconstruction_loss(self, imgs, **kwargs):
+        """
+        Compute reconstruction loss for training (BaseAutoencoder interface).
+
+        Args:
+            imgs: (batch_size, 3, H, W) tensor of images
+            **kwargs: mask_ratio (float in [0, 1] for masked reconstruction)
+
+        Returns:
+            loss: scalar tensor
+        """
+        mask_ratio = kwargs.get('mask_ratio', 0.0)
+        pred_patches, _ = self.forward(imgs, mask_ratio=mask_ratio)
+        target_patches = self.patchify(imgs)
+        loss = torch.nn.functional.mse_loss(pred_patches, target_patches)
+        return loss
+
+    def train_step(self, imgs, optimizer, **kwargs):
+        """
+        Perform one training step on a batch of images.
+
+        Args:
+            imgs: (batch_size, 3, H, W) tensor of images
+            optimizer: torch optimizer instance
+            **kwargs: Optional override parameters (mask_ratio_min, mask_ratio_max)
+
+        Returns:
+            loss_value: float, the loss value for this step
+        """
+        import random
+        import config as cfg
+
+        # Randomly sample mask ratio for this training step
+        mask_ratio_min = kwargs.get('mask_ratio_min', cfg.AdaptiveWorldModelConfig.MASK_RATIO_MIN)
+        mask_ratio_max = kwargs.get('mask_ratio_max', cfg.AdaptiveWorldModelConfig.MASK_RATIO_MAX)
+        mask_ratio = random.uniform(mask_ratio_min, mask_ratio_max)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward pass with masking
+        pred_patches, latent = self.forward(imgs, mask_ratio=mask_ratio)
+
+        # Calculate reconstruction loss
+        target_patches = self.patchify(imgs)
+        loss = torch.nn.functional.mse_loss(pred_patches, target_patches)
+
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+
+        return loss.item()
+
+    def patchify(self, imgs):
+        """
+        Convert images to patches.
+
+        Args:
+            imgs: (batch_size, 3, H, W) tensor
+
+        Returns:
+            patches: (batch_size, num_patches, patch_size**2 * 3) tensor
+        """
+        patch_size = int(self.patch_embed.patch_size[0])
+        B, C, H, W = imgs.shape
+        h = H // patch_size
+        w = W // patch_size
+        x = imgs.reshape(B, C, h, patch_size, w, patch_size)
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(B, h * w, patch_size**2 * C)
+        return x
 
     def reconstruct(self, imgs):
         """Full reconstruction using forward pass with no masking"""

@@ -5,6 +5,7 @@ Transformer-based action-conditioned predictor that interleaves autoencoder feat
 import torch
 import torch.nn as nn
 
+from models.base_predictor import BasePredictor
 from models.encoder_layer_with_attn import EncoderLayerWithAttn
 import config
 
@@ -159,7 +160,7 @@ def film_apply(features, gamma, beta):
     return features * gamma + beta
 
 
-class TransformerActionConditionedPredictor(nn.Module):
+class TransformerActionConditionedPredictor(BasePredictor):
     """
     Transformer-based predictor that interleaves autoencoder encoder features with actions
     using causal attention masking for future state prediction.
@@ -177,14 +178,11 @@ class TransformerActionConditionedPredictor(nn.Module):
         num_actions=2,  # Number of discrete actions in the action space
         autoencoder=None,  # Reference to autoencoder for decoding features to images
     ):
-        super().__init__()
+        super().__init__(level=level, num_actions=num_actions)
 
         self.embed_dim = embed_dim
         self.action_dim = action_dim
         self.max_sequence_length = max_sequence_length
-        self.level = level
-        self.max_lookahead = 10  # For compatibility with old interface
-        self.num_actions = num_actions
         self.autoencoder = autoencoder
 
         # New FiLM-based action conditioning
@@ -232,18 +230,6 @@ class TransformerActionConditionedPredictor(nn.Module):
         # Output head to predict next encoder features (or delta features)
         self.output_head = nn.Linear(embed_dim, embed_dim)
 
-        # Action reconstruction head - recovers which action was taken from reconstructed image diff
-        # Input: (batch_size, 3, 224, 224) - diff between predicted and last reconstructed images
-        self.action_classifier = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),  # Downsample
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),  # Global pool to (B, 32, 1, 1)
-            nn.Flatten(),
-            nn.Linear(32, num_actions)
-        )
-
         # Layer norm
         self.layer_norm = nn.LayerNorm(embed_dim)
 
@@ -269,7 +255,7 @@ class TransformerActionConditionedPredictor(nn.Module):
         mask = mask.masked_fill(mask == 1, float('-inf'))
         return mask
 
-    def forward(self, encoder_features_history, actions, return_attn=False, action_normalized=None, last_features=None, return_action_logits=False):
+    def forward(self, encoder_features_history, actions, return_attn=False, action_normalized=None, last_features=None, **kwargs):
         """
         Forward pass with interleaved encoder features and actions.
 
@@ -278,13 +264,12 @@ class TransformerActionConditionedPredictor(nn.Module):
             actions: list of action dicts (length = len(encoder_features_history) - 1)
             return_attn: whether to record and return per-layer attention maps
             action_normalized: (batch_size, num_action_channels) tensor in [-1, 1]
-                             If provided, uses FiLM conditioning instead of legacy action embedding
+                             If provided, uses FiLM conditioning
             last_features: (batch_size, num_patches+1, D) features from current frame for delta prediction
-            return_action_logits: whether to return action classification logits
+            **kwargs: Additional keyword arguments (for interface compatibility)
 
         Returns:
             predicted_features: [B, num_patches+1, D] (absolute or delta, depending on config.DELTA_LATENT)
-            action_logits (optional): [B, num_actions] when return_action_logits=True
             attn_info (optional): dict with attention maps and token metadata when return_attn=True
         """
         # Handle empty history case by returning random features
@@ -383,34 +368,9 @@ class TransformerActionConditionedPredictor(nn.Module):
             # predicted_features is delta, add to last_features to get absolute prediction
             predicted_features = last_features + predicted_features
 
-        # Compute action classification logits from image diff
-        action_logits = None
-        if return_action_logits:
-            if self.autoencoder is None or last_features is None:
-                raise ValueError("autoencoder and last_features must be provided when return_action_logits=True")
-
-            # Decode predicted features to image
-            B, seq_len, _ = predicted_features.shape
-            L = seq_len - 1  # Remove CLS token count
-            ids_restore = torch.arange(L, device=predicted_features.device).unsqueeze(0).repeat(B, 1)
-            pred_patches = self.autoencoder.forward_decoder(predicted_features, ids_restore)
-            decoded_pred = self.autoencoder.unpatchify(pred_patches)
-
-            # Decode last features to image
-            last_patches = self.autoencoder.forward_decoder(last_features, ids_restore)
-            decoded_last = self.autoencoder.unpatchify(last_patches)
-
-            # Compute pixel diff
-            pixel_diff = decoded_pred - decoded_last  # (B, 3, H, W)
-
-            # Classify action from diff
-            action_logits = self.action_classifier(pixel_diff)
-
-        if not return_attn and not return_action_logits:
+        # Simple return path if no attention requested
+        if not return_attn:
             return predicted_features
-
-        if return_action_logits and not return_attn:
-            return predicted_features, action_logits
 
         # Derive token indices for downstream analysis
         token_types_t = token_type_tensor
@@ -442,8 +402,6 @@ class TransformerActionConditionedPredictor(nn.Module):
             'last_frame_idx': last_frame_idx,
         }
 
-        if return_action_logits:
-            return predicted_features, action_logits, attn_info
         return predicted_features, attn_info
 
     def predict_uncertainty(self, encoder_features_history, actions, num_samples=10):

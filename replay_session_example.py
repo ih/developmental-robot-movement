@@ -61,8 +61,8 @@ def create_action_filter(filter_spec: Optional[str]) -> Optional[callable]:
         sys.exit(1)
 
 
-def replay_single_session(session_dir, checkpoint_dir, action_filter=None):
-    """Replay a single session directory"""
+def replay_single_session(session_dir, action_filter=None):
+    """Replay a single session directory with automatic robot type detection"""
     logger.info(f"Loading session from: {session_dir}")
 
     try:
@@ -82,17 +82,35 @@ def replay_single_session(session_dir, checkpoint_dir, action_filter=None):
         if action_filter is not None:
             logger.info("Action filtering enabled - only matching actions will be replayed")
 
+        # Select checkpoint directory and wandb project based on robot type
+        # Normalize robot type for comparison (lowercase, remove spaces/underscores)
+        robot_type_normalized = robot_type.lower().replace('_', '').replace(' ', '')
+
+        if 'jetbot' in robot_type_normalized:
+            checkpoint_dir = config.JETBOT_CHECKPOINT_DIR
+            wandb_project = "jetbot-developmental-movement-replay"
+            logger.info(f"Using JetBot checkpoint directory: {checkpoint_dir}")
+        elif 'toroidaldot' in robot_type_normalized:
+            checkpoint_dir = config.TOROIDAL_DOT_CHECKPOINT_DIR
+            wandb_project = "ToroidalDotRobot-developmental-movement-replay"
+            logger.info(f"Using Toroidal Dot checkpoint directory: {checkpoint_dir}")
+        else:
+            # Fallback to default checkpoint directory for unknown robot types
+            checkpoint_dir = config.DEFAULT_CHECKPOINT_DIR
+            wandb_project = f"{robot_type}-developmental-movement-replay"
+            logger.warning(f"Unknown robot type '{robot_type}', using default checkpoint directory: {checkpoint_dir}")
+
     except Exception as e:
         logger.error(f"Failed to load replay session: {e}")
         return False
 
-    # Create world model for replay (no interactive mode, no wandb by default)
+    # Create world model for replay (no interactive mode, wandb enabled by default)
     logger.info("Initializing AdaptiveWorldModel for replay...")
 
     world_model = AdaptiveWorldModel(
         robot,
         interactive=False,  # No interactive mode in replay
-        wandb_project="jetbot_developmental-movement-replay",  # Disable wandb for replay by default
+        wandb_project=wandb_project,
         checkpoint_dir=checkpoint_dir,
         action_selector=action_selector,
         autoencoder_lr=None,
@@ -156,14 +174,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Replay all actions
+  # Replay all actions from all robot types
   python replay_session_example.py
 
-  # Only replay actions with motor_right=0.12
+  # Only replay actions with motor_right=0.12 (JetBot)
   python replay_session_example.py --filter-action motor_right=0.12
 
-  # Only replay stop actions (motor_right=0)
-  python replay_session_example.py --filter-action motor_right=0
+  # Only replay move actions (Toroidal Dot)
+  python replay_session_example.py --filter-action action=1
         """
     )
     parser.add_argument(
@@ -171,42 +189,58 @@ Examples:
         type=str,
         default=None,
         metavar='KEY=VALUE',
-        help='Filter actions by key=value (e.g., motor_right=0.12). If not specified, all actions are replayed.'
+        help='Filter actions by key=value (e.g., motor_right=0.12 or action=1). If not specified, all actions are replayed.'
     )
     args = parser.parse_args()
 
     # Create action filter from command-line argument
     action_filter = create_action_filter(args.filter_action)
 
-    # Configuration
-    SESSIONS_BASE_DIR = config.RECORDING_BASE_DIR
-    CHECKPOINT_DIR = config.DEFAULT_CHECKPOINT_DIR  # Shared checkpoint directory
-
     logger.info("Starting robot session replay for all sessions...")
-    logger.info(f"Scanning for sessions in: {SESSIONS_BASE_DIR}")
 
-    # Get all session directories
-    session_dirs = get_all_session_dirs(SESSIONS_BASE_DIR)
+    # Scan both robot-specific directories for sessions
+    all_session_dirs = []
 
-    if not session_dirs:
-        logger.error("No valid session directories found")
+    # Scan JetBot sessions
+    # jetbot_sessions = get_all_session_dirs(config.JETBOT_RECORDING_DIR)
+    # if jetbot_sessions:
+    #     logger.info(f"Found {len(jetbot_sessions)} JetBot sessions in: {config.JETBOT_RECORDING_DIR}")
+    #     all_session_dirs.extend(jetbot_sessions)
+
+    # Scan Toroidal Dot sessions
+    toroidal_dot_sessions = get_all_session_dirs(config.TOROIDAL_DOT_RECORDING_DIR)
+    if toroidal_dot_sessions:
+        logger.info(f"Found {len(toroidal_dot_sessions)} Toroidal Dot sessions in: {config.TOROIDAL_DOT_RECORDING_DIR}")
+        all_session_dirs.extend(toroidal_dot_sessions)
+
+    # Also scan legacy base directory for any sessions
+    legacy_sessions = get_all_session_dirs(config.RECORDING_BASE_DIR)
+    # Filter out sessions already found in robot-specific directories
+    legacy_sessions = [s for s in legacy_sessions if s not in all_session_dirs]
+    if legacy_sessions:
+        logger.info(f"Found {len(legacy_sessions)} legacy sessions in: {config.RECORDING_BASE_DIR}")
+        all_session_dirs.extend(legacy_sessions)
+
+    if not all_session_dirs:
+        logger.error("No valid session directories found in any location")
         sys.exit(1)
 
-    logger.info(f"Found {len(session_dirs)} valid sessions to replay")
-    for i, session_dir in enumerate(session_dirs, 1):
+    logger.info(f"\nTotal: {len(all_session_dirs)} valid sessions to replay")
+    for i, session_dir in enumerate(all_session_dirs, 1):
         session_name = os.path.basename(session_dir)
-        logger.info(f"  {i}. {session_name}")
+        parent_dir = os.path.basename(os.path.dirname(session_dir))
+        logger.info(f"  {i}. [{parent_dir}] {session_name}")
 
-    # Replay each session
+    # Replay each session (checkpoint directory determined automatically per robot type)
     successful_replays = 0
-    for i, session_dir in enumerate(session_dirs, 1):
+    for i, session_dir in enumerate(all_session_dirs, 1):
         session_name = os.path.basename(session_dir)
         logger.info(f"\n{'='*60}")
-        logger.info(f"REPLAYING SESSION {i}/{len(session_dirs)}: {session_name}")
+        logger.info(f"REPLAYING SESSION {i}/{len(all_session_dirs)}: {session_name}")
         logger.info(f"{'='*60}")
 
         try:
-            success = replay_single_session(session_dir, CHECKPOINT_DIR, action_filter)
+            success = replay_single_session(session_dir, action_filter)
             if success:
                 successful_replays += 1
                 logger.info(f"✓ Session {session_name} completed successfully")
@@ -222,9 +256,9 @@ Examples:
     logger.info(f"\n{'='*60}")
     logger.info(f"REPLAY SUMMARY")
     logger.info(f"{'='*60}")
-    logger.info(f"Total sessions: {len(session_dirs)}")
+    logger.info(f"Total sessions: {len(all_session_dirs)}")
     logger.info(f"Successful replays: {successful_replays}")
-    logger.info(f"Failed replays: {len(session_dirs) - successful_replays}")
+    logger.info(f"Failed replays: {len(all_session_dirs) - successful_replays}")
     logger.info("All session replays complete!")
 
 if __name__ == "__main__":

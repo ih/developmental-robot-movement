@@ -12,7 +12,9 @@ This repository contains research code for developmental robot movement with a m
 2. **JetBot Implementation** (`jetbot_interface.py`, `jetbot_remote_client.py`) - Concrete JetBot robot interface
 3. **Toroidal Dot Environment** (`toroidal_dot_env.py`, `toroidal_dot_interface.py`) - Simulated environment for testing
 4. **Adaptive World Model** (`adaptive_world_model.py`) - Hierarchical world model with uncertainty-based action selection
-5. **Integration Examples** (`jetbot_world_model_example.py`, `toroidal_dot_world_model_example.py`) - Integration with different robots/environments
+5. **Robot Runner** (`robot_runner.py`) - Lightweight action execution without learning components
+6. **Action Selectors** (`toroidal_action_selectors.py`, `recorded_policy.py`) - Pluggable action selection strategies
+7. **Integration Examples** (`jetbot_world_model_example.py`, `toroidal_dot_world_model_example.py`, `toroidal_dot_runner_example.py`) - Integration with different robots/environments
 
 ## Architecture
 
@@ -42,8 +44,29 @@ This repository contains research code for developmental robot movement with a m
 - **Quality gating**: Robot only acts when visual reconstruction quality meets threshold
 - **Hierarchical predictors**: Multiple levels of action abstraction with automatic level creation
 - **Uncertainty-based exploration**: Selects actions with highest prediction uncertainty (entropy)
+- **Pluggable action selectors**: Custom action selection via `action_selector` parameter (defaults to uncertainty-based)
 - **Real-time training visualization**: Shows current vs reconstructed frames during autoencoder training
 - **Interactive visualization**: Real-time display of current frame, decoded frame, and predictions for all motor combinations
+
+### Robot Runner
+- **RobotRunner class**: Lightweight runner for executing actions without learning or world model components
+- **No neural networks**: Pure action execution without training, checkpoints, or predictions
+- **Action selector support**: Takes any action selector function for deterministic or custom policies
+- **Visual display**: Optional matplotlib-based observation display with action information
+- **Statistics tracking**: Automatic tracking of action distribution, timing, and execution counts
+- **Interactive mode**: Optional user confirmation/override before each action
+- **Recording compatible**: Works with RecordingRobot wrapper for data collection
+
+### Action Selectors
+- **Pluggable architecture**: Action selectors are functions that take observations and return (action, metadata) tuples
+- **Toroidal action selectors** (`toroidal_action_selectors.py`):
+  - `create_constant_action_selector(action)`: Always returns the same action
+  - `create_sequence_action_selector(sequence)`: Cycles through a sequence of actions
+  - Pre-defined sequences: `SEQUENCE_ALWAYS_MOVE`, `SEQUENCE_ALWAYS_STAY`, `SEQUENCE_ALTERNATE`, `SEQUENCE_DOUBLE_MOVE`, `SEQUENCE_TRIPLE_MOVE`
+- **Recorded action selector** (`recorded_policy.py`):
+  - `create_recorded_action_selector(reader)`: Replays actions from recorded sessions
+  - Optional action filtering for selective replay
+- **Usage**: Pass to `AdaptiveWorldModel` or `RobotRunner` via `action_selector` parameter
 
 ## Key Components
 
@@ -130,7 +153,7 @@ python adaptive_world_model.py
 - All ML components are stubs - only tests main loop logic
 - No physical robot required
 
-### Toroidal Dot Environment
+### Toroidal Dot Environment with World Model
 ```bash
 python toroidal_dot_world_model_example.py
 ```
@@ -138,7 +161,19 @@ python toroidal_dot_world_model_example.py
 - Fast iteration without hardware requirements
 - Separate checkpoints: `saved/checkpoints/toroidal_dot/`
 - Separate recordings: `saved/sessions/toroidal_dot/`
+- Uses `SEQUENCE_ALWAYS_MOVE` action selector by default
 - Interactive testing notebook: `test_toroidal_dot_actions.ipynb`
+
+### Toroidal Dot Environment without Learning
+```bash
+python toroidal_dot_runner_example.py
+```
+- Runs ToroidalDotRobot with RobotRunner (no learning or neural networks)
+- Executes deterministic action sequences using action selectors
+- Useful for testing action selectors and collecting data with known policies
+- Supports recording mode for data collection
+- Uses `SEQUENCE_ALWAYS_MOVE` action selector by default
+- Lightweight alternative to world model for pure action execution
 
 ### Recording and Replay System
 ```bash
@@ -153,6 +188,9 @@ python replay_session_example.py
 
 # Replay only specific actions (e.g., only forward movement)
 python replay_session_example.py --filter-action motor_right=0.12
+
+# Continuous replay with plateau detection
+python continuous_replay.py
 ```
 - **Recording mode**: Captures robot observations and actions with automatic disk space management
 - **Robot-specific directories**: JetBot (`saved/sessions/jetbot/`) and toroidal dot (`saved/sessions/toroidal_dot/`) stored separately
@@ -161,6 +199,27 @@ python replay_session_example.py --filter-action motor_right=0.12
 - **Robot-agnostic replay**: Can replay any robot's recorded sessions regardless of robot type
 - **Isolated checkpoints**: Each robot type maintains separate model checkpoints due to different action spaces
 - **Disk space management**: Automatic cleanup of oldest sessions per robot type (default 10 GB each)
+
+### Continuous Replay Training
+```bash
+# Run until plateau with default settings
+python continuous_replay.py
+
+# Run with custom plateau detection parameters
+python continuous_replay.py --patience 10 --min-delta 0.0001
+
+# Run with action filtering
+python continuous_replay.py --filter-action action=1
+
+# Run with max epochs limit
+python continuous_replay.py --max-epochs 50
+```
+- **Automatic training**: Runs replay sessions repeatedly until predictor loss plateaus
+- **Plateau detection**: Configurable patience, minimum delta, and minimum epochs before stopping
+- **Loss tracking**: Extracts predictor loss from wandb or checkpoint state after each epoch
+- **Action filtering**: Optional filtering to train on specific actions only
+- **Max epochs**: Configurable maximum number of training epochs (default: 100)
+- **Statistics**: Detailed loss history and training summary on completion
 
 ### Session Explorer and Training
 ```bash
@@ -210,17 +269,26 @@ Required Python packages:
 - `toroidal_dot_interface.py`: ToroidalDotRobot implementation of RobotInterface
 - `models/`: Neural network architectures directory
   - `models/__init__.py`: Module exports for clean imports
-  - `models/autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
-  - `models/predictor.py`: TransformerActionConditionedPredictor with sequence length management
+  - `models/base_autoencoder.py`: Base class for autoencoder implementations
+  - `models/base_predictor.py`: Base class for predictor implementations
+  - `models/vit_autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
+  - `models/cnn_autoencoder.py`: CNN-based autoencoder implementation
+  - `models/transformer_predictor.py`: TransformerActionConditionedPredictor with sequence length management
+  - `models/lstm_predictor.py`: LSTM-based predictor implementation
+  - `models/action_classifier.py`: Action classification module for action reconstruction loss
   - `models/encoder_layer_with_attn.py`: Custom transformer encoder layer with attention capture
 - `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
+- `robot_runner.py`: Lightweight runner for executing actions without learning components
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
 - `toroidal_dot_world_model_example.py`: Integration example connecting toroidal dot environment with world model
+- `toroidal_dot_runner_example.py`: Integration example using RobotRunner with toroidal dot (no learning)
+- `toroidal_action_selectors.py`: Action selector factories for toroidal dot environment (constant and sequence selectors)
 - `recording_writer.py`: Recording system with automatic disk space management
 - `recording_reader.py`: Reads recorded sessions with smart observation/action sequencing
 - `replay_robot.py`: Robot interface replacement for replaying recorded sessions
 - `recorded_policy.py`: Action selector factory for recorded action playback with optional filtering
 - `replay_session_example.py`: Robot-agnostic replay script with command-line action filtering
+- `continuous_replay.py`: Continuous replay training with plateau detection for automatic model improvement
 - `session_explorer.ipynb`: Multi-robot session exploration and training notebook with automatic robot type detection
 - `session_explorer.py`: Python script version of session explorer notebook
 - `test_jetbot_actions.ipynb`: Interactive Jupyter notebook for JetBot action space testing
