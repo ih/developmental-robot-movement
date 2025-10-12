@@ -4,14 +4,20 @@ Continuous replay training with plateau detection.
 Runs replay sessions repeatedly until predictor loss plateaus or max epochs reached.
 """
 
-import subprocess
-import sys
 import os
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import numpy as np
+import glob
+
+# Import necessary modules for direct execution
+from adaptive_world_model import AdaptiveWorldModel
+from recording_reader import RecordingReader
+from replay_robot import ReplayRobot
+from recorded_policy import create_recorded_action_selector
+import config
 
 # Setup logging
 logging.basicConfig(
@@ -88,6 +94,55 @@ class PlateauDetector:
         }
 
 
+def get_all_session_dirs(base_dir):
+    """Find all session directories in the base directory"""
+    if not os.path.exists(base_dir):
+        return []
+
+    session_pattern = os.path.join(base_dir, "session_*")
+    session_dirs = glob.glob(session_pattern)
+
+    # Filter to only include valid sessions
+    valid_sessions = []
+    for session_dir in session_dirs:
+        if os.path.isdir(session_dir):
+            meta_file = os.path.join(session_dir, "session_meta.json")
+            frames_dir = os.path.join(session_dir, "frames")
+            if os.path.exists(meta_file) and os.path.exists(frames_dir):
+                valid_sessions.append(session_dir)
+
+    valid_sessions.sort()
+    return valid_sessions
+
+
+def create_action_filter(filter_spec: Optional[str]) -> Optional[callable]:
+    """Create action filter function from specification string."""
+    if filter_spec is None:
+        return None
+
+    try:
+        key, value_str = filter_spec.split('=', 1)
+        key = key.strip()
+
+        # Try to parse value as float, then int, otherwise keep as string
+        try:
+            value = float(value_str)
+            if value == int(value):
+                value = int(value)
+        except ValueError:
+            value = value_str.strip()
+
+        def filter_fn(action: Dict[str, Any]) -> bool:
+            return action.get(key) == value
+
+        logger.info(f"Action filter created: {key}={value}")
+        return filter_fn
+
+    except ValueError:
+        logger.error(f"Invalid filter specification: '{filter_spec}'. Expected format: key=value")
+        return None
+
+
 def extract_predictor_loss_from_checkpoint(checkpoint_dir: str) -> Optional[float]:
     """
     Extract the latest predictor training loss from checkpoint state.
@@ -110,42 +165,6 @@ def extract_predictor_loss_from_checkpoint(checkpoint_dir: str) -> Optional[floa
         return state.get('last_predictor_loss', None)
     except Exception as e:
         logger.warning(f"Could not extract loss from checkpoint: {e}")
-        return None
-
-
-def extract_loss_from_wandb(checkpoint_dir: str) -> Optional[float]:
-    """
-    Extract average predictor loss from recent wandb logs.
-
-    This is more reliable if you're using wandb.
-    """
-    try:
-        import wandb
-
-        # Get the most recent run
-        api = wandb.Api()
-
-        # You'll need to adjust this to your wandb project
-        project = "ToroidalDotRobot-developmental-movement-replay"
-        runs = api.runs(f"irvin-hwang-simulacra-systems/{project}")
-
-        if not runs:
-            return None
-
-        latest_run = runs[0]
-        history = latest_run.history(keys=["predictor_training_loss"], samples=100)
-
-        if history.empty or 'predictor_training_loss' not in history.columns:
-            return None
-
-        # Get mean of recent losses (last 20 or all if less)
-        recent_losses = history['predictor_training_loss'].dropna().tail(20)
-        if len(recent_losses) > 0:
-            return float(recent_losses.mean())
-
-        return None
-    except Exception as e:
-        logger.warning(f"Could not extract loss from wandb: {e}")
         return None
 
 
@@ -177,10 +196,22 @@ def continuous_replay_with_plateau_detection(
     """
     detector = PlateauDetector(patience=patience, min_delta=min_delta, min_epochs=min_epochs)
     checkpoint_dir = get_checkpoint_directory()
+    action_filter = create_action_filter(filter_action)
+
+    # Find all sessions
+    toroidal_dot_sessions = get_all_session_dirs(config.TOROIDAL_DOT_RECORDING_DIR)
+
+    if not toroidal_dot_sessions:
+        logger.error("No valid session directories found")
+        return
+
+    session_dir = toroidal_dot_sessions[0]  # Use first session
+    session_name = os.path.basename(session_dir)
 
     logger.info("="*60)
     logger.info("CONTINUOUS REPLAY TRAINING WITH PLATEAU DETECTION")
     logger.info("="*60)
+    logger.info(f"Session: {session_name}")
     logger.info(f"Max epochs: {max_epochs}")
     logger.info(f"Patience: {patience} epochs")
     logger.info(f"Min delta: {min_delta}")
@@ -190,7 +221,10 @@ def continuous_replay_with_plateau_detection(
         logger.info(f"Action filter: {filter_action}")
     logger.info("="*60)
 
+    # Create world model ONCE (will be reused across epochs)
+    world_model = None
     epoch = 0
+    last_predictor_loss = None
 
     try:
         while epoch < max_epochs:
@@ -199,31 +233,64 @@ def continuous_replay_with_plateau_detection(
             logger.info(f"EPOCH {epoch}/{max_epochs}")
             logger.info(f"{'='*60}\n")
 
-            # Build command
-            cmd = [sys.executable, "replay_session_example.py"]
-            if filter_action:
-                cmd.extend(["--filter-action", filter_action])
+            # Create new replay robot for this epoch
+            reader = RecordingReader(session_dir)
+            action_space = reader.get_action_space()
+            robot = ReplayRobot(reader, action_space)
+            action_selector = create_recorded_action_selector(reader, action_filter=action_filter)
 
-            # Run replay
-            result = subprocess.run(cmd)
+            session_info = reader.get_session_info()
+            robot_type = session_info.get('robot_type', 'unknown')
 
-            if result.returncode != 0:
-                logger.error(f"Replay failed in epoch {epoch}")
+            logger.info(f"Replay setup: {reader.total_steps} steps")
+            logger.info(f"Robot type: {robot_type}")
+
+            # Create world model on first epoch, reuse thereafter
+            if world_model is None:
+                logger.info("Initializing AdaptiveWorldModel (first epoch)...")
+                wandb_project = "ToroidalDotRobot-developmental-movement-replay"
+
+                world_model = AdaptiveWorldModel(
+                    robot,
+                    interactive=False,
+                    wandb_project=wandb_project,
+                    checkpoint_dir=checkpoint_dir,
+                    action_selector=action_selector,
+                    autoencoder_lr=None,
+                    predictor_lr=None
+                )
+            else:
+                # Reuse existing world model but update robot
+                logger.info(f"Reusing existing world model (epoch {epoch})...")
+                world_model.robot = robot
+                world_model.action_selector = action_selector
+
+            # Run replay for this epoch
+            try:
+                world_model.main_loop()
+                logger.info(f"Epoch {epoch} completed successfully")
+            except StopIteration:
+                logger.info(f"Epoch {epoch} finished - end of recording reached")
+            except Exception as e:
+                logger.error(f"Epoch {epoch} failed: {e}")
+                robot.cleanup()
                 break
 
-            # Extract loss from checkpoint or wandb
+            # Cleanup robot for this epoch
+            robot.cleanup()
+
+            # Save checkpoint after each epoch
+            world_model.save_checkpoint()
+
+            # Extract loss
             logger.info("\nExtracting predictor loss...")
-
-            # Try wandb first (more reliable)
-            loss = extract_loss_from_wandb(checkpoint_dir)
-
-            # Fallback to checkpoint if wandb not available
-            if loss is None:
-                loss = extract_predictor_loss_from_checkpoint(checkpoint_dir)
+            loss = extract_predictor_loss_from_checkpoint(checkpoint_dir)
 
             if loss is None:
-                logger.warning("Could not extract predictor loss - continuing anyway")
-                continue
+                logger.warning("Could not extract predictor loss - using last known value")
+                loss = last_predictor_loss if last_predictor_loss is not None else 1.0
+            else:
+                last_predictor_loss = loss
 
             # Check for plateau
             logger.info(f"Epoch {epoch} - Predictor Loss: {loss:.6f}")

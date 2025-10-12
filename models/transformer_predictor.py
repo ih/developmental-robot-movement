@@ -10,7 +10,66 @@ from models.encoder_layer_with_attn import EncoderLayerWithAttn
 import config
 
 
-def action_dict_to_index(action_dict, action_space):
+def get_action_config_for_robot(robot_type):
+    """
+    Get action channels and ranges for a specific robot type.
+
+    Args:
+        robot_type: str, either "jetbot" or "toroidal_dot"
+
+    Returns:
+        tuple: (action_channels, action_ranges)
+
+    Example:
+        >>> channels, ranges = get_action_config_for_robot("toroidal_dot")
+        >>> channels
+        ['action']
+        >>> ranges
+        {'action': (0, 1)}
+    """
+    if robot_type == "toroidal_dot":
+        return (
+            config.ToroidalDotConfig.ACTION_CHANNELS_DOT,
+            config.ToroidalDotConfig.ACTION_RANGES_DOT
+        )
+    elif robot_type == "jetbot":
+        return (
+            config.ACTION_CHANNELS,
+            config.ACTION_RANGES
+        )
+    else:
+        raise ValueError(f"Unknown robot type: {robot_type}. Expected 'jetbot' or 'toroidal_dot'.")
+
+
+def create_transformer_predictor_for_robot(robot_type, **kwargs):
+    """
+    Create a TransformerActionConditionedPredictor configured for a specific robot type.
+
+    Automatically sets the correct action_channels and action_ranges based on robot type.
+
+    Args:
+        robot_type: str, either "jetbot" or "toroidal_dot"
+        **kwargs: Additional arguments passed to TransformerActionConditionedPredictor
+
+    Returns:
+        TransformerActionConditionedPredictor instance configured for the robot
+
+    Example:
+        >>> predictor = create_transformer_predictor_for_robot(
+        ...     "toroidal_dot",
+        ...     embed_dim=256,
+        ...     num_actions=2
+        ... )
+    """
+    action_channels, action_ranges = get_action_config_for_robot(robot_type)
+    return TransformerActionConditionedPredictor(
+        action_channels=action_channels,
+        action_ranges=action_ranges,
+        **kwargs
+    )
+
+
+def action_dict_to_index(action_dict, action_space, action_channels=None):
     """
     Convert an action dictionary to its index in the action space.
 
@@ -24,6 +83,7 @@ def action_dict_to_index(action_dict, action_space):
         action_space: List of action dictionaries defining the discrete action space
                      Example: [{'motor_left': 0, 'motor_right': 0, 'duration': 0.2},
                                {'motor_right': 0, 'motor_right': 0.12, 'duration': 0.2}]
+        action_channels: List of action channel names to match (defaults to config.ACTION_CHANNELS)
 
     Returns:
         int: Index of the action in action_space
@@ -39,10 +99,13 @@ def action_dict_to_index(action_dict, action_space):
         >>> action_dict_to_index(action, action_space)
         1
     """
+    if action_channels is None:
+        action_channels = config.ACTION_CHANNELS
+
     for idx, space_action in enumerate(action_space):
         # Check if all relevant keys match (with tolerance for floating point comparison)
         match = True
-        for key in config.ACTION_CHANNELS:
+        for key in action_channels:
             action_val = action_dict.get(key, 0.0)
             space_val = space_action.get(key, 0.0)
             if abs(action_val - space_val) > 1e-6:
@@ -177,6 +240,8 @@ class TransformerActionConditionedPredictor(BasePredictor):
         level=0,
         num_actions=2,  # Number of discrete actions in the action space
         autoencoder=None,  # Reference to autoencoder for decoding features to images
+        action_channels=None,  # List of action channel names (e.g., ["motor_left", "motor_right", "duration"])
+        action_ranges=None,  # Dict mapping channel names to (min, max) tuples
     ):
         super().__init__(level=level, num_actions=num_actions)
 
@@ -185,9 +250,13 @@ class TransformerActionConditionedPredictor(BasePredictor):
         self.max_sequence_length = max_sequence_length
         self.autoencoder = autoencoder
 
+        # Store action configuration (use defaults from config if not provided)
+        self.action_channels = action_channels if action_channels is not None else config.ACTION_CHANNELS
+        self.action_ranges = action_ranges if action_ranges is not None else config.ACTION_RANGES
+
         # New FiLM-based action conditioning
         # ActionEmbedding: converts normalized actions to learned embeddings
-        num_action_channels = len(config.ACTION_CHANNELS)
+        num_action_channels = len(self.action_channels)
         self.action_embed = ActionEmbedding(
             in_dim=num_action_channels,
             emb_dim=config.ACTION_EMBED_DIM,
@@ -236,10 +305,20 @@ class TransformerActionConditionedPredictor(BasePredictor):
         self.dropout = nn.Dropout(dropout)
 
     def _normalize_action(self, action_dict, device):
+        """
+        Normalize action dictionary to [-1, 1] range using instance action configuration.
+
+        Args:
+            action_dict: Dictionary with action parameters
+            device: torch.device
+
+        Returns:
+            normalized_action: (1, num_action_channels) tensor in [-1, 1]
+        """
         values = []
-        for key in config.ACTION_CHANNELS:
+        for key in self.action_channels:
             value = float(action_dict.get(key, 0.0))
-            min_val, max_val = config.ACTION_RANGES[key]
+            min_val, max_val = self.action_ranges[key]
             value = max(min(value, max_val), min_val)
             if max_val == min_val:
                 scaled = 0.0

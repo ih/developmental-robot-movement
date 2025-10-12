@@ -9,8 +9,8 @@ TRANSFORM = transforms.Compose([
 # Adaptive World Model Parameters
 class AdaptiveWorldModelConfig:
     # Architecture selection
-    AUTOENCODER_TYPE = "cnn"  # Options: "vit" (Vision Transformer MAE), "cnn" (Convolutional)
-    PREDICTOR_TYPE = "lstm"  # Options: "transformer", "lstm"
+    AUTOENCODER_TYPE = "vit"  # Options: "vit" (Vision Transformer MAE), "cnn" (Convolutional)
+    PREDICTOR_TYPE = "transformer"  # Options: "transformer", "lstm"
 
     # Core parameters
     LOOKAHEAD = 1
@@ -27,9 +27,9 @@ class AdaptiveWorldModelConfig:
     MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking (ViT only)
 
     # Prediction loss weights
-    PRED_PATCH_W = 1  # Weight for patch-space reconstruction loss
-    PRED_LATENT_W = .2  # Weight for latent-space prediction loss
-    PRED_ACTION_W = 0  # Weight for action reconstruction loss (classifying which action was taken)
+    PRED_PATCH_W = 0.8  # Weight for patch-space reconstruction loss (visual quality anchor)
+    PRED_LATENT_W = 0.2  # Weight for latent-space prediction loss (main training signal)
+    PRED_ACTION_W = 0  # Weight for action reconstruction loss (disabled for now)
 
     # Action classification
     ENABLE_ACTION_CLASSIFIER = False  # Enable separate action classification module
@@ -101,6 +101,6 @@ ACTION_RANGES = {  # min, max for scaling to [-1, 1]
 ACTION_EMBED_DIM = 64          # learned action embedding dimension
 FILM_HIDDEN_DIM  = 128         # hidden width inside Action MLP
 FILM_BLOCK_IDS   = [0, 2]      # apply FiLM in early & mid transformer layers
-DELTA_LATENT     = True        # switch on residual prediction
+DELTA_LATENT     = False        # switch on residual prediction
 
 

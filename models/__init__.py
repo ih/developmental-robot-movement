@@ -11,7 +11,11 @@ from .vit_autoencoder import MaskedAutoencoderViT
 from .cnn_autoencoder import CNNAutoencoder
 
 # Predictor implementations
-from .transformer_predictor import TransformerActionConditionedPredictor
+from .transformer_predictor import (
+    TransformerActionConditionedPredictor,
+    get_action_config_for_robot,
+    create_transformer_predictor_for_robot
+)
 from .lstm_predictor import LSTMActionConditionedPredictor
 
 # Action classification
@@ -27,6 +31,8 @@ __all__ = [
     # Predictor implementations
     'TransformerActionConditionedPredictor',
     'LSTMActionConditionedPredictor',
+    'get_action_config_for_robot',
+    'create_transformer_predictor_for_robot',
     # Action classification
     'ActionClassifier'
 ]

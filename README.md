@@ -82,7 +82,7 @@ This repository contains research code for developmental robot movement with a m
 - **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for improved generalization
 - **TransformerActionConditionedPredictor**: Causal transformer that interleaves visual features with action tokens
 - **Fresh prediction training**: Predictors trained using fresh predictions with consistent loss calculation
-- **Dual loss training**: Combined patch-space reconstruction + latent-space prediction losses for encoder optimization (current weights: 1.0 patch, 0.2 latent)
+- **Dual loss training**: Combined patch-space reconstruction + latent-space prediction losses for encoder optimization (current weights: 0.8 patch, 0.2 latent)
 - **Action reconstruction loss**: Optional action classification from predicted features (currently disabled with weight 0)
 - **Joint training architecture**: Autoencoder reconstruction loss + action predictor gradient flow with shared encoder
 - **Sequence length management**: Handles long histories (4096 token capacity with clipping for GPU safety)
@@ -355,7 +355,7 @@ The following metrics are automatically logged when wandb is enabled:
 
 **Prediction System:**
 - **`predictor_training_loss`**: Combined patch + latent loss for predictor training (action loss currently disabled)
-- **`predictor_patch_loss`**: Patch-space reconstruction loss (anchors visual quality, weight=1.0)
+- **`predictor_patch_loss`**: Patch-space reconstruction loss (anchors visual quality, weight=0.8)
 - **`predictor_latent_loss`**: Latent-space prediction loss (trains encoder for predictability, weight=0.2)
 - **`predictor_action_loss`**: Action classification loss (currently disabled, weight=0)
 - **`predictor_explained_variance`**: R² in patch space - scale-invariant predictor quality metric (target: >0.2 indicates meaningful learning)
@@ -370,7 +370,7 @@ The following metrics are automatically logged when wandb is enabled:
 - **Sublayer tracking**: Separate metrics for self_attn, linear1, linear2, etc. components
 
 **Dual Loss Training Approach:**
-- **Patch loss (weight=1.0)**: Maintains visual reconstruction quality and prevents representation collapse
+- **Patch loss (weight=0.8)**: Maintains visual reconstruction quality and prevents representation collapse
 - **Latent loss (weight=0.2)**: Encourages encoder to learn prediction-friendly representations
 - **Action loss (weight=0.0)**: Action classification from predicted features (currently disabled)
 - **Combined approach**: Encoder gradients flow from both predictor and reconstruction tasks

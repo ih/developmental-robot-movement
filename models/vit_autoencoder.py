@@ -165,22 +165,26 @@ class MaskedAutoencoderViT(BaseAutoencoder):
         return latent  # Shape: [batch_size, num_patches + 1, embed_dim]
 
     def decode(self, latent_features):
-        """Decode latent features back to images (for visualization)"""
-        # Expand cls token to full sequence for decoder
+        """
+        Decode latent features back to images (for visualization).
+
+        Args:
+            latent_features: (batch_size, num_patches+1, embed_dim) tensor from encode()
+
+        Returns:
+            decoded_imgs: (batch_size, 3, H, W) tensor
+        """
         B = latent_features.shape[0]
         num_patches = self.patch_embed.num_patches
-        
-        # Create a dummy ids_restore (no masking)
+
+        # Create a dummy ids_restore (no masking - identity mapping)
         ids_restore = torch.arange(num_patches, device=latent_features.device).unsqueeze(0).repeat(B, 1)
-        
-        # Expand latent to include position for all patches (simplified)
-        x = latent_features.unsqueeze(1)  # Add sequence dim
-        # Pad with zeros for patch positions (this is a simplification)
-        x_padded = torch.cat([x, torch.zeros(B, num_patches, x.shape[-1], device=x.device)], dim=1)
-        
-        pred = self.forward_decoder(x_padded, ids_restore)
-        
-        # Reshape to image
+
+        # latent_features already has shape [B, num_patches+1, embed_dim]
+        # Pass directly to decoder
+        pred = self.forward_decoder(latent_features, ids_restore)
+
+        # Reshape patches to image
         pred = self.unpatchify(pred)
         return pred
 

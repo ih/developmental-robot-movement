@@ -130,7 +130,9 @@ def replay_single_session(session_dir, action_filter=None):
         logger.info("Replay finished - end of recording reached")
         return True
     except Exception as e:
+        import traceback
         logger.error(f"Replay failed: {e}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         return False
     finally:
         # Save final checkpoint after replay
