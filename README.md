@@ -111,6 +111,13 @@ This repository contains research code for developmental robot movement with a m
 ### Configuration
 - **config.py**: Contains image transforms, constants, and adaptive world model parameters
 - **AdaptiveWorldModelConfig class**: Centralized configuration for all model parameters
+- **Optimizer configuration**:
+  - AdamW optimizer with decoupled weight decay (0.01)
+  - Linear warmup: 600 steps from 0 → base LR
+  - Cosine decay: base LR → η_min over remaining steps
+  - η_min = max(base_lr × 0.01, 1e-6)
+  - Selective weight decay: excludes bias and LayerNorm parameters
+  - Base learning rates: AUTOENCODER_LR=1e-4, PREDICTOR_LR=1.5e-4
 - **Robot-specific directories**:
   - `JETBOT_CHECKPOINT_DIR = saved/checkpoints/jetbot/`
   - `TOROIDAL_DOT_CHECKPOINT_DIR = saved/checkpoints/toroidal_dot/`
@@ -343,6 +350,30 @@ model = AdaptiveWorldModel(robot_interface)
 - **Remote monitoring**: View current frame, decoded frame, and all action predictions via wandb interface
 - **Upload frequency**: Visualizations uploaded every 10 steps (configurable via `VISUALIZATION_UPLOAD_INTERVAL`)
 
+### Configuration Parameters
+
+The following configuration parameters are logged to wandb at initialization:
+
+**Optimizer Configuration:**
+- **`weight_decay`**: AdamW weight decay coefficient (0.01)
+- **`warmup_steps`**: Number of linear warmup steps (600)
+- **`lr_min_ratio`**: Minimum LR ratio for cosine decay (0.01)
+- **`autoencoder_lr`**: Base learning rate for autoencoder (1e-4)
+- **`predictor_lr`**: Base learning rate for predictor (1.5e-4)
+
+**Architecture and Training:**
+- **`mask_ratio_min`**: Minimum mask ratio for ViT (0.3)
+- **`mask_ratio_max`**: Maximum mask ratio for ViT (0.85)
+- **`pred_patch_w`**: Patch-space loss weight (0.8)
+- **`pred_latent_w`**: Latent-space loss weight (0.2)
+- **`pred_action_w`**: Action classification loss weight (0.0)
+
+**System Parameters:**
+- **`device`**: Training device (cuda/cpu)
+- **`reconstruction_threshold`**: Quality threshold for reconstruction (0.001)
+- **`prediction_threshold`**: Quality threshold for predictions (0.001)
+- **`prediction_history_size`**: Context size for predictions (3)
+
 ### Logged Metrics
 
 The following metrics are automatically logged when wandb is enabled:
@@ -427,7 +458,8 @@ The system automatically saves and loads learning progress to enable continuous 
 ### Saved Components
 
 - Neural network weights (autoencoder, predictors)
-- Optimizer states for continued training
+- Optimizer states (AdamW) for continued training
+- Learning rate scheduler states (warmup + cosine decay)
 - Training step counters and learning progress
 - Recent history buffers (last 100 entries)
 

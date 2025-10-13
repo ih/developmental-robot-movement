@@ -22,7 +22,10 @@ class AdaptiveWorldModelConfig:
 
     # Training parameters
     AUTOENCODER_LR = 1e-4
-    PREDICTOR_LR = 1e-4
+    PREDICTOR_LR = 1.5e-4  # Base learning rate for transformer/latent predictors
+    WEIGHT_DECAY = 0.01  # AdamW weight decay (decoupled, excludes bias/LayerNorm)
+    WARMUP_STEPS = 600  # Warmup steps (2-5% of total steps, or 1k-5k)
+    LR_MIN_RATIO = 1e-2  # η_min = η₀ × LR_MIN_RATIO, or 1e-6 minimum
     MASK_RATIO_MIN = 0.3  # Minimum mask ratio for randomized masking (ViT only)
     MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking (ViT only)
 

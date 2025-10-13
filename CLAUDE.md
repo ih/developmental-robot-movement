@@ -272,6 +272,7 @@ To add support for a new robot:
 
 ### Experiment Tracking
 - **Weights & Biases integration**: Pass `wandb_project` parameter to `AdaptiveWorldModel` constructor to enable logging
+- **Configuration logging**: Optimizer settings (weight_decay, warmup_steps, lr_min_ratio), learning rates, loss weights, and thresholds logged at initialization
 - **Core metrics**: `reconstruction_loss`, `autoencoder_training_loss`, `predictor_training_loss`, `step`, `training_step`
 - **Triple loss components**: `predictor_patch_loss` (visual quality anchor), `predictor_latent_loss` (prediction-friendly encoder training), `predictor_action_loss` (action classification from predicted features)
 - **Predictor quality**: `predictor_explained_variance` (R² in patch space - scale-invariant metric showing predictor improvement over baseline)
@@ -291,7 +292,8 @@ To add support for a new robot:
 - **Resume training**: Automatically loads existing checkpoints on startup (primary files first, then backup files)
 - **Saved components**:
   - Neural network weights (autoencoder, predictors)
-  - Optimizer states for continued training
+  - Optimizer states (AdamW) for continued training
+  - Learning rate scheduler states (warmup + cosine decay)
   - Training step counters and learning progress
   - Recent history buffers (last 100 entries)
 - **File naming**:
@@ -303,10 +305,17 @@ To add support for a new robot:
 - **Centralized parameters**: All adaptive world model parameters moved to `config.py` in `AdaptiveWorldModelConfig` class
 - **Recording configuration**: `RECORDING_MODE` boolean and `RECORDING_MAX_DISK_GB` for disk space management
 - **Configurable intervals**: Logging, visualization upload, checkpoint saving, and training display frequencies
+- **Optimizer configuration**:
+  - AdamW optimizer with decoupled weight decay (WEIGHT_DECAY=0.01)
+  - Linear warmup: WARMUP_STEPS=600 from 0 → base LR
+  - Cosine decay: base LR → η_min over remaining steps
+  - η_min = max(base_lr × LR_MIN_RATIO, 1e-6) where LR_MIN_RATIO=0.01
+  - Selective weight decay: excludes bias and LayerNorm parameters
+  - Scheduler states saved/loaded with checkpoints
 - **Training parameters**:
   - Mask ratio bounds (MASK_RATIO_MIN=0.3, MASK_RATIO_MAX=0.85)
-  - Learning rates (AUTOENCODER_LR=1e-4, PREDICTOR_LR=1e-4)
-  - Quality thresholds (RECONSTRUCTION_THRESHOLD=0.0005, PREDICTION_THRESHOLD=0.0005)
+  - Learning rates (AUTOENCODER_LR=1e-4, PREDICTOR_LR=1.5e-4)
+  - Quality thresholds (RECONSTRUCTION_THRESHOLD=0.001, PREDICTION_THRESHOLD=0.001)
 - **Action normalization parameters**: `ACTION_CHANNELS`, `ACTION_RANGES` define action space mapping to [-1, 1] for FiLM conditioning
 - **FiLM architecture parameters**: `ACTION_EMBED_DIM`, `FILM_HIDDEN_DIM`, `FILM_BLOCK_IDS` control action conditioning layer configuration
 - **Delta latent mode**: `DELTA_LATENT` flag enables residual prediction architecture for improved gradient flow

@@ -97,6 +97,9 @@ class AdaptiveWorldModel:
                 "prediction_threshold": AdaptiveWorldModelConfig.PREDICTION_THRESHOLD,
                 "autoencoder_lr": AdaptiveWorldModelConfig.AUTOENCODER_LR,
                 "predictor_lr": AdaptiveWorldModelConfig.PREDICTOR_LR,
+                "weight_decay": AdaptiveWorldModelConfig.WEIGHT_DECAY,
+                "warmup_steps": AdaptiveWorldModelConfig.WARMUP_STEPS,
+                "lr_min_ratio": AdaptiveWorldModelConfig.LR_MIN_RATIO,
                 "mask_ratio_min": AdaptiveWorldModelConfig.MASK_RATIO_MIN,
                 "mask_ratio_max": AdaptiveWorldModelConfig.MASK_RATIO_MAX,
                 "pred_patch_w": AdaptiveWorldModelConfig.PRED_PATCH_W,
@@ -202,6 +205,72 @@ class AdaptiveWorldModel:
             return self.explicit_predictor_lr
         else:
             return AdaptiveWorldModelConfig.PREDICTOR_LR
+
+    def _create_param_groups(self, model):
+        """
+        Create parameter groups for AdamW optimizer.
+
+        Separates parameters into two groups:
+        1. Parameters with weight decay (weights in Linear/Conv layers)
+        2. Parameters without weight decay (biases, LayerNorm params)
+
+        Returns:
+            List of parameter groups for optimizer
+        """
+        decay_params = []
+        no_decay_params = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Exclude bias and LayerNorm parameters from weight decay
+            # Common patterns: 'bias', 'norm', 'ln', 'bn' (batch norm)
+            if 'bias' in name or 'norm' in name.lower() or 'ln_' in name or 'bn' in name:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        return [
+            {'params': decay_params, 'weight_decay': AdaptiveWorldModelConfig.WEIGHT_DECAY},
+            {'params': no_decay_params, 'weight_decay': 0.0}
+        ]
+
+    def _create_scheduler(self, optimizer, total_steps=None):
+        """
+        Create warmup + cosine decay learning rate scheduler.
+
+        Args:
+            optimizer: The optimizer to schedule
+            total_steps: Total training steps (if None, uses a large default)
+
+        Returns:
+            Learning rate scheduler
+        """
+        warmup_steps = AdaptiveWorldModelConfig.WARMUP_STEPS
+
+        # If total_steps not provided, use a large value (can be updated later)
+        if total_steps is None:
+            total_steps = 100000  # Default to 100k steps
+
+        # Calculate minimum learning rate
+        base_lr = optimizer.param_groups[0]['lr']
+        lr_min = max(base_lr * AdaptiveWorldModelConfig.LR_MIN_RATIO, 1e-6)
+
+        # Create warmup + cosine decay scheduler using LambdaLR
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                # Linear warmup from 0 to 1
+                return float(current_step) / float(max(1, warmup_steps))
+            else:
+                # Cosine decay from 1 to lr_min_ratio
+                progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                cosine_decay = 0.5 * (1.0 + np.cos(np.pi * min(progress, 1.0)))
+                # Scale between lr_min_ratio and 1.0
+                min_ratio = lr_min / base_lr
+                return min_ratio + (1.0 - min_ratio) * cosine_decay
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     def _compute_grad_action_ratio(self, predictor):
         """
@@ -538,17 +607,19 @@ class AdaptiveWorldModel:
         # Create backup of existing checkpoint files before saving new ones
         self._backup_existing_checkpoints()
 
-        # Save autoencoder model and optimizer
+        # Save autoencoder model, optimizer, and scheduler
         torch.save({
             'model_state_dict': self.autoencoder.state_dict(),
             'optimizer_state_dict': getattr(self, 'autoencoder_optimizer', {}).state_dict() if hasattr(self, 'autoencoder_optimizer') else None,
+            'scheduler_state_dict': getattr(self, 'autoencoder_scheduler', {}).state_dict() if hasattr(self, 'autoencoder_scheduler') else None,
         }, os.path.join(self.checkpoint_dir, 'autoencoder.pth'))
 
-        # Save predictors
+        # Save predictors with schedulers
         for i, predictor in enumerate(self.predictors):
             torch.save({
                 'model_state_dict': predictor.state_dict() if hasattr(predictor, 'state_dict') else {},
                 'optimizer_state_dict': getattr(predictor, 'optimizer', {}).state_dict() if hasattr(predictor, 'optimizer') else None,
+                'scheduler_state_dict': getattr(predictor, 'scheduler', {}).state_dict() if hasattr(predictor, 'scheduler') else None,
                 'level': predictor.level,
             }, os.path.join(self.checkpoint_dir, f'predictor_{i}.pth'))
 
@@ -557,6 +628,7 @@ class AdaptiveWorldModel:
             torch.save({
                 'model_state_dict': self.action_classifier.state_dict(),
                 'optimizer_state_dict': getattr(self, 'action_classifier_optimizer', {}).state_dict() if hasattr(self, 'action_classifier_optimizer') else None,
+                'scheduler_state_dict': getattr(self, 'action_classifier_scheduler', {}).state_dict() if hasattr(self, 'action_classifier_scheduler') else None,
             }, os.path.join(self.checkpoint_dir, 'action_classifier.pth'))
 
         # Save learning progress and history (keep only recent history to avoid huge files)
@@ -634,13 +706,15 @@ class AdaptiveWorldModel:
         if os.path.exists(autoencoder_path):
             checkpoint = torch.load(autoencoder_path, map_location=self.device)
             self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
-            
-            # Restore optimizer (respecting explicit learning rate overrides)
+
+            # Restore optimizer and scheduler (respecting explicit learning rate overrides)
             opt_state = checkpoint.get('optimizer_state_dict')
             if opt_state is not None:
                 if not hasattr(self, 'autoencoder_optimizer'):
                     lr = self._get_autoencoder_lr()
-                    self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=lr)
+                    param_groups = self._create_param_groups(self.autoencoder)
+                    self.autoencoder_optimizer = torch.optim.AdamW(param_groups, lr=lr)
+                    self.autoencoder_scheduler = self._create_scheduler(self.autoencoder_optimizer)
 
                 if self.explicit_autoencoder_lr is None:
                     # Use saved optimizer state if no explicit override
@@ -650,6 +724,14 @@ class AdaptiveWorldModel:
                     print(f"Overriding autoencoder learning rate to {self.explicit_autoencoder_lr}")
                     for param_group in self.autoencoder_optimizer.param_groups:
                         param_group['lr'] = self.explicit_autoencoder_lr
+
+                # Restore scheduler state
+                scheduler_state = checkpoint.get('scheduler_state_dict')
+                if scheduler_state is not None and hasattr(self, 'autoencoder_scheduler'):
+                    try:
+                        self.autoencoder_scheduler.load_state_dict(scheduler_state)
+                    except Exception as e:
+                        print(f"Warning: Could not load autoencoder scheduler state: {e}")
             print("Autoencoder checkpoint loaded")
         
         # Load predictors (using backup if needed)
@@ -668,12 +750,14 @@ class AdaptiveWorldModel:
                 if hasattr(predictor, 'load_state_dict') and checkpoint['model_state_dict']:
                     predictor.load_state_dict(checkpoint['model_state_dict'])
 
-                # Restore optimizer (respecting explicit learning rate overrides)
+                # Restore optimizer and scheduler (respecting explicit learning rate overrides)
                 opt_state = checkpoint.get('optimizer_state_dict')
                 if opt_state is not None:
                     if not hasattr(predictor, 'optimizer'):
                         lr = self._get_predictor_lr()
-                        predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=lr)
+                        param_groups = self._create_param_groups(predictor)
+                        predictor.optimizer = torch.optim.AdamW(param_groups, lr=lr)
+                        predictor.scheduler = self._create_scheduler(predictor.optimizer)
 
                     if self.explicit_predictor_lr is None:
                         # Use saved optimizer state if no explicit override
@@ -684,6 +768,14 @@ class AdaptiveWorldModel:
                         for param_group in predictor.optimizer.param_groups:
                             param_group['lr'] = self.explicit_predictor_lr
 
+                    # Restore scheduler state
+                    scheduler_state = checkpoint.get('scheduler_state_dict')
+                    if scheduler_state is not None and hasattr(predictor, 'scheduler'):
+                        try:
+                            predictor.scheduler.load_state_dict(scheduler_state)
+                        except Exception as e:
+                            print(f"Warning: Could not load predictor scheduler state: {e}")
+
         # Load action classifier if it exists (using backup if needed)
         if self.action_classifier is not None:
             action_classifier_file = f'action_classifier{suffix}.pth'
@@ -692,16 +784,26 @@ class AdaptiveWorldModel:
                 checkpoint = torch.load(action_classifier_path, map_location=self.device)
                 self.action_classifier.load_state_dict(checkpoint['model_state_dict'])
 
-                # Restore optimizer
+                # Restore optimizer and scheduler
                 opt_state = checkpoint.get('optimizer_state_dict')
                 if opt_state is not None:
                     if not hasattr(self, 'action_classifier_optimizer'):
                         lr = self._get_predictor_lr()
-                        self.action_classifier_optimizer = torch.optim.Adam(
-                            self.action_classifier.parameters(),
+                        param_groups = self._create_param_groups(self.action_classifier)
+                        self.action_classifier_optimizer = torch.optim.AdamW(
+                            param_groups,
                             lr=lr
                         )
+                        self.action_classifier_scheduler = self._create_scheduler(self.action_classifier_optimizer)
                     self.action_classifier_optimizer.load_state_dict(opt_state)
+
+                    # Restore scheduler state
+                    scheduler_state = checkpoint.get('scheduler_state_dict')
+                    if scheduler_state is not None and hasattr(self, 'action_classifier_scheduler'):
+                        try:
+                            self.action_classifier_scheduler.load_state_dict(scheduler_state)
+                        except Exception as e:
+                            print(f"Warning: Could not load action classifier scheduler state: {e}")
                 print("Action classifier checkpoint loaded")
 
         # Load learning progress and history (using backup if needed)
@@ -1265,13 +1367,17 @@ class AdaptiveWorldModel:
         """Train neural predictor at specified level (gradients flow to autoencoder automatically)."""
         predictor = self.predictors[level]
 
-        # Initialize predictor optimizer if not exists
+        # Initialize predictor optimizer and scheduler if not exists
         if not hasattr(predictor, 'optimizer'):
-            predictor.optimizer = torch.optim.Adam(predictor.parameters(), lr=self._get_predictor_lr())
+            param_groups = self._create_param_groups(predictor)
+            predictor.optimizer = torch.optim.AdamW(param_groups, lr=self._get_predictor_lr())
+            predictor.scheduler = self._create_scheduler(predictor.optimizer)
 
-        # Initialize autoencoder optimizer for joint training
+        # Initialize autoencoder optimizer and scheduler for joint training
         if not hasattr(self, 'autoencoder_optimizer'):
-            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=self._get_autoencoder_lr())
+            param_groups = self._create_param_groups(self.autoencoder)
+            self.autoencoder_optimizer = torch.optim.AdamW(param_groups, lr=self._get_autoencoder_lr())
+            self.autoencoder_scheduler = self._create_scheduler(self.autoencoder_optimizer)
 
         # Ensure frame tensor lives on the correct device
         current_frame_tensor = current_frame_tensor.to(self.device)
@@ -1313,10 +1419,12 @@ class AdaptiveWorldModel:
         self.autoencoder_optimizer.zero_grad()
         if self.action_classifier is not None:
             if not hasattr(self, 'action_classifier_optimizer'):
-                self.action_classifier_optimizer = torch.optim.Adam(
-                    self.action_classifier.parameters(),
+                param_groups = self._create_param_groups(self.action_classifier)
+                self.action_classifier_optimizer = torch.optim.AdamW(
+                    param_groups,
                     lr=self._get_predictor_lr()
                 )
+                self.action_classifier_scheduler = self._create_scheduler(self.action_classifier_optimizer)
             self.action_classifier_optimizer.zero_grad()
 
         # Decode predicted features to image space
@@ -1373,6 +1481,14 @@ class AdaptiveWorldModel:
         if self.action_classifier is not None:
             self.action_classifier_optimizer.step()
 
+        # Step schedulers
+        if hasattr(predictor, 'scheduler'):
+            predictor.scheduler.step()
+        if hasattr(self, 'autoencoder_scheduler'):
+            self.autoencoder_scheduler.step()
+        if self.action_classifier is not None and hasattr(self, 'action_classifier_scheduler'):
+            self.action_classifier_scheduler.step()
+
         # Store last predictor loss for checkpoint persistence
         self.last_predictor_loss = prediction_loss.item()
 
@@ -1424,12 +1540,18 @@ class AdaptiveWorldModel:
         # Convert to properly scaled tensor
         frame_tensor = self.to_model_tensor(ground_truth_frame)
 
-        # Initialize optimizer if not exists
+        # Initialize optimizer and scheduler if not exists
         if not hasattr(self, 'autoencoder_optimizer'):
-            self.autoencoder_optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=self._get_autoencoder_lr())
+            param_groups = self._create_param_groups(self.autoencoder)
+            self.autoencoder_optimizer = torch.optim.AdamW(param_groups, lr=self._get_autoencoder_lr())
+            self.autoencoder_scheduler = self._create_scheduler(self.autoencoder_optimizer)
 
         # Use autoencoder's train_step method (architecture handles its own training details)
         train_loss_value = self.autoencoder.train_step(frame_tensor, self.autoencoder_optimizer)
+
+        # Step scheduler
+        if hasattr(self, 'autoencoder_scheduler'):
+            self.autoencoder_scheduler.step()
 
         # Log training loss to wandb
         if self.wandb_enabled:
