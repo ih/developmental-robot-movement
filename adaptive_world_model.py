@@ -704,7 +704,7 @@ class AdaptiveWorldModel:
         
         # Load autoencoder
         if os.path.exists(autoencoder_path):
-            checkpoint = torch.load(autoencoder_path, map_location=self.device)
+            checkpoint = torch.load(autoencoder_path, map_location=self.device, weights_only=False)
             self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
 
             # Restore optimizer and scheduler (respecting explicit learning rate overrides)
@@ -739,7 +739,7 @@ class AdaptiveWorldModel:
         predictor_files = [f for f in os.listdir(self.checkpoint_dir) if f.startswith('predictor_') and f.endswith(f'{suffix}.pth')]
         for predictor_file in sorted(predictor_files):
             predictor_path = os.path.join(self.checkpoint_dir, predictor_file)
-            checkpoint = torch.load(predictor_path, map_location=self.device)
+            checkpoint = torch.load(predictor_path, map_location=self.device, weights_only=False)
 
             # Find or create corresponding predictor
             # Extract index from filename like 'predictor_0_backup.pth' or 'predictor_0.pth'
@@ -781,7 +781,7 @@ class AdaptiveWorldModel:
             action_classifier_file = f'action_classifier{suffix}.pth'
             action_classifier_path = os.path.join(self.checkpoint_dir, action_classifier_file)
             if os.path.exists(action_classifier_path):
-                checkpoint = torch.load(action_classifier_path, map_location=self.device)
+                checkpoint = torch.load(action_classifier_path, map_location=self.device, weights_only=False)
                 self.action_classifier.load_state_dict(checkpoint['model_state_dict'])
 
                 # Restore optimizer and scheduler

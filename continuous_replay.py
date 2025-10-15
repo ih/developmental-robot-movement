@@ -245,6 +245,15 @@ def continuous_replay_with_plateau_detection(
             logger.info(f"Replay setup: {reader.total_steps} steps")
             logger.info(f"Robot type: {robot_type}")
 
+            # Set ACTION_CHANNELS and ACTION_RANGES based on robot type (before creating model)
+            if "toroidal" in robot_type.lower():
+                config.ACTION_CHANNELS = config.ToroidalDotConfig.ACTION_CHANNELS_DOT
+                config.ACTION_RANGES = config.ToroidalDotConfig.ACTION_RANGES_DOT
+                logger.info(f"Set ACTION_CHANNELS for ToroidalDotRobot: {config.ACTION_CHANNELS}")
+            else:
+                # Default to JetBot config (already set as defaults)
+                logger.info(f"Using default JetBot ACTION_CHANNELS: {config.ACTION_CHANNELS}")
+
             # Create world model on first epoch, reuse thereafter
             if world_model is None:
                 logger.info("Initializing AdaptiveWorldModel (first epoch)...")
