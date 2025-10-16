@@ -865,7 +865,7 @@ class AdaptiveWorldModel:
             reconstruction_threshold = AdaptiveWorldModelConfig.RECONSTRUCTION_THRESHOLD
             if reconstruction_loss > reconstruction_threshold:
                 # Train autoencoder if reconstruction is poor
-                train_loss = self.train_autoencoder(current_frame)
+                train_loss = self.train_autoencoder(frame_tensor)
 
                 # Show current and reconstructed frames while training (periodically)
                 # if self.autoencoder_training_step % AdaptiveWorldModelConfig.DISPLAY_TRAINING_INTERVAL == 0:
@@ -1535,11 +1535,13 @@ class AdaptiveWorldModel:
         return prediction_loss.item()
 
 
-    def train_autoencoder(self, ground_truth_frame):
-        """Train the autoencoder using its train_step method"""
-        # Convert to properly scaled tensor
-        frame_tensor = self.to_model_tensor(ground_truth_frame)
+    def train_autoencoder(self, frame_tensor):
+        """
+        Train the autoencoder using its train_step method.
 
+        Args:
+            frame_tensor: (batch_size, 3, H, W) tensor of images
+        """
         # Initialize optimizer and scheduler if not exists
         if not hasattr(self, 'autoencoder_optimizer'):
             param_groups = self._create_param_groups(self.autoencoder)

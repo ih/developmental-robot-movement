@@ -412,8 +412,7 @@ def run_predictor(frame_idx, history_length):
 
 def train_autoencoder_step_wrapper(frame_tensor):
     """Single autoencoder training step using AdaptiveWorldModel"""
-    frame_numpy = tensor_to_numpy_image(frame_tensor)
-    loss = adaptive_world_model.train_autoencoder(frame_numpy)
+    loss = adaptive_world_model.train_autoencoder(frame_tensor)
     return loss
 
 def train_autoencoder_threshold(frame_idx, threshold, max_steps, progress=gr.Progress()):
@@ -475,40 +474,46 @@ def train_autoencoder_steps(frame_idx, num_steps, progress=gr.Progress()):
     return train_autoencoder_threshold(frame_idx, 0.0, num_steps, progress)
 
 def train_predictor_threshold(frame_idx, history_length, threshold, max_steps, progress=gr.Progress()):
-    """Train predictor to threshold"""
+    """Train predictor to threshold - predicts current frame from past history"""
     if adaptive_world_model.autoencoder is None or not adaptive_world_model.predictors:
         return None, "Load both autoencoder and predictor checkpoints first.", "Error", "--"
 
     if not session_state.get("observations"):
         return None, "No session loaded.", "Error", "--"
 
-    observations = session_state["observations"]
     target_idx = frame_idx
-
     selected_obs, action_dicts, error = build_predictor_sequence(session_state, target_idx, history_length)
+
     if error:
         return None, f"**Cannot train predictor:** {error}", "Error", "--"
 
-    if target_idx + 1 >= len(observations):
-        return None, "**Cannot train predictor:** No next frame available.", "Error", "--"
+    if len(selected_obs) < 2:
+        return None, "**Cannot train predictor:** Need at least 2 frames.", "Error", "--"
 
-    next_obs = observations[target_idx + 1]
-    target_tensor = get_frame_tensor(session_state["session_dir"], next_obs["frame_path"]).unsqueeze(0).to(device)
+    if len(action_dicts) < 1:
+        return None, "**Cannot train predictor:** Need at least one action in history.", "Error", "--"
 
-    feature_history = []
-    for obs in selected_obs:
+    # Split into past and current (like run_predictor)
+    past_obs = selected_obs[:-1]
+    current_obs = selected_obs[-1]
+
+    past_actions = action_dicts[:-1] if len(action_dicts) > 1 else []
+    recorded_current_action = action_dicts[-1]
+
+    # Encode only past frames
+    past_feature_history = []
+    for obs in past_obs:
         tensor = get_frame_tensor(session_state["session_dir"], obs["frame_path"]).unsqueeze(0).to(device)
         adaptive_world_model.autoencoder.eval()
         with torch.no_grad():
             encoded = adaptive_world_model.autoencoder.encode(tensor).detach()
-        feature_history.append(encoded)
+        past_feature_history.append(encoded)
 
-    recorded_future_action, _ = get_future_action_for_prediction(session_state, target_idx)
-    if recorded_future_action is None:
-        recorded_future_action = {}
+    # Get current frame as target
+    current_tensor = get_frame_tensor(session_state["session_dir"], current_obs["frame_path"]).unsqueeze(0).to(device)
 
-    history_actions_with_future = [clone_action(action) for action in action_dicts]
-    history_actions_with_future.append(clone_action(recorded_future_action))
+    # Action setup: past actions + current action
+    history_actions_with_current = past_actions + [clone_action(recorded_current_action)]
 
     losses = []
     training_signals.reset_predictor()
@@ -521,25 +526,27 @@ def train_predictor_threshold(frame_idx, history_length, threshold, max_steps, p
         adaptive_world_model.autoencoder.train()
 
         try:
-            if history_actions_with_future:
-                action_normalized = normalize_action_dicts([history_actions_with_future[-1]]).to(device)
-            else:
-                action_normalized = torch.zeros(1, len(config.ACTION_CHANNELS), device=device)
+            # Normalize the current action (last action in history)
+            action_normalized = normalize_action_dicts([recorded_current_action]).to(device)
 
-            last_features = feature_history[-1] if feature_history else None
+            # Get last past features for delta prediction
+            last_past_features = past_feature_history[-1] if past_feature_history else None
 
+            # Predict current frame from past
             predicted_features = predictor(
-                feature_history,
-                history_actions_with_future,
+                past_feature_history,
+                history_actions_with_current,
                 action_normalized=action_normalized,
-                last_features=last_features
+                last_features=last_past_features
             )
+
+            # Train predictor using current frame as target
             loss = adaptive_world_model.train_predictor(
                 level=0,
-                current_frame_tensor=target_tensor,
+                current_frame_tensor=current_tensor,
                 predicted_features=predicted_features,
-                history_features=feature_history,
-                history_actions=history_actions_with_future,
+                history_features=past_feature_history,
+                history_actions=history_actions_with_current,
             )
         except Exception as exc:
             return None, f"**Training error:** {exc}", "Error", "--"
@@ -566,6 +573,7 @@ def train_predictor_threshold(frame_idx, history_length, threshold, max_steps, p
     status = f"Completed in {len(losses)} steps"
     loss_display = format_loss(final_loss) if final_loss is not None else "--"
     info = f"**Training completed after {len(losses)} steps**\n\nFinal total loss: {format_loss(final_loss)}"
+    info += f"\n\n**Training task:** Predict current frame (Frame {target_idx+1}) from {len(past_obs)} past frames"
 
     if final_loss <= threshold:
         info += f"\n\n**Target threshold {format_loss(threshold)} achieved!**"
@@ -632,7 +640,7 @@ with gr.Blocks(title="Session Explorer", theme=gr.themes.Soft()) as demo:
 
     # Predictor Inference
     gr.Markdown("## Predictor Inference")
-    gr.Markdown("History uses frames leading up to the current selection to predict the next observation.")
+    gr.Markdown("Uses past frames to predict the currently selected frame.")
 
     history_slider = gr.Slider(minimum=2, maximum=8, value=3, step=1, label="History Length")
     run_predictor_btn = gr.Button("Run Predictor", variant="primary")
@@ -666,7 +674,7 @@ with gr.Blocks(title="Session Explorer", theme=gr.themes.Soft()) as demo:
 
     # Predictor Training
     gr.Markdown("## Predictor Training")
-    gr.Markdown("Train the predictor using AdaptiveWorldModel with joint autoencoder training.")
+    gr.Markdown("Train the predictor to predict the current frame from past frames using AdaptiveWorldModel with joint autoencoder training.")
 
     with gr.Row():
         predictor_threshold = gr.Number(value=0.001, label="Threshold")
