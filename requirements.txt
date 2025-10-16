@@ -10,3 +10,5 @@ ipywidgets
 ipython
 tqdm
 wandb
+nest_asyncio
+gradio

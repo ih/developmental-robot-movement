@@ -69,16 +69,16 @@ This repository contains research code for developmental robot movement with a m
 
 ## Key Components
 
-### Session Explorer Notebook
-- **session_explorer.ipynb**: Interactive Jupyter notebook for exploring recorded sessions and training models. Browse recorded sessions with frame-by-frame playback, run autoencoder/predictor checkpoints against stored frames, and train models on specific frames or sequences using authentic AdaptiveWorldModel methods.
+### Session Explorer
+- **session_explorer_gradio.py**: Web-based Gradio interface for exploring recorded sessions and training models. Browse recorded sessions with frame-by-frame playback, run autoencoder/predictor checkpoints against stored frames, and train models on specific frames or sequences using authentic AdaptiveWorldModel methods.
+- **session_explorer_lib.py**: Shared library of utilities for session loading, frame processing, model management, and visualization. Provides reusable components for session exploration tools.
+- **SESSION_EXPLORER_GRADIO.md**: Comprehensive documentation for the Gradio session explorer interface including features, usage, configuration, and troubleshooting.
 - **Multi-robot support**: Automatically detects robot type from session metadata and loads appropriate checkpoints (JetBot or toroidal dot)
 - **Robot-agnostic exploration**: Works seamlessly with sessions from any robot type, dynamically adapting action space and model paths
-- **Action distribution analysis**: Automatic table showing action usage statistics when loading sessions, comparing current session vs all sessions with counts and percentages for each action in the action space
-- **Comprehensive weight visualization**: Real-time visualization of both autoencoder and predictor network weights during inference and training, including weight distribution histograms, layer norms, and detailed change tracking for transformer components (action embeddings, position embeddings, self-attention, MLP layers)
-- **Model saving capabilities**: Save trained autoencoder and predictor models with configurable paths, compatible with AdaptiveWorldModel checkpoint format
-- **Interactive training controls**: Pause and resume buttons for both autoencoder and predictor training with responsive UI updates and proper state management
-- **Attention introspection**: Visualize transformer attention patterns with heatmaps, breakdown charts, and quantitative metrics (APA, ALF, TTAR, RI@16, entropy)
+- **Web-based interface**: Modern Gradio UI accessible from any browser (default: http://localhost:7860), no Jupyter required
 - **Action space sweep**: Predictions across full robot action space with MSE for each action, clearly labeled with action values and recorded action indicator
+- **Progress tracking**: Built-in progress bars and live status updates during training
+- **Threshold and fixed-step training**: Train until loss reaches target threshold or for specified number of steps
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
@@ -223,6 +223,8 @@ Required Python packages:
 - ipywidgets, IPython (notebook compatibility)
 - tqdm (progress bars)
 - wandb (experiment tracking and logging)
+- gradio (web-based session explorer interface)
+- nest_asyncio (async support for Gradio)
 
 ## File Structure
 
@@ -247,8 +249,9 @@ Required Python packages:
 - `replay_robot.py`: Robot interface replacement for replaying recorded sessions
 - `recorded_policy.py`: Action selector factory for recorded action playback
 - `replay_session_example.py`: Robot-agnostic replay script for recorded sessions
-- `session_explorer.ipynb`: Interactive Jupyter notebook for multi-robot session exploration with automatic robot type detection
-- `session_explorer.py`: Python script version of session explorer notebook with identical functionality
+- `session_explorer_gradio.py`: Web-based Gradio interface for multi-robot session exploration and training
+- `session_explorer_lib.py`: Shared library of utilities for session management, frame processing, and model operations
+- `SESSION_EXPLORER_GRADIO.md`: Documentation for the Gradio session explorer interface
 - `test_jetbot_actions.ipynb`: Jupyter notebook for interactive JetBot action space testing
 - `test_toroidal_dot_actions.ipynb`: Jupyter notebook for interactive toroidal dot environment testing
 - `config.py`: Shared configuration, image transforms, robot-specific directories, and adaptive world model parameters
