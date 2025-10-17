@@ -13,7 +13,7 @@ import numpy as np
 import glob
 
 # Import necessary modules for direct execution
-from adaptive_world_model import AdaptiveWorldModel
+from autoencoder_latent_predictor_world_model import AutoencoderLatentPredictorWorldModel
 from recording_reader import RecordingReader
 from replay_robot import ReplayRobot
 from recorded_policy import create_recorded_action_selector
@@ -256,10 +256,10 @@ def continuous_replay_with_plateau_detection(
 
             # Create world model on first epoch, reuse thereafter
             if world_model is None:
-                logger.info("Initializing AdaptiveWorldModel (first epoch)...")
+                logger.info("Initializing AutoencoderLatentPredictorWorldModel (first epoch)...")
                 wandb_project = "ToroidalDotRobot-developmental-movement-replay"
 
-                world_model = AdaptiveWorldModel(
+                world_model = AutoencoderLatentPredictorWorldModel(
                     robot,
                     interactive=False,
                     wandb_project=wandb_project,

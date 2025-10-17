@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 import config
 from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
-from adaptive_world_model import AdaptiveWorldModel, normalize_action_dicts
+from autoencoder_latent_predictor_world_model import AutoencoderLatentPredictorWorldModel, normalize_action_dicts
 from robot_interface import RobotInterface
 from session_explorer_lib import *
 
@@ -154,11 +154,11 @@ def load_session(session_choice):
     DEFAULT_AUTOENCODER_PATH = os.path.join(checkpoint_dir, "autoencoder.pth")
     DEFAULT_PREDICTOR_PATH = os.path.join(checkpoint_dir, "predictor_0.pth")
 
-    # Recreate AdaptiveWorldModel if needed
+    # Recreate AutoencoderLatentPredictorWorldModel if needed
     if adaptive_world_model is None or current_robot_type != robot_type or current_checkpoint_dir != checkpoint_dir:
         current_robot_type = robot_type
         current_checkpoint_dir = checkpoint_dir
-        adaptive_world_model = AdaptiveWorldModel(
+        adaptive_world_model = AutoencoderLatentPredictorWorldModel(
             stub_robot,
             wandb_project=WANDB_PROJECT,
             checkpoint_dir=checkpoint_dir,
@@ -411,7 +411,7 @@ def run_predictor(frame_idx, history_length):
     return fig1, fig2, info
 
 def train_autoencoder_step_wrapper(frame_tensor):
-    """Single autoencoder training step using AdaptiveWorldModel"""
+    """Single autoencoder training step using AutoencoderLatentPredictorWorldModel"""
     loss = adaptive_world_model.train_autoencoder(frame_tensor)
     return loss
 
@@ -652,7 +652,7 @@ with gr.Blocks(title="Session Explorer", theme=gr.themes.Soft()) as demo:
 
     # Autoencoder Training
     gr.Markdown("## Autoencoder Training")
-    gr.Markdown("Train the autoencoder using AdaptiveWorldModel with randomized masking.")
+    gr.Markdown("Train the autoencoder using AutoencoderLatentPredictorWorldModel with randomized masking.")
 
     with gr.Row():
         autoencoder_threshold = gr.Number(value=0.001, label="Threshold")
@@ -674,7 +674,7 @@ with gr.Blocks(title="Session Explorer", theme=gr.themes.Soft()) as demo:
 
     # Predictor Training
     gr.Markdown("## Predictor Training")
-    gr.Markdown("Train the predictor to predict the current frame from past frames using AdaptiveWorldModel with joint autoencoder training.")
+    gr.Markdown("Train the predictor to predict the current frame from past frames using AutoencoderLatentPredictorWorldModel with joint autoencoder training.")
 
     with gr.Row():
         predictor_threshold = gr.Number(value=0.001, label="Threshold")

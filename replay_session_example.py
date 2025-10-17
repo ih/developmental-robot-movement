@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Example script showing how to replay recorded robot sessions
-using the AdaptiveWorldModel with RecordingReader and ReplayRobot.
+using the AutoencoderLatentPredictorWorldModel with RecordingReader and ReplayRobot.
 """
 
-from adaptive_world_model import AdaptiveWorldModel
+from autoencoder_latent_predictor_world_model import AutoencoderLatentPredictorWorldModel
 from recording_reader import RecordingReader
 from replay_robot import ReplayRobot
 from recorded_policy import create_recorded_action_selector
@@ -105,9 +105,9 @@ def replay_single_session(session_dir, action_filter=None):
         return False
 
     # Create world model for replay (no interactive mode, wandb enabled by default)
-    logger.info("Initializing AdaptiveWorldModel for replay...")
+    logger.info("Initializing AutoencoderLatentPredictorWorldModel for replay...")
 
-    world_model = AdaptiveWorldModel(
+    world_model = AutoencoderLatentPredictorWorldModel(
         robot,
         interactive=False,  # No interactive mode in replay
         wandb_project=wandb_project,

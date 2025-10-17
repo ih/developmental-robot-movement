@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Example script showing how to integrate JetBot with AdaptiveWorldModel
+Example script showing how to integrate JetBot with AutoencoderLatentPredictorWorldModel
 using the RobotInterface abstraction.
 """
 
 from jetbot_interface import JetBotInterface
-from adaptive_world_model import AdaptiveWorldModel
+from autoencoder_latent_predictor_world_model import AutoencoderLatentPredictorWorldModel
 from recording_writer import RecordingWriter
 from recording_robot import RecordingRobot
 import config
@@ -67,9 +67,9 @@ def main():
         robot = jetbot
 
     # Create world model with appropriate robot interface
-    logger.info("Initializing AdaptiveWorldModel...")
+    logger.info("Initializing AutoencoderLatentPredictorWorldModel...")
 
-    world_model = AdaptiveWorldModel(
+    world_model = AutoencoderLatentPredictorWorldModel(
         robot,
         interactive=config.INTERACTIVE_MODE,
         wandb_project="jetbot-developmental-movement-testing",

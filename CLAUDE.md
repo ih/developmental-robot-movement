@@ -9,7 +9,7 @@ This repository contains research code for developmental robot movement with a m
 1. **RobotInterface** (`robot_interface.py`) - Abstract base class defining robot interaction contract
 2. **JetBot Implementation** (`jetbot_interface.py`, `jetbot_remote_client.py`) - Concrete JetBot robot interface
 3. **Toroidal Dot Environment** (`toroidal_dot_env.py`, `toroidal_dot_interface.py`) - Simulated environment with white dot on black background for testing and debugging
-4. **Adaptive World Model** (`adaptive_world_model.py`) - Hierarchical world model with uncertainty-based action selection
+4. **Autoencoder Latent Predictor World Model** (`autoencoder_latent_predictor_world_model.py`) - Hierarchical world model with uncertainty-based action selection
 5. **Robot Runner** (`robot_runner.py`) - Lightweight action execution without learning components
 6. **Action Selectors** (`toroidal_action_selectors.py`, `recorded_policy.py`) - Pluggable action selection strategies
 7. **Integration Examples** (`jetbot_world_model_example.py`, `toroidal_dot_world_model_example.py`, `toroidal_dot_runner_example.py`) - Shows how to connect world model and runner with different robots/environments
@@ -36,7 +36,7 @@ This repository contains research code for developmental robot movement with a m
 - **Fast iteration**: No hardware needed, perfect for debugging and testing world model
 - **Configurable parameters**: Dot radius, movement speed, image size via ToroidalDotConfig
 
-### Adaptive World Model
+### Autoencoder Latent Predictor World Model
 - **Dependency injection**: Takes RobotInterface in constructor for modularity
 - **Main loop architecture**: Continuous cycle of perception → prediction → action selection → execution
 - **Neural vision system**: MaskedAutoencoderViT for visual encoding/decoding with joint training
@@ -65,12 +65,12 @@ This repository contains research code for developmental robot movement with a m
 - **Recorded action selector** (`recorded_policy.py`):
   - `create_recorded_action_selector(reader)`: Replays actions from recorded sessions
   - Optional action filtering for selective replay
-- **Usage**: Pass to `AdaptiveWorldModel` or `RobotRunner` via `action_selector` parameter
+- **Usage**: Pass to `AutoencoderLatentPredictorWorldModel` or `RobotRunner` via `action_selector` parameter
 
 ## Key Components
 
 ### Session Explorer
-- **session_explorer_gradio.py**: Web-based Gradio interface for exploring recorded sessions and training models. Browse recorded sessions with frame-by-frame playback, run autoencoder/predictor checkpoints against stored frames, and train models on specific frames or sequences using authentic AdaptiveWorldModel methods.
+- **session_explorer_gradio.py**: Web-based Gradio interface for exploring recorded sessions and training models. Browse recorded sessions with frame-by-frame playback, run autoencoder/predictor checkpoints against stored frames, and train models on specific frames or sequences using authentic AutoencoderLatentPredictorWorldModel methods.
 - **session_explorer_lib.py**: Shared library of utilities for session loading, frame processing, model management, and visualization. Provides reusable components for session exploration tools.
 - **SESSION_EXPLORER_GRADIO.md**: Comprehensive documentation for the Gradio session explorer interface including features, usage, configuration, and troubleshooting.
 - **Multi-robot support**: Automatically detects robot type from session metadata and loads appropriate checkpoints (JetBot or toroidal dot)
@@ -119,7 +119,7 @@ This repository contains research code for developmental robot movement with a m
 
 ### Configuration
 - **config.py**: Contains image transforms, constants, and adaptive world model parameters
-- **AdaptiveWorldModelConfig class**: Centralized configuration for all model parameters including thresholds, learning rates, and training intervals
+- **AutoencoderLatentPredictorWorldModelConfig class**: Centralized configuration for all model parameters including thresholds, learning rates, and training intervals
 - **Robot-specific directories**:
   - `JETBOT_CHECKPOINT_DIR = saved/checkpoints/jetbot/` - JetBot model checkpoints
   - `TOROIDAL_DOT_CHECKPOINT_DIR = saved/checkpoints/toroidal_dot/` - Toroidal dot model checkpoints
@@ -148,7 +148,7 @@ python jetbot_remote_client.py
 ```bash
 python jetbot_world_model_example.py
 ```
-- Integrates AdaptiveWorldModel with actual JetBot hardware
+- Integrates AutoencoderLatentPredictorWorldModel with actual JetBot hardware
 - Requires JetBot running RPyC server
 - Interactive mode with real robot control
 - Press Enter to continue with proposed action, type custom action dict, or 'stop' to exit
@@ -158,7 +158,7 @@ python jetbot_world_model_example.py
 
 ### World Model Testing (No Robot)
 ```bash
-python adaptive_world_model.py
+python autoencoder_latent_predictor_world_model.py
 ```
 - Runs world model with stub robot for testing
 - Shows visualization of predictions for all actions
@@ -169,7 +169,7 @@ python adaptive_world_model.py
 ```bash
 python toroidal_dot_world_model_example.py
 ```
-- Integrates AdaptiveWorldModel with simulated toroidal dot environment
+- Integrates AutoencoderLatentPredictorWorldModel with simulated toroidal dot environment
 - Perfect for debugging and fast iteration without hardware
 - Uses separate checkpoint directory (`saved/checkpoints/toroidal_dot/`)
 - Records to separate session directory (`saved/sessions/toroidal_dot/`)
@@ -238,7 +238,7 @@ Required Python packages:
   - `models/autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
   - `models/predictor.py`: TransformerActionConditionedPredictor with FiLM conditioning, delta latent prediction, image-based action classification, and attention introspection
   - `models/encoder_layer_with_attn.py`: Custom transformer encoder layer that optionally returns attention maps
-- `adaptive_world_model.py`: Main world model implementation with comprehensive training and logging
+- `autoencoder_latent_predictor_world_model.py`: Main world model implementation with comprehensive training and logging
 - `robot_runner.py`: Lightweight runner for executing actions without learning components
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
 - `toroidal_dot_world_model_example.py`: Integration example connecting toroidal dot environment with world model (uses SEQUENCE_ALWAYS_MOVE)
@@ -274,7 +274,7 @@ To add support for a new robot:
 - The world model will learn about all parameters in the action space
 
 ### Experiment Tracking
-- **Weights & Biases integration**: Pass `wandb_project` parameter to `AdaptiveWorldModel` constructor to enable logging
+- **Weights & Biases integration**: Pass `wandb_project` parameter to `AutoencoderLatentPredictorWorldModel` constructor to enable logging
 - **Configuration logging**: Optimizer settings (weight_decay, warmup_steps, lr_min_ratio), learning rates, loss weights, and thresholds logged at initialization
 - **Core metrics**: `reconstruction_loss`, `autoencoder_training_loss`, `predictor_training_loss`, `step`, `training_step`
 - **Triple loss components**: `predictor_patch_loss` (visual quality anchor), `predictor_latent_loss` (prediction-friendly encoder training), `predictor_action_loss` (action classification from predicted features)
@@ -284,7 +284,7 @@ To add support for a new robot:
 - **Fresh prediction quality**: `prediction_errors/level_X` for each predictor level (guides training decisions)
 - **Detailed transformer metrics**: Per-layer gradient norms and UWR for transformer layers (e.g., `grad_norms/transformer/transformer_layer_0_self_attn`, `uwr/transformer/transformer_layer_1_linear1`)
 - **New metrics**: `consecutive_autoencoder_iterations` and `predictor_training_iterations` for training phase analysis
-- **Usage**: `AdaptiveWorldModel(robot_interface, wandb_project="my-experiment")` or `None` to disable
+- **Usage**: `AutoencoderLatentPredictorWorldModel(robot_interface, wandb_project="my-experiment")` or `None` to disable
 
 ### Learning Progress Persistence
 - **Rolling backup system**: Automatic backup creation before each save for safety
@@ -302,10 +302,10 @@ To add support for a new robot:
 - **File naming**:
   - Primary files: `autoencoder.pth`, `predictor_0.pth`, `state.pkl`
   - Backup files: `autoencoder_backup.pth`, `predictor_0_backup.pth`, `state_backup.pkl`
-- **Usage**: `AdaptiveWorldModel(robot_interface, checkpoint_dir="jetbot_checkpoints")`
+- **Usage**: `AutoencoderLatentPredictorWorldModel(robot_interface, checkpoint_dir="jetbot_checkpoints")`
 
 ### Configuration Management
-- **Centralized parameters**: All adaptive world model parameters moved to `config.py` in `AdaptiveWorldModelConfig` class
+- **Centralized parameters**: All adaptive world model parameters moved to `config.py` in `AutoencoderLatentPredictorWorldModelConfig` class
 - **Recording configuration**: `RECORDING_MODE` boolean and `RECORDING_MAX_DISK_GB` for disk space management
 - **Configurable intervals**: Logging, visualization upload, checkpoint saving, and training display frequencies
 - **Optimizer configuration**:

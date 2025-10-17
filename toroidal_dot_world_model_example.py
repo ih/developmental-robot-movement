@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Example script showing how to integrate ToroidalDotRobot with AdaptiveWorldModel
+Example script showing how to integrate ToroidalDotRobot with AutoencoderLatentPredictorWorldModel
 using the RobotInterface abstraction.
 
 This demonstrates the world model learning in a simple simulated environment.
 """
 
 from toroidal_dot_interface import ToroidalDotRobot
-from adaptive_world_model import AdaptiveWorldModel
+from autoencoder_latent_predictor_world_model import AutoencoderLatentPredictorWorldModel
 from recording_writer import RecordingWriter
 from recording_robot import RecordingRobot
 from toroidal_action_selectors import create_sequence_action_selector, SEQUENCE_ALWAYS_MOVE
@@ -89,11 +89,11 @@ def main():
     action_selector = create_sequence_action_selector(SEQUENCE_ALWAYS_MOVE)
 
     # Create world model with appropriate robot interface
-    logger.info("Initializing AdaptiveWorldModel...")
+    logger.info("Initializing AutoencoderLatentPredictorWorldModel...")
     logger.info(f"Action space: {robot.action_space}")
     logger.info(f"Checkpoint directory: {config.TOROIDAL_DOT_CHECKPOINT_DIR}")
 
-    world_model = AdaptiveWorldModel(
+    world_model = AutoencoderLatentPredictorWorldModel(
         robot,
         interactive=config.INTERACTIVE_MODE,
         wandb_project="toroidal-dot-developmental-learning",

@@ -243,8 +243,8 @@ class MaskedAutoencoderViT(BaseAutoencoder):
         import config as cfg
 
         # Randomly sample mask ratio for this training step
-        mask_ratio_min = kwargs.get('mask_ratio_min', cfg.AdaptiveWorldModelConfig.MASK_RATIO_MIN)
-        mask_ratio_max = kwargs.get('mask_ratio_max', cfg.AdaptiveWorldModelConfig.MASK_RATIO_MAX)
+        mask_ratio_min = kwargs.get('mask_ratio_min', cfg.AutoencoderLatentPredictorWorldModelConfig.MASK_RATIO_MIN)
+        mask_ratio_max = kwargs.get('mask_ratio_max', cfg.AutoencoderLatentPredictorWorldModelConfig.MASK_RATIO_MAX)
         mask_ratio = random.uniform(mask_ratio_min, mask_ratio_max)
 
         # Zero gradients

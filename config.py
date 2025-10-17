@@ -6,8 +6,8 @@ TRANSFORM = transforms.Compose([
     transforms.ToTensor()
 ])
 
-# Adaptive World Model Parameters
-class AdaptiveWorldModelConfig:
+# Autoencoder Latent Predictor World Model Parameters
+class AutoencoderLatentPredictorWorldModelConfig:
     # Architecture selection
     AUTOENCODER_TYPE = "vit"  # Options: "vit" (Vision Transformer MAE), "cnn" (Convolutional)
     PREDICTOR_TYPE = "transformer"  # Options: "transformer", "lstm"

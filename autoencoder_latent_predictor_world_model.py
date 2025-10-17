@@ -1,4 +1,4 @@
-﻿# Adaptive World Model with Hierarchical Action Learning
+﻿# Autoencoder Latent Predictor World Model with Hierarchical Action Learning
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,7 +19,7 @@ from models import (
 )
 from models.action_classifier import ActionClassifier
 from models.transformer_predictor import action_dict_to_index
-from config import AdaptiveWorldModelConfig
+from config import AutoencoderLatentPredictorWorldModelConfig
 import config
 
 
@@ -64,7 +64,7 @@ def normalize_action_dicts(action_dicts):
 
     return normalized_actions
 
-class AdaptiveWorldModel:
+class AutoencoderLatentPredictorWorldModel:
     def __init__(self, robot_interface, interactive=False, wandb_project=None, checkpoint_dir="checkpoints", autoencoder_lr=None, predictor_lr=None, action_selector=None):
         # Store the robot interface
         self.robot = robot_interface
@@ -74,7 +74,7 @@ class AdaptiveWorldModel:
 
         # Checkpoint management
         self.checkpoint_dir = checkpoint_dir
-        self.save_interval = AdaptiveWorldModelConfig.CHECKPOINT_SAVE_INTERVAL
+        self.save_interval = AutoencoderLatentPredictorWorldModelConfig.CHECKPOINT_SAVE_INTERVAL
 
         # Store explicit learning rates for potential override
         self.explicit_autoencoder_lr = autoencoder_lr
@@ -89,24 +89,24 @@ class AdaptiveWorldModel:
             wandb.init(project=wandb_project, config={
                 "device": str(self.device),
                 "interactive": interactive,
-                "lookahead": AdaptiveWorldModelConfig.LOOKAHEAD,
-                "max_lookahead_margin": AdaptiveWorldModelConfig.MAX_LOOKAHEAD_MARGIN,
-                "prediction_history_size": AdaptiveWorldModelConfig.PREDICTION_HISTORY_SIZE,
-                "uncertainty_threshold": AdaptiveWorldModelConfig.UNCERTAINTY_THRESHOLD,
-                "reconstruction_threshold": AdaptiveWorldModelConfig.RECONSTRUCTION_THRESHOLD,
-                "prediction_threshold": AdaptiveWorldModelConfig.PREDICTION_THRESHOLD,
-                "autoencoder_lr": AdaptiveWorldModelConfig.AUTOENCODER_LR,
-                "predictor_lr": AdaptiveWorldModelConfig.PREDICTOR_LR,
-                "weight_decay": AdaptiveWorldModelConfig.WEIGHT_DECAY,
-                "warmup_steps": AdaptiveWorldModelConfig.WARMUP_STEPS,
-                "lr_min_ratio": AdaptiveWorldModelConfig.LR_MIN_RATIO,
-                "mask_ratio_min": AdaptiveWorldModelConfig.MASK_RATIO_MIN,
-                "mask_ratio_max": AdaptiveWorldModelConfig.MASK_RATIO_MAX,
-                "pred_patch_w": AdaptiveWorldModelConfig.PRED_PATCH_W,
-                "pred_latent_w": AdaptiveWorldModelConfig.PRED_LATENT_W,
-                "pred_action_w": AdaptiveWorldModelConfig.PRED_ACTION_W,
-                "max_history_size": AdaptiveWorldModelConfig.MAX_HISTORY_SIZE,
-                "checkpoint_history_limit": AdaptiveWorldModelConfig.CHECKPOINT_HISTORY_LIMIT,
+                "lookahead": AutoencoderLatentPredictorWorldModelConfig.LOOKAHEAD,
+                "max_lookahead_margin": AutoencoderLatentPredictorWorldModelConfig.MAX_LOOKAHEAD_MARGIN,
+                "prediction_history_size": AutoencoderLatentPredictorWorldModelConfig.PREDICTION_HISTORY_SIZE,
+                "uncertainty_threshold": AutoencoderLatentPredictorWorldModelConfig.UNCERTAINTY_THRESHOLD,
+                "reconstruction_threshold": AutoencoderLatentPredictorWorldModelConfig.RECONSTRUCTION_THRESHOLD,
+                "prediction_threshold": AutoencoderLatentPredictorWorldModelConfig.PREDICTION_THRESHOLD,
+                "autoencoder_lr": AutoencoderLatentPredictorWorldModelConfig.AUTOENCODER_LR,
+                "predictor_lr": AutoencoderLatentPredictorWorldModelConfig.PREDICTOR_LR,
+                "weight_decay": AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY,
+                "warmup_steps": AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS,
+                "lr_min_ratio": AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO,
+                "mask_ratio_min": AutoencoderLatentPredictorWorldModelConfig.MASK_RATIO_MIN,
+                "mask_ratio_max": AutoencoderLatentPredictorWorldModelConfig.MASK_RATIO_MAX,
+                "pred_patch_w": AutoencoderLatentPredictorWorldModelConfig.PRED_PATCH_W,
+                "pred_latent_w": AutoencoderLatentPredictorWorldModelConfig.PRED_LATENT_W,
+                "pred_action_w": AutoencoderLatentPredictorWorldModelConfig.PRED_ACTION_W,
+                "max_history_size": AutoencoderLatentPredictorWorldModelConfig.MAX_HISTORY_SIZE,
+                "checkpoint_history_limit": AutoencoderLatentPredictorWorldModelConfig.CHECKPOINT_HISTORY_LIMIT,
             })
             self.wandb_enabled = True
         else:
@@ -124,14 +124,14 @@ class AdaptiveWorldModel:
 
         # Optional action classifier for action reconstruction loss
         self.action_classifier = None
-        if AdaptiveWorldModelConfig.ENABLE_ACTION_CLASSIFIER:
+        if AutoencoderLatentPredictorWorldModelConfig.ENABLE_ACTION_CLASSIFIER:
             self.action_classifier = ActionClassifier(num_actions=len(self.base_actions)).to(self.device)
 
         # Parameters from config
-        self.lookahead = AdaptiveWorldModelConfig.LOOKAHEAD
-        self.max_lookahead_margin = AdaptiveWorldModelConfig.MAX_LOOKAHEAD_MARGIN
-        self.prediction_history_size = AdaptiveWorldModelConfig.PREDICTION_HISTORY_SIZE
-        self.uncertainty_threshold = AdaptiveWorldModelConfig.UNCERTAINTY_THRESHOLD
+        self.lookahead = AutoencoderLatentPredictorWorldModelConfig.LOOKAHEAD
+        self.max_lookahead_margin = AutoencoderLatentPredictorWorldModelConfig.MAX_LOOKAHEAD_MARGIN
+        self.prediction_history_size = AutoencoderLatentPredictorWorldModelConfig.PREDICTION_HISTORY_SIZE
+        self.uncertainty_threshold = AutoencoderLatentPredictorWorldModelConfig.UNCERTAINTY_THRESHOLD
         self.interactive = interactive
 
         # Matplotlib figure for persistent display
@@ -163,7 +163,7 @@ class AdaptiveWorldModel:
 
     def _create_autoencoder(self):
         """Factory method to create autoencoder based on configuration"""
-        autoencoder_type = AdaptiveWorldModelConfig.AUTOENCODER_TYPE.lower()
+        autoencoder_type = AutoencoderLatentPredictorWorldModelConfig.AUTOENCODER_TYPE.lower()
 
         if autoencoder_type == "vit":
             return MaskedAutoencoderViT()
@@ -174,7 +174,7 @@ class AdaptiveWorldModel:
 
     def _create_predictor(self, level=0):
         """Factory method to create predictor based on configuration"""
-        predictor_type = AdaptiveWorldModelConfig.PREDICTOR_TYPE.lower()
+        predictor_type = AutoencoderLatentPredictorWorldModelConfig.PREDICTOR_TYPE.lower()
 
         if predictor_type == "transformer":
             return TransformerActionConditionedPredictor(
@@ -197,14 +197,14 @@ class AdaptiveWorldModel:
         elif hasattr(self, 'autoencoder_optimizer') and self.autoencoder_optimizer is not None:
             return self.autoencoder_optimizer.param_groups[0]['lr']
         else:
-            return AdaptiveWorldModelConfig.AUTOENCODER_LR
+            return AutoencoderLatentPredictorWorldModelConfig.AUTOENCODER_LR
 
     def _get_predictor_lr(self):
         """Get predictor learning rate using hierarchy: explicit > saved optimizer > config"""
         if self.explicit_predictor_lr is not None:
             return self.explicit_predictor_lr
         else:
-            return AdaptiveWorldModelConfig.PREDICTOR_LR
+            return AutoencoderLatentPredictorWorldModelConfig.PREDICTOR_LR
 
     def _create_param_groups(self, model):
         """
@@ -232,7 +232,7 @@ class AdaptiveWorldModel:
                 decay_params.append(param)
 
         return [
-            {'params': decay_params, 'weight_decay': AdaptiveWorldModelConfig.WEIGHT_DECAY},
+            {'params': decay_params, 'weight_decay': AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY},
             {'params': no_decay_params, 'weight_decay': 0.0}
         ]
 
@@ -247,7 +247,7 @@ class AdaptiveWorldModel:
         Returns:
             Learning rate scheduler
         """
-        warmup_steps = AdaptiveWorldModelConfig.WARMUP_STEPS
+        warmup_steps = AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS
 
         # If total_steps not provided, use a large value (can be updated later)
         if total_steps is None:
@@ -255,7 +255,7 @@ class AdaptiveWorldModel:
 
         # Calculate minimum learning rate
         base_lr = optimizer.param_groups[0]['lr']
-        lr_min = max(base_lr * AdaptiveWorldModelConfig.LR_MIN_RATIO, 1e-6)
+        lr_min = max(base_lr * AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO, 1e-6)
 
         # Create warmup + cosine decay scheduler using LambdaLR
         def lr_lambda(current_step):
@@ -406,8 +406,8 @@ class AdaptiveWorldModel:
 
             # Combine losses with weights
             total = (
-                AdaptiveWorldModelConfig.PRED_PATCH_W * loss_img
-                + AdaptiveWorldModelConfig.PRED_LATENT_W * loss_lat
+                AutoencoderLatentPredictorWorldModelConfig.PRED_PATCH_W * loss_img
+                + AutoencoderLatentPredictorWorldModelConfig.PRED_LATENT_W * loss_lat
             )
 
             return total, loss_img, loss_lat, pred_img, target_lat
@@ -632,7 +632,7 @@ class AdaptiveWorldModel:
             }, os.path.join(self.checkpoint_dir, 'action_classifier.pth'))
 
         # Save learning progress and history (keep only recent history to avoid huge files)
-        history_limit = AdaptiveWorldModelConfig.CHECKPOINT_HISTORY_LIMIT
+        history_limit = AutoencoderLatentPredictorWorldModelConfig.CHECKPOINT_HISTORY_LIMIT
         state = {
             'autoencoder_training_step': self.autoencoder_training_step,
             'predictor_training_step': self.predictor_training_step,
@@ -857,18 +857,18 @@ class AdaptiveWorldModel:
                 reconstruction_loss = self.autoencoder.compute_reconstruction_loss(frame_tensor).item()
             
             # Log reconstruction loss to wandb (periodically)
-            if self.wandb_enabled and self.autoencoder_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+            if self.wandb_enabled and self.autoencoder_training_step % AutoencoderLatentPredictorWorldModelConfig.LOG_INTERVAL == 0:
                 wandb.log({
                     "reconstruction_loss": reconstruction_loss
                 })
             
-            reconstruction_threshold = AdaptiveWorldModelConfig.RECONSTRUCTION_THRESHOLD
+            reconstruction_threshold = AutoencoderLatentPredictorWorldModelConfig.RECONSTRUCTION_THRESHOLD
             if reconstruction_loss > reconstruction_threshold:
                 # Train autoencoder if reconstruction is poor
                 train_loss = self.train_autoencoder(frame_tensor)
 
                 # Show current and reconstructed frames while training (periodically)
-                # if self.autoencoder_training_step % AdaptiveWorldModelConfig.DISPLAY_TRAINING_INTERVAL == 0:
+                # if self.autoencoder_training_step % AutoencoderLatentPredictorWorldModelConfig.DISPLAY_TRAINING_INTERVAL == 0:
                 #     self.display_reconstruction_training(current_frame, decoded_frame, reconstruction_loss)
                 self.autoencoder_training_step += 1
                 self.consecutive_autoencoder_iterations += 1
@@ -914,7 +914,7 @@ class AdaptiveWorldModel:
                 prediction_errors = self.evaluate_fresh_predictions(fresh_predictions, frame_tensor)
 
                 # Log prediction errors to wandb (periodically)
-                if self.wandb_enabled and self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+                if self.wandb_enabled and self.predictor_training_step % AutoencoderLatentPredictorWorldModelConfig.LOG_INTERVAL == 0:
                     log_dict = {}
 
                     # Log individual predictor errors with grouping
@@ -924,7 +924,7 @@ class AdaptiveWorldModel:
                     wandb.log(log_dict)
 
                 # Train once on predictors that have errors above threshold
-                prediction_threshold = AdaptiveWorldModelConfig.PREDICTION_THRESHOLD
+                prediction_threshold = AutoencoderLatentPredictorWorldModelConfig.PREDICTION_THRESHOLD
                 for level, error in enumerate(prediction_errors):
                     if error > prediction_threshold:
                         self.train_predictor(
@@ -943,7 +943,7 @@ class AdaptiveWorldModel:
 
             # Display frames for visual feedback (on interval, or always in interactive mode)
             self.display_counter += 1
-            should_display = (self.display_counter % AdaptiveWorldModelConfig.DISPLAY_INTERVAL == 0) or self.interactive
+            should_display = (self.display_counter % AutoencoderLatentPredictorWorldModelConfig.DISPLAY_INTERVAL == 0) or self.interactive
             if should_display:
                 try:
                     self.display_frames(current_frame, decoded_frame, all_action_predictions, prediction_errors, reconstruction_loss)
@@ -968,7 +968,7 @@ class AdaptiveWorldModel:
                 self.action_time_intervals.append(time_between_actions)
 
                 # Log action timing statistics periodically
-                if self.wandb_enabled and self.action_count % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+                if self.wandb_enabled and self.action_count % AutoencoderLatentPredictorWorldModelConfig.LOG_INTERVAL == 0:
                     if self.action_time_intervals:
                         wandb.log({
                             "action_timing/mean_interval": np.mean(self.action_time_intervals),
@@ -987,10 +987,10 @@ class AdaptiveWorldModel:
             self.make_predictions(current_features, action_to_execute)
             
             # Add delay between actions
-            time.sleep(AdaptiveWorldModelConfig.ACTION_DELAY)
+            time.sleep(AutoencoderLatentPredictorWorldModelConfig.ACTION_DELAY)
             
             # Step 6: Upload visualizations periodically
-            if self.wandb_enabled and self.action_count % AdaptiveWorldModelConfig.VISUALIZATION_UPLOAD_INTERVAL == 0:
+            if self.wandb_enabled and self.action_count % AutoencoderLatentPredictorWorldModelConfig.VISUALIZATION_UPLOAD_INTERVAL == 0:
                 self.upload_visualizations_to_wandb(current_frame, decoded_frame, all_action_predictions, prediction_errors, reconstruction_loss)
             
             # Step 7: Update history buffers
@@ -1456,9 +1456,9 @@ class AdaptiveWorldModel:
                     loss_action = F.cross_entropy(action_logits, action_target)
 
         # Combine losses with weights
-        w_image = AdaptiveWorldModelConfig.PRED_PATCH_W  # Renamed but same weight
-        w_latent = AdaptiveWorldModelConfig.PRED_LATENT_W
-        w_action = AdaptiveWorldModelConfig.PRED_ACTION_W
+        w_image = AutoencoderLatentPredictorWorldModelConfig.PRED_PATCH_W  # Renamed but same weight
+        w_latent = AutoencoderLatentPredictorWorldModelConfig.PRED_LATENT_W
+        w_action = AutoencoderLatentPredictorWorldModelConfig.PRED_ACTION_W
         prediction_loss = w_image * loss_image + w_latent * loss_latent + w_action * loss_action
 
         # Backward pass - this will train both predictor and autoencoder!
@@ -1471,7 +1471,7 @@ class AdaptiveWorldModel:
 
         # Capture weights before step for UWR calculation (throttled)
         weights_before = {}
-        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+        if self.predictor_training_step % AutoencoderLatentPredictorWorldModelConfig.LOG_INTERVAL == 0:
             for name, param in predictor.named_parameters():
                 if param.grad is not None:
                     weights_before[name] = param.data.clone()
@@ -1493,7 +1493,7 @@ class AdaptiveWorldModel:
         self.last_predictor_loss = prediction_loss.item()
 
         # Calculate detailed metrics periodically to reduce overhead
-        if self.predictor_training_step % AdaptiveWorldModelConfig.LOG_INTERVAL == 0:
+        if self.predictor_training_step % AutoencoderLatentPredictorWorldModelConfig.LOG_INTERVAL == 0:
             # Calculate all metrics together
             detailed_metrics = self._calculate_predictor_metrics(predictor, pred_image, current_frame_tensor, weights_before)
             # Log predictor training metrics to wandb
@@ -1629,7 +1629,7 @@ class AdaptiveWorldModel:
     
     def maintain_history_window(self):
         """Keep history buffers at reasonable size"""
-        max_history = AdaptiveWorldModelConfig.MAX_HISTORY_SIZE
+        max_history = AutoencoderLatentPredictorWorldModelConfig.MAX_HISTORY_SIZE
         
         if len(self.frame_features_history) > max_history:
             self.frame_features_history = self.frame_features_history[-max_history:]
@@ -1840,7 +1840,7 @@ if __name__ == "__main__":
     # Interactive mode with stub robot
     stub_robot = StubRobot()
     # Enable wandb logging by providing a project name, or set to None to disable
-    model = AdaptiveWorldModel(stub_robot, interactive=True, wandb_project="adaptive-world-model-test")
+    model = AutoencoderLatentPredictorWorldModel(stub_robot, interactive=True, wandb_project="adaptive-world-model-test")
     try:
         model.main_loop()
     except KeyboardInterrupt:
