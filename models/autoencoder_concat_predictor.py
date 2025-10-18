@@ -281,14 +281,11 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
 # ------------------------------
 
 def canvas_to_tensor(canvas: np.ndarray) -> torch.Tensor:
-    """Convert HxWx3 uint8 canvas -> [1,3,H,W] float tensor 0..1 using config.TRANSFORM if available."""
-    pil = Image.fromarray(canvas)
-    if TRANSFORM is not None:
-        t = TRANSFORM(pil)              # [3,H,W], 0..1
-    else:
-        arr = np.asarray(pil).astype("float32") / 255.0
-        arr = np.transpose(arr, (2,0,1))
-        t = torch.from_numpy(arr)
+    """Convert HxWx3 uint8 canvas -> [1,3,H,W] float tensor 0..1 without resizing."""
+    # Don't use TRANSFORM here - canvas is multi-frame and should not be resized
+    arr = canvas.astype("float32") / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    t = torch.from_numpy(arr)
     return t.unsqueeze(0)
 
 @torch.no_grad()

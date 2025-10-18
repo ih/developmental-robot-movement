@@ -42,6 +42,7 @@ class AutoencoderConcatPredictorWorldModel:
         robot_interface: RobotInterface,
         action_selector: Optional[Callable] = None,
         device: Optional[torch.device] = None,
+        training_callback: Optional[Callable] = None,
     ):
         """
         Initialize the autoencoder concat predictor world model.
@@ -51,14 +52,21 @@ class AutoencoderConcatPredictorWorldModel:
             action_selector: Function that takes (observation, action_space) and returns (action, metadata)
                            If None, uses default random action selection
             device: torch.device for model computations (defaults to cuda if available)
+            training_callback: Optional callback(iteration, loss) called after each training step
         """
         self.robot = robot_interface
         self.action_selector = action_selector or self._default_action_selector
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.training_callback = training_callback
 
-        # Initialize autoencoder model
+        # Initialize autoencoder model for canvas dimensions
+        # Canvas: height=224, width = CANVAS_HISTORY_SIZE * 224 + (CANVAS_HISTORY_SIZE - 1) * SEPARATOR_WIDTH
+        canvas_height = Config.FRAME_SIZE[0]
+        canvas_width = Config.CANVAS_HISTORY_SIZE * Config.FRAME_SIZE[1] + (Config.CANVAS_HISTORY_SIZE - 1) * Config.SEPARATOR_WIDTH
+
         self.autoencoder = TargetedMAEWrapper(
-            image_size=Config.FRAME_SIZE[0],
+            img_height=canvas_height,
+            img_width=canvas_width,
             patch_size=16,
             embed_dim=256,
             decoder_embed_dim=128,
@@ -85,54 +93,73 @@ class AutoencoderConcatPredictorWorldModel:
         # Store last prediction for comparison with current frame
         self.last_prediction = None
 
+        # Visualization state tracking
+        self.last_training_canvas = None
+        self.last_training_canvas_reconstruction = None
+        self.last_training_loss = None
+        self.last_training_iterations = 0
+        self.last_training_loss_history = []  # List of losses during last training
+        self.last_prediction_canvas = None
+
         print(f"AutoencoderConcatPredictorWorldModel initialized on {self.device}")
         print(f"Canvas history size: {Config.CANVAS_HISTORY_SIZE}")
         print(f"Frame size: {Config.FRAME_SIZE}")
         print(f"Separator width: {Config.SEPARATOR_WIDTH}")
 
-    def _default_action_selector(self, observation: np.ndarray, action_space: list) -> Tuple[dict, dict]:
+    def _default_action_selector(self, observation: np.ndarray, action_space: list) -> dict:
         """Default random action selection."""
         import random
         action = random.choice(action_space)
-        metadata = {"selection_method": "random"}
-        return action, metadata
+        return action
 
-    def train_canvas_reconstruction(self, training_canvas: np.ndarray, num_frames: int) -> float:
+    def train_autoencoder(self, training_canvas: np.ndarray) -> float:
         """
-        Train autoencoder to reconstruct canvas until loss below threshold.
+        Train the autoencoder on a canvas using standard random masking.
 
         Args:
-            training_canvas: HxWx3 canvas with history frames
-            num_frames: Number of frames in canvas
+            training_canvas: HxWx3 canvas numpy array (uint8)
 
         Returns:
-            Final reconstruction loss
+            loss_value: float, the loss value for this training step
         """
         # Convert canvas to tensor
         canvas_tensor = canvas_to_tensor(training_canvas).to(self.device)
 
-        # Compute patch mask for last slot
-        H, W = canvas_tensor.shape[-2:]
-        patch_mask = compute_patch_mask_for_last_slot(
-            img_size=(H, W),
-            patch_size=16,
-            K=num_frames,
-            sep_width=Config.SEPARATOR_WIDTH,
-        ).to(self.device)
-
-        # Train until reconstruction loss below threshold
+        # Use standard train_step with random masking
         self.autoencoder.train()
-        loss = float('inf')
+        loss_value = self.autoencoder.train_step(canvas_tensor, self.ae_optimizer)
+        self.ae_scheduler.step()
+        return loss_value
 
-        while loss > Config.CANVAS_RECONSTRUCTION_THRESHOLD:
-            loss = self.autoencoder.train_on_canvas(
-                canvas_tensor,
-                patch_mask,
-                self.ae_optimizer
-            )
-            self.ae_scheduler.step()
+    def reset_state(self):
+        """Reset the world model state for a new session."""
+        self.interleaved_history = []
+        self.last_prediction = None
+        self.last_training_canvas = None
+        self.last_training_canvas_reconstruction = None
+        self.last_training_loss = None
+        self.last_training_iterations = 0
+        self.last_training_loss_history = []
+        self.last_prediction_canvas = None
 
-        return loss
+    def get_canvas_reconstruction(self, canvas: np.ndarray) -> np.ndarray:
+        """
+        Get reconstruction of a canvas for visualization.
+
+        Args:
+            canvas: HxWx3 canvas numpy array (uint8)
+
+        Returns:
+            Reconstructed canvas as HxWx3 uint8 array
+        """
+        canvas_tensor = canvas_to_tensor(canvas).to(self.device)
+        self.autoencoder.eval()
+        with torch.no_grad():
+            reconstructed = self.autoencoder.reconstruct(canvas_tensor)
+            reconstructed_np = (
+                reconstructed.clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
+            ).astype(np.uint8)
+        return reconstructed_np
 
     def predict_next_frame(self, prediction_canvas_history: list) -> np.ndarray:
         """
@@ -153,6 +180,9 @@ class AutoencoderConcatPredictorWorldModel:
             frame_size=Config.FRAME_SIZE,
             sep_width=Config.SEPARATOR_WIDTH,
         )
+
+        # Store for visualization
+        self.last_prediction_canvas = prediction_canvas.copy()
 
         # Convert to tensor
         canvas_tensor = canvas_to_tensor(prediction_canvas).to(self.device)
@@ -222,18 +252,34 @@ class AutoencoderConcatPredictorWorldModel:
                         frame_size=Config.FRAME_SIZE,
                         sep_width=Config.SEPARATOR_WIDTH,
                     )
-                    num_frames = (len(self.interleaved_history) + 1) // 2
 
-                    # Train autoencoder
+                    # Store for visualization
+                    self.last_training_canvas = training_canvas.copy()
+
+                    # Train autoencoder until reconstruction loss below threshold
                     print("Training autoencoder on canvas...")
-                    final_loss = self.train_canvas_reconstruction(training_canvas, num_frames)
-                    print(f"Training complete, final loss: {final_loss:.6f}")
+                    loss = float('inf')
+                    iterations = 0
+                    self.last_training_loss_history = []
+
+                    while loss > Config.CANVAS_RECONSTRUCTION_THRESHOLD:
+                        loss = self.train_autoencoder(training_canvas)
+                        iterations += 1
+                        self.last_training_loss_history.append(loss)
+
+                        # Call training callback if provided
+                        if self.training_callback:
+                            self.training_callback(iterations, loss)
+
+                    self.last_training_loss = loss
+                    self.last_training_iterations = iterations
+                    print(f"Training complete, final loss: {loss:.6f}, iterations: {iterations}")
                 else:
                     print(f"Skipping training (need exactly {2 * Config.CANVAS_HISTORY_SIZE - 1} elements, have {len(self.interleaved_history)})")
 
                 # Step 5: Select action and add to history
-                action, metadata = self.action_selector(current_frame, self.robot.action_space)
-                print(f"Selected action: {action} ({metadata.get('selection_method', 'unknown')})")
+                action = self.action_selector(current_frame, self.robot.action_space)
+                print(f"Selected action: {action}")
                 self.interleaved_history.append(action)
                 print(f"History length after adding action: {len(self.interleaved_history)}")
 
@@ -248,6 +294,7 @@ class AutoencoderConcatPredictorWorldModel:
                 else:
                     print(f"Skipping prediction (need exactly {2 * Config.CANVAS_HISTORY_SIZE} elements, have {len(self.interleaved_history)})")
                     self.last_prediction = None
+                    self.last_prediction_canvas = None
 
                 # Step 8: Execute action on robot
                 success = self.robot.execute_action(action)

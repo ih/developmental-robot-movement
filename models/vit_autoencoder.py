@@ -13,22 +13,22 @@ class MaskedAutoencoderViT(BaseAutoencoder):
     A Vision Transformer (ViT) based Masked Autoencoder (MAE)
     with a POWERFUL encoder and a LIGHTWEIGHT MLP decoder.
     """
-    def __init__(self, image_size=224, patch_size=16, embed_dim=256,
+    def __init__(self, img_height=224, img_width=224, patch_size=16, embed_dim=256,
                  decoder_embed_dim=128, depth=5, num_heads=4, mlp_ratio=4.):
         super().__init__()
 
         # Store dimensions for base class interface
         self.embed_dim = embed_dim
-        self.image_size = image_size
+        self.image_size = (img_height, img_width)
         self.patch_size = patch_size
 
         # --------------------------------------------------------------------------
         # MAE ENCODER (Powerful Transformer)
         # This part remains the same as before.
-        self.patch_embed = timm.models.vision_transformer.PatchEmbed(image_size, patch_size, 3, embed_dim)
+        self.patch_embed = timm.models.vision_transformer.PatchEmbed((img_height, img_width), patch_size, 3, embed_dim)
         num_patches = self.patch_embed.num_patches
         self.num_tokens = num_patches + 1  # +1 for CLS token
-        self.grid_size = image_size // patch_size
+        self.grid_size = (img_height // patch_size, img_width // patch_size)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)
         self.blocks = nn.ModuleList([
@@ -67,18 +67,26 @@ class MaskedAutoencoderViT(BaseAutoencoder):
             self.pos_embed.copy_(enc_pos)
             self.decoder_pos_embed.copy_(dec_pos)
 
-    def _build_2d_sincos_pos_embed(self, embed_dim: int, grid_size: int, device=None):
+    def _build_2d_sincos_pos_embed(self, embed_dim: int, grid_size: tuple, device=None):
         """
         Create 2D sin-cos positional embeddings with a [CLS] token at the start.
-        Returns a tensor of shape [1, grid_size*grid_size + 1, embed_dim].
+        Returns a tensor of shape [1, grid_h*grid_w + 1, embed_dim].
+
+        Args:
+            embed_dim: Embedding dimension
+            grid_size: Tuple of (grid_h, grid_w)
+            device: torch device
         """
         assert embed_dim % 2 == 0, "embed_dim must be even for 2D sin-cos embeddings"
+
+        grid_h_size, grid_w_size = grid_size
+
         # Positions along each axis
-        grid_h = torch.arange(grid_size, dtype=torch.float32, device=device)
-        grid_w = torch.arange(grid_size, dtype=torch.float32, device=device)
+        grid_h = torch.arange(grid_h_size, dtype=torch.float32, device=device)
+        grid_w = torch.arange(grid_w_size, dtype=torch.float32, device=device)
         # Normalize to [0, 1]
-        grid_h = grid_h / (grid_size - 1 if grid_size > 1 else 1)
-        grid_w = grid_w / (grid_size - 1 if grid_size > 1 else 1)
+        grid_h = grid_h / (grid_h_size - 1 if grid_h_size > 1 else 1)
+        grid_w = grid_w / (grid_w_size - 1 if grid_w_size > 1 else 1)
         # Meshgrid: [H, W]
         gh, gw = torch.meshgrid(grid_h, grid_w, indexing='ij') if hasattr(torch, 'meshgrid') else torch.meshgrid(grid_h, grid_w)
         # Flatten to [N]
@@ -191,7 +199,7 @@ class MaskedAutoencoderViT(BaseAutoencoder):
     def unpatchify(self, x):
         """Convert patches back to image format"""
         patch_size = int(self.patch_embed.patch_size[0])
-        h = w = int(x.shape[1] ** 0.5)  # Assume square image
+        h, w = self.grid_size  # Use stored grid_size tuple
         x = x.reshape(x.shape[0], h, w, patch_size, patch_size, 3)
         x = torch.einsum('nhwpqc->nchpwq', x)
         imgs = x.reshape(x.shape[0], 3, h * patch_size, w * patch_size)

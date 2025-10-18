@@ -114,7 +114,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
 
     # Training thresholds
-    CANVAS_RECONSTRUCTION_THRESHOLD = 0.001  # Threshold for canvas reconstruction training
+    CANVAS_RECONSTRUCTION_THRESHOLD = 0.003  # Threshold for canvas reconstruction training
 
     # Optimizer parameters
     AUTOENCODER_LR = 1e-4          # Learning rate for autoencoder training

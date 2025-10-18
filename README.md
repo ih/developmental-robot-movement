@@ -80,6 +80,16 @@ This repository contains research code for developmental robot movement with a m
 - **Training capabilities**: Train models on specific frames or sequences using the exact same algorithms as the live system
 - **No Jupyter required**: Runs as standalone web app accessible from any browser
 
+### Concat World Model Explorer
+- **concat_world_model_explorer_gradio.py**: Web-based Gradio interface for running AutoencoderConcatPredictorWorldModel on recorded toroidal dot sessions
+- **Canvas-based approach**: Uses targeted masked autoencoder with canvas-based frame concatenation
+- **Session replay**: Load and replay recorded sessions with world model training
+- **Live progress tracking**: Real-time display of training loss, prediction error, and iteration timing
+- **Comprehensive metrics**: Tracks training loss, training iterations, prediction error, and iteration time across all iterations
+- **Visual feedback**: Displays current frame, predicted frame, training canvas, reconstructed canvas, and prediction canvas
+- **Training loss visualization**: Live plot of training loss (log scale) during autoencoder training iterations
+- **Metric graphs**: Four plots showing training loss, training iterations, prediction error, and iteration time over all iterations
+
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
 - **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for improved generalization
@@ -245,6 +255,20 @@ python session_explorer_gradio.py
 - **Progress tracking**: Built-in progress bars and live status updates during training
 - **No Jupyter required**: Standalone web application with cleaner UI and better organization
 
+### Concat World Model Explorer
+```bash
+python concat_world_model_explorer_gradio.py
+```
+- **Canvas-based world model**: Interactive web UI for exploring AutoencoderConcatPredictorWorldModel on toroidal dot sessions
+- **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/`
+- **Frame navigation**: Browse session frames with slider and text input
+- **World model execution**: Run world model for specified number of iterations with real-time progress
+- **Live training metrics**: Display of reconstruction loss, prediction error, and iteration timing during execution
+- **Training loss progress**: Live plot of training loss during autoencoder training iterations (log scale)
+- **Post-run visualizations**: Current frame, predicted frame, prediction error, training canvas, reconstructed canvas, and prediction canvas
+- **Comprehensive graphs**: Four plots tracking training loss, training iterations, prediction error, and iteration time
+- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method for real training experience
+
 ### Interactive JetBot Testing
 ```bash
 jupyter notebook test_jetbot_actions.ipynb
@@ -305,6 +329,10 @@ Required Python packages:
 - `session_explorer_gradio.py`: Web-based Gradio interface for multi-robot session exploration and training
 - `session_explorer_lib.py`: Shared library of utilities for session management, frame processing, and model operations
 - `SESSION_EXPLORER_GRADIO.md`: Documentation for the Gradio session explorer interface
+- `autoencoder_concat_predictor_world_model.py`: Canvas-based world model using targeted masked autoencoder with frame concatenation
+- `concat_world_model_explorer_gradio.py`: Web-based Gradio interface for AutoencoderConcatPredictorWorldModel exploration
+- `test_concat_world_model.py`: Test script for AutoencoderConcatPredictorWorldModel
+- `models/autoencoder_concat_predictor.py`: Canvas building utilities and TargetedMAEWrapper for masked autoencoder with custom patch masks
 - `test_jetbot_actions.ipynb`: Interactive Jupyter notebook for JetBot action space testing
 - `test_toroidal_dot_actions.ipynb`: Interactive Jupyter notebook for toroidal dot environment testing
 - `config.py`: Shared configuration, image transforms, robot-specific directories, and adaptive world model parameters

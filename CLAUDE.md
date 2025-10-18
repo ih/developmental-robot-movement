@@ -10,9 +10,10 @@ This repository contains research code for developmental robot movement with a m
 2. **JetBot Implementation** (`jetbot_interface.py`, `jetbot_remote_client.py`) - Concrete JetBot robot interface
 3. **Toroidal Dot Environment** (`toroidal_dot_env.py`, `toroidal_dot_interface.py`) - Simulated environment with white dot on black background for testing and debugging
 4. **Autoencoder Latent Predictor World Model** (`autoencoder_latent_predictor_world_model.py`) - Hierarchical world model with uncertainty-based action selection
-5. **Robot Runner** (`robot_runner.py`) - Lightweight action execution without learning components
-6. **Action Selectors** (`toroidal_action_selectors.py`, `recorded_policy.py`) - Pluggable action selection strategies
-7. **Integration Examples** (`jetbot_world_model_example.py`, `toroidal_dot_world_model_example.py`, `toroidal_dot_runner_example.py`) - Shows how to connect world model and runner with different robots/environments
+5. **Autoencoder Concat Predictor World Model** (`autoencoder_concat_predictor_world_model.py`) - Canvas-based world model using targeted masked autoencoder with frame concatenation
+6. **Robot Runner** (`robot_runner.py`) - Lightweight action execution without learning components
+7. **Action Selectors** (`toroidal_action_selectors.py`, `recorded_policy.py`) - Pluggable action selection strategies
+8. **Integration Examples** (`jetbot_world_model_example.py`, `toroidal_dot_world_model_example.py`, `toroidal_dot_runner_example.py`) - Shows how to connect world model and runner with different robots/environments
 
 ## Architecture
 
@@ -47,6 +48,17 @@ This repository contains research code for developmental robot movement with a m
 - **Real-time training visualization**: Shows current vs reconstructed frames during autoencoder training
 - **Interactive visualization**: Real-time display of current frame, decoded frame, and predictions for all motor combinations
 
+### Autoencoder Concat Predictor World Model
+- **Canvas-based approach**: Concatenates history frames horizontally with action-colored separators between them
+- **Targeted masking**: Uses masked autoencoder to inpaint masked next-frame slot for prediction
+- **Main loop architecture**: Get frame → compute prediction error → train on canvas → select action → predict next frame → execute action
+- **Action encoding**: Actions encoded as thin colored separators (e.g., red for stay, green for move)
+- **Non-square canvases**: Supports non-square image dimensions (e.g., 224x688 for 3 frames + 2 separators)
+- **Pluggable action selectors**: Custom action selection via `action_selector` parameter (returns action only, no metadata)
+- **Visualization state**: Tracks last training canvas, reconstruction, prediction canvas, and predicted frame
+- **Training callback**: Optional callback for live training progress updates in UI
+- **Quality gating**: Trains autoencoder until reconstruction loss below threshold before proceeding
+
 ### Robot Runner
 - **RobotRunner class**: Lightweight runner for executing actions without learning or world model components
 - **No neural networks**: Pure action execution without training, checkpoints, or predictions
@@ -79,6 +91,17 @@ This repository contains research code for developmental robot movement with a m
 - **Action space sweep**: Predictions across full robot action space with MSE for each action, clearly labeled with action values and recorded action indicator
 - **Progress tracking**: Built-in progress bars and live status updates during training
 - **Threshold and fixed-step training**: Train until loss reaches target threshold or for specified number of steps
+
+### Concat World Model Explorer
+- **concat_world_model_explorer_gradio.py**: Web-based Gradio interface for running AutoencoderConcatPredictorWorldModel on recorded toroidal dot sessions
+- **Canvas-based approach**: Uses targeted masked autoencoder with canvas-based frame concatenation instead of latent-space prediction
+- **Session replay**: Load and replay recorded sessions with authentic world model training
+- **Live progress tracking**: Real-time display of training loss, prediction error, and iteration timing during execution
+- **Training loss visualization**: Live plot of training loss (log scale) during autoencoder training iterations shown in progress bar
+- **Comprehensive metrics**: Tracks training loss, training iterations, prediction error, and iteration time across all iterations
+- **Visual feedback**: Displays current frame, predicted frame, training canvas, reconstructed canvas, and prediction canvas
+- **Metric graphs**: Four plots showing training loss history, training iterations, prediction error, and iteration time over all iterations
+- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method for real training experience
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
@@ -118,8 +141,9 @@ This repository contains research code for developmental robot movement with a m
 - **Motor configuration**: Uses right motor for movement control, left motor remains at 0
 
 ### Configuration
-- **config.py**: Contains image transforms, constants, and adaptive world model parameters
-- **AutoencoderLatentPredictorWorldModelConfig class**: Centralized configuration for all model parameters including thresholds, learning rates, and training intervals
+- **config.py**: Contains image transforms, constants, and world model parameters
+- **AutoencoderLatentPredictorWorldModelConfig class**: Centralized configuration for all latent predictor model parameters including thresholds, learning rates, and training intervals
+- **AutoencoderConcatPredictorWorldModelConfig class**: Configuration for canvas-based world model (frame size, separator width, canvas history size, reconstruction threshold, optimizer parameters)
 - **Robot-specific directories**:
   - `JETBOT_CHECKPOINT_DIR = saved/checkpoints/jetbot/` - JetBot model checkpoints
   - `TOROIDAL_DOT_CHECKPOINT_DIR = saved/checkpoints/toroidal_dot/` - Toroidal dot model checkpoints
@@ -207,6 +231,20 @@ python replay_session_example.py
 - **Isolated checkpoints**: Each robot type maintains separate model checkpoints due to different action space dimensionality
 - **Disk space management**: Automatic cleanup of oldest sessions when total recordings exceed configurable disk limit (default 10 GB per robot type)
 
+### Concat World Model Explorer
+```bash
+python concat_world_model_explorer_gradio.py
+```
+- **Canvas-based world model**: Interactive web UI for exploring AutoencoderConcatPredictorWorldModel on toroidal dot sessions
+- **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/`
+- **Frame navigation**: Browse session frames with slider and text input
+- **World model execution**: Run world model for specified number of iterations with real-time progress
+- **Live training metrics**: Display of reconstruction loss, prediction error, and iteration timing during execution
+- **Training loss progress**: Live plot of training loss during autoencoder training iterations (log scale) shown in progress bar
+- **Post-run visualizations**: Current frame, predicted frame, prediction error, training canvas, reconstructed canvas, and prediction canvas
+- **Comprehensive graphs**: Four plots tracking training loss, training iterations, prediction error, and iteration time
+- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method for real training experience
+
 ## Dependencies
 
 Install dependencies with:
@@ -238,7 +276,9 @@ Required Python packages:
   - `models/autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
   - `models/predictor.py`: TransformerActionConditionedPredictor with FiLM conditioning, delta latent prediction, image-based action classification, and attention introspection
   - `models/encoder_layer_with_attn.py`: Custom transformer encoder layer that optionally returns attention maps
+  - `models/autoencoder_concat_predictor.py`: Canvas building utilities and TargetedMAEWrapper for masked autoencoder with custom patch masks
 - `autoencoder_latent_predictor_world_model.py`: Main world model implementation with comprehensive training and logging
+- `autoencoder_concat_predictor_world_model.py`: Canvas-based world model using targeted masked autoencoder with frame concatenation
 - `robot_runner.py`: Lightweight runner for executing actions without learning components
 - `jetbot_world_model_example.py`: Integration example connecting JetBot with world model
 - `toroidal_dot_world_model_example.py`: Integration example connecting toroidal dot environment with world model (uses SEQUENCE_ALWAYS_MOVE)
@@ -252,6 +292,8 @@ Required Python packages:
 - `session_explorer_gradio.py`: Web-based Gradio interface for multi-robot session exploration and training
 - `session_explorer_lib.py`: Shared library of utilities for session management, frame processing, and model operations
 - `SESSION_EXPLORER_GRADIO.md`: Documentation for the Gradio session explorer interface
+- `concat_world_model_explorer_gradio.py`: Web-based Gradio interface for AutoencoderConcatPredictorWorldModel exploration
+- `test_concat_world_model.py`: Test script for AutoencoderConcatPredictorWorldModel
 - `test_jetbot_actions.ipynb`: Jupyter notebook for interactive JetBot action space testing
 - `test_toroidal_dot_actions.ipynb`: Jupyter notebook for interactive toroidal dot environment testing
 - `config.py`: Shared configuration, image transforms, robot-specific directories, and adaptive world model parameters
