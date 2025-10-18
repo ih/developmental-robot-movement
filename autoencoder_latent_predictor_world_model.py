@@ -21,6 +21,7 @@ from models.action_classifier import ActionClassifier
 from models.transformer_predictor import action_dict_to_index
 from config import AutoencoderLatentPredictorWorldModelConfig
 import config
+import world_model_utils
 
 
 def normalize_action_dicts(action_dicts):
@@ -206,72 +207,6 @@ class AutoencoderLatentPredictorWorldModel:
         else:
             return AutoencoderLatentPredictorWorldModelConfig.PREDICTOR_LR
 
-    def _create_param_groups(self, model):
-        """
-        Create parameter groups for AdamW optimizer.
-
-        Separates parameters into two groups:
-        1. Parameters with weight decay (weights in Linear/Conv layers)
-        2. Parameters without weight decay (biases, LayerNorm params)
-
-        Returns:
-            List of parameter groups for optimizer
-        """
-        decay_params = []
-        no_decay_params = []
-
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-
-            # Exclude bias and LayerNorm parameters from weight decay
-            # Common patterns: 'bias', 'norm', 'ln', 'bn' (batch norm)
-            if 'bias' in name or 'norm' in name.lower() or 'ln_' in name or 'bn' in name:
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        return [
-            {'params': decay_params, 'weight_decay': AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY},
-            {'params': no_decay_params, 'weight_decay': 0.0}
-        ]
-
-    def _create_scheduler(self, optimizer, total_steps=None):
-        """
-        Create warmup + cosine decay learning rate scheduler.
-
-        Args:
-            optimizer: The optimizer to schedule
-            total_steps: Total training steps (if None, uses a large default)
-
-        Returns:
-            Learning rate scheduler
-        """
-        warmup_steps = AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS
-
-        # If total_steps not provided, use a large value (can be updated later)
-        if total_steps is None:
-            total_steps = 100000  # Default to 100k steps
-
-        # Calculate minimum learning rate
-        base_lr = optimizer.param_groups[0]['lr']
-        lr_min = max(base_lr * AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO, 1e-6)
-
-        # Create warmup + cosine decay scheduler using LambdaLR
-        def lr_lambda(current_step):
-            if current_step < warmup_steps:
-                # Linear warmup from 0 to 1
-                return float(current_step) / float(max(1, warmup_steps))
-            else:
-                # Cosine decay from 1 to lr_min_ratio
-                progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-                cosine_decay = 0.5 * (1.0 + np.cos(np.pi * min(progress, 1.0)))
-                # Scale between lr_min_ratio and 1.0
-                min_ratio = lr_min / base_lr
-                return min_ratio + (1.0 - min_ratio) * cosine_decay
-
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
     def _compute_grad_action_ratio(self, predictor):
         """
         Compute ratio of gradient L2 norm flowing through action-related parameters.
@@ -712,9 +647,16 @@ class AutoencoderLatentPredictorWorldModel:
             if opt_state is not None:
                 if not hasattr(self, 'autoencoder_optimizer'):
                     lr = self._get_autoencoder_lr()
-                    param_groups = self._create_param_groups(self.autoencoder)
+                    param_groups = world_model_utils.create_param_groups(
+                        self.autoencoder,
+                        AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY
+                    )
                     self.autoencoder_optimizer = torch.optim.AdamW(param_groups, lr=lr)
-                    self.autoencoder_scheduler = self._create_scheduler(self.autoencoder_optimizer)
+                    self.autoencoder_scheduler = world_model_utils.create_warmup_cosine_scheduler(
+                        self.autoencoder_optimizer,
+                        warmup_steps=AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS,
+                        lr_min_ratio=AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO
+                    )
 
                 if self.explicit_autoencoder_lr is None:
                     # Use saved optimizer state if no explicit override
@@ -755,9 +697,16 @@ class AutoencoderLatentPredictorWorldModel:
                 if opt_state is not None:
                     if not hasattr(predictor, 'optimizer'):
                         lr = self._get_predictor_lr()
-                        param_groups = self._create_param_groups(predictor)
+                        param_groups = world_model_utils.create_param_groups(
+                            predictor,
+                            AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY
+                        )
                         predictor.optimizer = torch.optim.AdamW(param_groups, lr=lr)
-                        predictor.scheduler = self._create_scheduler(predictor.optimizer)
+                        predictor.scheduler = world_model_utils.create_warmup_cosine_scheduler(
+                            predictor.optimizer,
+                            warmup_steps=AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS,
+                            lr_min_ratio=AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO
+                        )
 
                     if self.explicit_predictor_lr is None:
                         # Use saved optimizer state if no explicit override
@@ -789,12 +738,19 @@ class AutoencoderLatentPredictorWorldModel:
                 if opt_state is not None:
                     if not hasattr(self, 'action_classifier_optimizer'):
                         lr = self._get_predictor_lr()
-                        param_groups = self._create_param_groups(self.action_classifier)
+                        param_groups = world_model_utils.create_param_groups(
+                            self.action_classifier,
+                            AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY
+                        )
                         self.action_classifier_optimizer = torch.optim.AdamW(
                             param_groups,
                             lr=lr
                         )
-                        self.action_classifier_scheduler = self._create_scheduler(self.action_classifier_optimizer)
+                        self.action_classifier_scheduler = world_model_utils.create_warmup_cosine_scheduler(
+                            self.action_classifier_optimizer,
+                            warmup_steps=AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS,
+                            lr_min_ratio=AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO
+                        )
                     self.action_classifier_optimizer.load_state_dict(opt_state)
 
                     # Restore scheduler state
@@ -824,16 +780,7 @@ class AutoencoderLatentPredictorWorldModel:
             self.last_predictor_loss = state.get('last_predictor_loss', None)
 
             print(f"Learning progress loaded: {self.autoencoder_training_step} autoencoder steps, {self.predictor_training_step} predictor steps, {self.action_count} actions")
-    
-    def to_model_tensor(self, frame_np):
-        """Convert frame to properly scaled tensor for model input"""
-        # frame_np is HxWx3 RGB, uint8 or float
-        if frame_np.dtype == np.uint8:
-            img = frame_np.astype(np.float32) / 255.0
-        else:
-            img = np.clip(frame_np.astype(np.float32), 0.0, 1.0)
-        return torch.from_numpy(img.transpose(2,0,1)).unsqueeze(0).to(self.device)  # [1,3,H,W]
-        
+
     def main_loop(self):
         while True:
             # Step 1: Capture and encode current frame using the interface
@@ -842,7 +789,7 @@ class AutoencoderLatentPredictorWorldModel:
                 continue  # Skip this iteration if observation failed
             
             # Convert to properly scaled tensor [1, 3, H, W]
-            frame_tensor = self.to_model_tensor(current_frame)
+            frame_tensor = world_model_utils.to_model_tensor(current_frame, self.device)
             current_features = self.autoencoder.encode(frame_tensor)
             
             # Step 2: Validate image encoding quality using proper reconstruction
@@ -996,7 +943,14 @@ class AutoencoderLatentPredictorWorldModel:
             # Step 7: Update history buffers
             self.frame_features_history.append(current_features.detach())
             self.action_history.append(action_to_execute)
-            self.maintain_history_window()
+            # Maintain history window size
+            max_history = AutoencoderLatentPredictorWorldModelConfig.MAX_HISTORY_SIZE
+            self.frame_features_history = world_model_utils.maintain_history_window(
+                self.frame_features_history, max_history
+            )
+            self.action_history = world_model_utils.maintain_history_window(
+                self.action_history, max_history
+            )
     
     def interactive_prompt(self, current_frame, decoded_frame, reconstruction_loss, 
                           prediction_errors, best_action, all_action_predictions):
@@ -1369,15 +1323,29 @@ class AutoencoderLatentPredictorWorldModel:
 
         # Initialize predictor optimizer and scheduler if not exists
         if not hasattr(predictor, 'optimizer'):
-            param_groups = self._create_param_groups(predictor)
+            param_groups = world_model_utils.create_param_groups(
+                predictor,
+                AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY
+            )
             predictor.optimizer = torch.optim.AdamW(param_groups, lr=self._get_predictor_lr())
-            predictor.scheduler = self._create_scheduler(predictor.optimizer)
+            predictor.scheduler = world_model_utils.create_warmup_cosine_scheduler(
+                predictor.optimizer,
+                warmup_steps=AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS,
+                lr_min_ratio=AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO
+            )
 
         # Initialize autoencoder optimizer and scheduler for joint training
         if not hasattr(self, 'autoencoder_optimizer'):
-            param_groups = self._create_param_groups(self.autoencoder)
+            param_groups = world_model_utils.create_param_groups(
+                self.autoencoder,
+                AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY
+            )
             self.autoencoder_optimizer = torch.optim.AdamW(param_groups, lr=self._get_autoencoder_lr())
-            self.autoencoder_scheduler = self._create_scheduler(self.autoencoder_optimizer)
+            self.autoencoder_scheduler = world_model_utils.create_warmup_cosine_scheduler(
+                self.autoencoder_optimizer,
+                warmup_steps=AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS,
+                lr_min_ratio=AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO
+            )
 
         # Ensure frame tensor lives on the correct device
         current_frame_tensor = current_frame_tensor.to(self.device)
@@ -1419,12 +1387,19 @@ class AutoencoderLatentPredictorWorldModel:
         self.autoencoder_optimizer.zero_grad()
         if self.action_classifier is not None:
             if not hasattr(self, 'action_classifier_optimizer'):
-                param_groups = self._create_param_groups(self.action_classifier)
+                param_groups = world_model_utils.create_param_groups(
+                    self.action_classifier,
+                    AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY
+                )
                 self.action_classifier_optimizer = torch.optim.AdamW(
                     param_groups,
                     lr=self._get_predictor_lr()
                 )
-                self.action_classifier_scheduler = self._create_scheduler(self.action_classifier_optimizer)
+                self.action_classifier_scheduler = world_model_utils.create_warmup_cosine_scheduler(
+                    self.action_classifier_optimizer,
+                    warmup_steps=AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS,
+                    lr_min_ratio=AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO
+                )
             self.action_classifier_optimizer.zero_grad()
 
         # Decode predicted features to image space
@@ -1544,9 +1519,16 @@ class AutoencoderLatentPredictorWorldModel:
         """
         # Initialize optimizer and scheduler if not exists
         if not hasattr(self, 'autoencoder_optimizer'):
-            param_groups = self._create_param_groups(self.autoencoder)
+            param_groups = world_model_utils.create_param_groups(
+                self.autoencoder,
+                AutoencoderLatentPredictorWorldModelConfig.WEIGHT_DECAY
+            )
             self.autoencoder_optimizer = torch.optim.AdamW(param_groups, lr=self._get_autoencoder_lr())
-            self.autoencoder_scheduler = self._create_scheduler(self.autoencoder_optimizer)
+            self.autoencoder_scheduler = world_model_utils.create_warmup_cosine_scheduler(
+                self.autoencoder_optimizer,
+                warmup_steps=AutoencoderLatentPredictorWorldModelConfig.WARMUP_STEPS,
+                lr_min_ratio=AutoencoderLatentPredictorWorldModelConfig.LR_MIN_RATIO
+            )
 
         # Use autoencoder's train_step method (architecture handles its own training details)
         train_loss_value = self.autoencoder.train_step(frame_tensor, self.autoencoder_optimizer)
@@ -1626,15 +1608,7 @@ class AutoencoderLatentPredictorWorldModel:
             if horizon-1 < len(self.prediction_buffer) and self.prediction_buffer[horizon-1].get('error', 0) > threshold:
                 return max(1, horizon - 1)
         return self.lookahead
-    
-    def maintain_history_window(self):
-        """Keep history buffers at reasonable size"""
-        max_history = AutoencoderLatentPredictorWorldModelConfig.MAX_HISTORY_SIZE
-        
-        if len(self.frame_features_history) > max_history:
-            self.frame_features_history = self.frame_features_history[-max_history:]
-            self.action_history = self.action_history[-max_history:]
-    
+
     def make_predictions(self, current_features, action):
         """Generate predictions for future timesteps"""
         self.prediction_buffer = []

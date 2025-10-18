@@ -106,4 +106,20 @@ FILM_HIDDEN_DIM  = 128         # hidden width inside Action MLP
 FILM_BLOCK_IDS   = [0, 2]      # apply FiLM in early & mid transformer layers
 DELTA_LATENT     = False        # switch on residual prediction
 
+# Autoencoder Concat Predictor World Model Configuration
+class AutoencoderConcatPredictorWorldModelConfig:
+    # Canvas construction
+    FRAME_SIZE = (224, 224)        # Size of each frame in canvas
+    SEPARATOR_WIDTH = 8            # Width of action-colored separator between frames
+    CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
+
+    # Training thresholds
+    CANVAS_RECONSTRUCTION_THRESHOLD = 0.001  # Threshold for canvas reconstruction training
+
+    # Optimizer parameters
+    AUTOENCODER_LR = 1e-4          # Learning rate for autoencoder training
+    WEIGHT_DECAY = 0.01            # AdamW weight decay
+    WARMUP_STEPS = 600             # Warmup steps for learning rate scheduler
+    LR_MIN_RATIO = 0.01            # Minimum LR as ratio of base LR
+
 
