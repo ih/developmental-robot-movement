@@ -155,7 +155,7 @@ def update_frame(frame_idx):
 
 def run_world_model(num_iterations, progress=gr.Progress()):
     """Run the world model for N iterations with live metrics tracking"""
-    global world_model
+    global world_model, replay_robot
 
     if world_model is None:
         return "Please load a session first", "", "", None, None, None, None, None, None, None
@@ -175,6 +175,7 @@ def run_world_model(num_iterations, progress=gr.Progress()):
 
     try:
         import time
+        loop_count = 0  # Track how many times we loop back to the beginning
 
         # Run world model with progress updates and metric tracking
         for i in range(num_iterations):
@@ -189,8 +190,25 @@ def run_world_model(num_iterations, progress=gr.Progress()):
 
             world_model.training_callback = training_progress_callback
 
-            # Run one iteration
-            world_model.run(max_iterations=1)
+            # Run one iteration, catching StopIteration to loop the session
+            iteration_successful = False
+            while not iteration_successful:
+                try:
+                    world_model.run(max_iterations=1)
+                    iteration_successful = True
+                except StopIteration:
+                    # Session ended, reset reader to loop back to beginning
+                    # Model training progress is preserved (weights, optimizer state)
+                    # but we need to clear the frame/action history buffer
+                    loop_count += 1
+                    print(f"Session ended at iteration {i+1}/{num_iterations}, looping back to beginning (loop #{loop_count})...")
+                    replay_robot.reader.reset()
+                    # Clear the interleaved history to avoid corrupted frame/action structure
+                    world_model.interleaved_history = []
+                    # Clear prediction state for clean restart
+                    world_model.last_prediction = None
+                    world_model.last_prediction_canvas = None
+                    # Retry the iteration from the beginning of the session
 
             iteration_time = time.time() - start_time
 
@@ -302,6 +320,8 @@ def run_world_model(num_iterations, progress=gr.Progress()):
 
         # Create visualizations
         status_msg = f"**Completed {num_iterations} iterations** (Total: {len(world_model._metrics_history['iteration'])} iterations)"
+        if loop_count > 0:
+            status_msg += f"\n\n*Session looped {loop_count} time{'s' if loop_count > 1 else ''} to complete all iterations*"
 
         # Current frame and prediction
         fig_frames = None
@@ -378,10 +398,10 @@ def run_world_model(num_iterations, progress=gr.Progress()):
 
         return status_msg, current_metrics, fig_metrics, fig_frames, fig_training_canvas, fig_training_reconstruction, fig_training_loss_plot, fig_prediction_canvas, fig_predicted_frame, training_info, format_loss(prediction_error)
 
-    except StopIteration:
-        return "Session ended (no more observations)", "", None, None, None, None, None, None, None, "", "--"
     except Exception as e:
-        return f"Error: {str(e)}", "", None, None, None, None, None, None, None, "", "--"
+        import traceback
+        error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
+        return error_msg, "", None, None, None, None, None, None, None, "", "--"
 
 # Build Gradio interface
 with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as demo:
