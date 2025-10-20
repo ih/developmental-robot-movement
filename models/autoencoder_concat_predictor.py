@@ -167,6 +167,81 @@ def compute_patch_mask_for_last_slot(
 
     return mask  # shape (1, Gh*Gw)
 
+def compute_randomized_patch_mask_for_last_slot(
+    img_size: Tuple[int,int],
+    patch_size: int,
+    num_frame_slots: int,
+    sep_width: int,
+    mask_ratio_min: float = 0.3,
+    mask_ratio_max: float = 0.85,
+    last_slot_index: int = -1,
+) -> torch.Tensor:
+    """
+    Build a randomized boolean mask over patches in the last frame slot.
+
+    Unlike compute_patch_mask_for_last_slot which masks ALL patches in the slot,
+    this function randomly selects a subset based on a random mask_ratio.
+
+    Args:
+        img_size: (H, W) canvas dimensions
+        patch_size: Size of each patch
+        num_frame_slots: Number of frame slots in canvas
+        sep_width: Separator width in pixels
+        mask_ratio_min: Minimum mask ratio (default 0.3)
+        mask_ratio_max: Maximum mask ratio (default 0.85)
+        last_slot_index: Which slot to mask (default -1 = last)
+
+    Returns:
+        (1, num_patches) boolean tensor where True = mask this patch
+    """
+    import random
+
+    canvas_height, canvas_width = img_size
+    assert canvas_height % patch_size == 0, "canvas_height must be divisible by patch_size"
+    assert canvas_width % patch_size == 0, "canvas_width must be divisible by patch_size"
+
+    num_patches_height = canvas_height // patch_size
+    num_patches_width = canvas_width // patch_size
+
+    # Compute slot bounds (same logic as compute_patch_mask_for_last_slot)
+    single_frame_width = (canvas_width - (num_frame_slots - 1) * sep_width) // num_frame_slots
+    slot_index = (num_frame_slots - 1) if last_slot_index == -1 else last_slot_index
+    slot_start_x = slot_index * (single_frame_width + sep_width)
+    slot_end_x = slot_start_x + single_frame_width
+
+    # Identify all patches that overlap with the last slot
+    last_slot_patch_indices = []
+    patch_index = 0
+
+    for patch_row in range(num_patches_height):
+        for patch_col in range(num_patches_width):
+            # Patch bounds in pixels
+            patch_start_x = patch_col * patch_size
+            patch_end_x = patch_start_x + patch_size
+            patch_start_y = patch_row * patch_size
+            patch_end_y = patch_start_y + patch_size
+
+            # If patch overlaps the slot region, add to list
+            overlaps_slot = not (patch_end_x <= slot_start_x or patch_start_x >= slot_end_x)
+            if overlaps_slot:
+                last_slot_patch_indices.append(patch_index)
+            patch_index += 1
+
+    # Randomly sample mask ratio for this training step
+    mask_ratio = random.uniform(mask_ratio_min, mask_ratio_max)
+
+    # Randomly select subset of last-slot patches to mask
+    num_patches_to_mask = int(len(last_slot_patch_indices) * mask_ratio)
+    masked_patch_indices = random.sample(last_slot_patch_indices, num_patches_to_mask)
+
+    # Build final mask
+    total_num_patches = num_patches_height * num_patches_width
+    mask = torch.zeros((1, total_num_patches), dtype=torch.bool)
+    for patch_index in masked_patch_indices:
+        mask[0, patch_index] = True
+
+    return mask  # shape (1, num_patches_height * num_patches_width)
+
 # ------------------------------
 # MAE targeted-mask forward (adds a helper around the provided ViT MAE)
 # ------------------------------
@@ -180,30 +255,40 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
         """
         Train the autoencoder on a canvas with targeted masking.
 
+        Computes loss only on masked patches in patch space, forcing the model
+        to learn inpainting rather than just reconstructing visible regions.
+        This is the MAE-native approach and works for any mask pattern.
+
         Args:
             canvas_tensor: [1, 3, H, W] canvas image tensor
             patch_mask: [1, num_patches] boolean tensor; True = masked
             optimizer: Optimizer for updating weights
 
         Returns:
-            loss: Reconstruction loss value
+            loss: MSE loss value for masked patches only
         """
-        # Forward pass with patch masking
-        pred_patches, _ = self.forward_with_patch_mask(canvas_tensor, patch_mask)
+        # Forward pass with masking - model predicts all patches including masked ones
+        pred_patches, _ = self.forward_with_patch_mask(canvas_tensor, patch_mask)  # [1, num_patches, patch_size^2 * 3]
 
-        # Compute reconstruction loss only on masked patches
-        # Unpatchify to get full image prediction
-        img_pred = self.unpatchify(pred_patches)  # [1, 3, H, W]
+        # Convert ground truth canvas to patch representation (no gradients needed)
+        with torch.no_grad():
+            target_patches = self.patchify(canvas_tensor)  # [1, num_patches, patch_size^2 * 3]
 
-        # MSE loss on masked regions
-        loss = torch.nn.functional.mse_loss(img_pred, canvas_tensor)
+        # Select only the masked patches for loss computation
+        # This ensures we only optimize for inpainting the masked region
+        masked_pred = pred_patches[patch_mask]      # [num_masked_patches, patch_size^2 * 3]
+        masked_target = target_patches[patch_mask]  # [num_masked_patches, patch_size^2 * 3]
 
-        # Backward pass
+        # Compute MSE loss only on masked patches
+        # The loss is automatically normalized by the number of masked patches
+        loss = F.mse_loss(masked_pred, masked_target)
+
+        # Backward pass and optimizer step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        return loss.item()
+        return float(loss.detach().cpu())
 
     def forward_with_patch_mask(self, imgs: torch.Tensor, patch_mask: torch.Tensor):
         """
@@ -277,7 +362,7 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
         return pred, latent  # pred is per-patch predictions in *original* order
 
 # ------------------------------
-# Training & Inference helpers
+# Canvas tensor conversion
 # ------------------------------
 
 def canvas_to_tensor(canvas: np.ndarray) -> torch.Tensor:
@@ -287,70 +372,3 @@ def canvas_to_tensor(canvas: np.ndarray) -> torch.Tensor:
     arr = np.transpose(arr, (2, 0, 1))
     t = torch.from_numpy(arr)
     return t.unsqueeze(0)
-
-@torch.no_grad()
-def predict_next_frame_with_ae(
-    model: TargetedMAEWrapper,
-    frames: List[np.ndarray],
-    actions: Optional[List[dict]],
-    sep_width: int = 8,
-) -> np.ndarray:
-    """
-    Build canvas with K history frames + one empty slot (the next frame position),
-    then inpaint that last slot with a targeted masked forward pass.
-    Returns the predicted next frame as an HxWx3 uint8 image.
-    """
-    K = len(frames) + 1  # we will create K slots: frames[:-1] history + 1 blank (future)
-    H, W = 224, 224
-    # Build a temporary list with the last slot as zeros (or mid-gray)
-    future_blank = np.zeros((H, W, 3), dtype=np.uint8)
-    canv = build_canvas(frames + [future_blank], actions, frame_size=(H,W), sep_width=sep_width)
-
-    # Convert to tensor and prepare patch mask that covers the *last* slot
-    x = canvas_to_tensor(canv).to(next(model.parameters()).device)  # [1,3,H,W] after TRANSFORM
-    # The model's patch size is model.patch_size (int)
-    patch = int(model.patch_size)
-    # H_total and W_total are determined by TRANSFORM: ensure they equal canvas size
-    Htot, Wtot = x.shape[-2], x.shape[-1]
-    patch_mask = compute_patch_mask_for_last_slot(
-        img_size=(Htot, Wtot),
-        patch_size=patch,
-        K=K,
-        sep_width=sep_width
-    ).to(x.device)
-
-    # Inference: targeted inpainting
-    pred_patches, _ = model.forward_with_patch_mask(x, patch_mask)  # [1, L, P^2*3]
-    # Unpatchify helper from original MAE (we can reuse model.unpatchify via a tiny wrapper)
-    # We'll mimic the decode() pathway to get the full canvas image predicted
-    # First, reconstruct the full canvas image from predicted patches
-    img_pred = model.unpatchify(pred_patches)  # [1, 3, Htot, Wtot]
-    img_np = (img_pred.clamp(0,1).squeeze(0).permute(1,2,0).cpu().numpy() * 255.0).astype(np.uint8)
-
-    # Extract the last slot region (without separators)
-    W0 = (Wtot - (K - 1) * sep_width) // K
-    x0 = (K - 1) * (W0 + sep_width)
-    x1 = x0 + W0
-    next_frame = img_np[:, x0:x1, :]
-    # Resize back to (H,W) if needed (should already match)
-    if next_frame.shape[0] != H or next_frame.shape[1] != W:
-        next_frame = _ensure_hw(next_frame, (H,W))
-    return next_frame
-
-# ------------------------------
-# Minimal usage example (pseudo)
-# ------------------------------
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Initialize MAE
-    mae = TargetedMAEWrapper(image_size=224, patch_size=16, embed_dim=256, decoder_embed_dim=128).to(device)
-    mae.eval()
-
-    # Fake data for a quick smoke test (3 history frames, 2 actions between them)
-    Khist = 3
-    H, W = 224, 224
-    frames = [(np.random.rand(H, W, 3) * 255).astype(np.uint8) for _ in range(Khist)]
-    actions = [{'motor_right': 0.0}, {'motor_right': 0.12}]  # len = Khist-1
-    # Predict next
-    pred = predict_next_frame_with_ae(mae, frames, actions, sep_width=8)
-    print("Pred next frame:", pred.shape, pred.dtype)

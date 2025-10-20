@@ -6,6 +6,10 @@ TRANSFORM = transforms.Compose([
     transforms.ToTensor()
 ])
 
+# Shared Autoencoder Training Parameters
+MASK_RATIO_MIN = .3   # Minimum mask ratio for randomized masking
+MASK_RATIO_MAX = 1  # Maximum mask ratio for randomized masking
+
 # Autoencoder Latent Predictor World Model Parameters
 class AutoencoderLatentPredictorWorldModelConfig:
     # Architecture selection
@@ -26,8 +30,6 @@ class AutoencoderLatentPredictorWorldModelConfig:
     WEIGHT_DECAY = 0.01  # AdamW weight decay (decoupled, excludes bias/LayerNorm)
     WARMUP_STEPS = 600  # Warmup steps (2-5% of total steps, or 1k-5k)
     LR_MIN_RATIO = 1e-2  # η_min = η₀ × LR_MIN_RATIO, or 1e-6 minimum
-    MASK_RATIO_MIN = 0.3  # Minimum mask ratio for randomized masking (ViT only)
-    MASK_RATIO_MAX = 0.85  # Maximum mask ratio for randomized masking (ViT only)
 
     # Prediction loss weights
     PRED_PATCH_W = 0.8  # Weight for patch-space reconstruction loss (visual quality anchor)
@@ -114,7 +116,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
 
     # Training thresholds
-    CANVAS_RECONSTRUCTION_THRESHOLD = 0.003  # Threshold for canvas reconstruction training
+    CANVAS_INPAINTING_THRESHOLD = 0.0016  # Threshold for stopping autoencoder training (loss on masked patches only)
 
     # Optimizer parameters
     AUTOENCODER_LR = 1e-4          # Learning rate for autoencoder training

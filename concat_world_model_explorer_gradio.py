@@ -158,10 +158,10 @@ def run_world_model(num_iterations, progress=gr.Progress()):
     global world_model, replay_robot
 
     if world_model is None:
-        return "Please load a session first", "", "", None, None, None, None, None, None, None
+        return "Please load a session first", "", None, None, None, None, None, None, None, None, None, "", "--"
 
     if num_iterations <= 0:
-        return "Number of iterations must be greater than 0", "", "", None, None, None, None, None, None, None
+        return "Number of iterations must be greater than 0", "", None, None, None, None, None, None, None, None, None, "", "--"
 
     # Initialize or retrieve metrics history
     if not hasattr(world_model, '_metrics_history'):
@@ -342,16 +342,19 @@ def run_world_model(num_iterations, progress=gr.Progress()):
                 ax.axis("off")
                 plt.tight_layout()
 
-        # Training canvas and reconstruction
+        # Training canvas visualizations
         fig_training_canvas = None
-        fig_training_reconstruction = None
+        fig_training_canvas_masked = None
+        fig_training_inpainting_full = None
+        fig_training_inpainting_composite = None
         fig_training_loss_plot = None
         training_info = ""
 
         if world_model.last_training_canvas is not None:
+            # 1. Original training canvas
             fig_training_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
             ax.imshow(world_model.last_training_canvas)
-            ax.set_title(f"Training Canvas (Final Loss: {format_loss(world_model.last_training_loss)})")
+            ax.set_title(f"Training Canvas (Original)")
             ax.axis("off")
             plt.tight_layout()
 
@@ -370,13 +373,40 @@ def run_world_model(num_iterations, progress=gr.Progress()):
                 ax.set_yscale('log')  # Log scale to see progress better
                 plt.tight_layout()
 
-            # Get reconstruction
-            reconstruction = world_model.get_canvas_reconstruction(world_model.last_training_canvas)
-            fig_training_reconstruction, ax = plt.subplots(1, 1, figsize=(12, 4))
-            ax.imshow(reconstruction)
-            ax.set_title("Training Canvas Reconstruction")
-            ax.axis("off")
-            plt.tight_layout()
+            # Generate additional visualizations if mask is available
+            if world_model.last_training_mask is not None:
+                # 2. Canvas with mask overlay (shows which patches are masked)
+                canvas_with_mask = world_model.get_canvas_with_mask_overlay(
+                    world_model.last_training_canvas,
+                    world_model.last_training_mask
+                )
+                fig_training_canvas_masked, ax = plt.subplots(1, 1, figsize=(12, 4))
+                ax.imshow(canvas_with_mask)
+                ax.set_title("Training Canvas with Mask (Red = Masked Patches)")
+                ax.axis("off")
+                plt.tight_layout()
+
+                # 3. Full model output (what model reconstructs for everything)
+                inpainting_full = world_model.get_canvas_inpainting_full_output(
+                    world_model.last_training_canvas,
+                    world_model.last_training_mask
+                )
+                fig_training_inpainting_full, ax = plt.subplots(1, 1, figsize=(12, 4))
+                ax.imshow(inpainting_full)
+                ax.set_title("Training Inpainting - Full Model Output (All Patches)")
+                ax.axis("off")
+                plt.tight_layout()
+
+                # 4. Composite (original + inpainted masked regions only)
+                inpainting_composite = world_model.get_canvas_inpainting_composite(
+                    world_model.last_training_canvas,
+                    world_model.last_training_mask
+                )
+                fig_training_inpainting_composite, ax = plt.subplots(1, 1, figsize=(12, 4))
+                ax.imshow(inpainting_composite)
+                ax.set_title("Training Inpainting - Composite (Original + Inpainted Masked Regions)")
+                ax.axis("off")
+                plt.tight_layout()
 
         # Prediction canvas and predicted frame
         fig_prediction_canvas = None
@@ -396,12 +426,12 @@ def run_world_model(num_iterations, progress=gr.Progress()):
             ax.axis("off")
             plt.tight_layout()
 
-        return status_msg, current_metrics, fig_metrics, fig_frames, fig_training_canvas, fig_training_reconstruction, fig_training_loss_plot, fig_prediction_canvas, fig_predicted_frame, training_info, format_loss(prediction_error)
+        return status_msg, current_metrics, fig_metrics, fig_frames, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite, fig_training_loss_plot, fig_prediction_canvas, fig_predicted_frame, training_info, format_loss(prediction_error)
 
     except Exception as e:
         import traceback
         error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
-        return error_msg, "", None, None, None, None, None, None, None, "", "--"
+        return error_msg, "", None, None, None, None, None, None, None, None, None, "", "--"
 
 # Build Gradio interface
 with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as demo:
@@ -462,8 +492,10 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     gr.Markdown("### Training Results")
     training_info_display = gr.Markdown("")
-    training_canvas_plot = gr.Plot(label="Training Canvas")
-    training_reconstruction_plot = gr.Plot(label="Training Canvas Reconstruction")
+    training_canvas_plot = gr.Plot(label="1. Training Canvas (Original)")
+    training_canvas_masked_plot = gr.Plot(label="2. Training Canvas with Mask Overlay")
+    training_inpainting_full_plot = gr.Plot(label="3. Training Inpainting - Full Model Output")
+    training_inpainting_composite_plot = gr.Plot(label="4. Training Inpainting - Composite")
     training_loss_history_plot = gr.Plot(label="Training Loss Progress")
 
     gr.Markdown("### Prediction Results")
@@ -509,7 +541,9 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             metrics_history_plot,
             frames_plot,
             training_canvas_plot,
-            training_reconstruction_plot,
+            training_canvas_masked_plot,
+            training_inpainting_full_plot,
+            training_inpainting_composite_plot,
             training_loss_history_plot,
             prediction_canvas_plot,
             predicted_frame_plot,

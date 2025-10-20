@@ -16,6 +16,7 @@ from models.autoencoder_concat_predictor import (
     build_canvas,
     canvas_to_tensor,
     compute_patch_mask_for_last_slot,
+    compute_randomized_patch_mask_for_last_slot,
 )
 from config import AutoencoderConcatPredictorWorldModelConfig as Config
 import world_model_utils
@@ -95,7 +96,7 @@ class AutoencoderConcatPredictorWorldModel:
 
         # Visualization state tracking
         self.last_training_canvas = None
-        self.last_training_canvas_reconstruction = None
+        self.last_training_mask = None  # Patch mask used during last training iteration
         self.last_training_loss = None
         self.last_training_iterations = 0
         self.last_training_loss_history = []  # List of losses during last training
@@ -114,7 +115,7 @@ class AutoencoderConcatPredictorWorldModel:
 
     def train_autoencoder(self, training_canvas: np.ndarray) -> float:
         """
-        Train the autoencoder on a canvas using standard random masking.
+        Train the autoencoder on a canvas using targeted randomized masking on the last frame.
 
         Args:
             training_canvas: HxWx3 canvas numpy array (uint8)
@@ -125,9 +126,29 @@ class AutoencoderConcatPredictorWorldModel:
         # Convert canvas to tensor
         canvas_tensor = canvas_to_tensor(training_canvas).to(self.device)
 
-        # Use standard train_step with random masking
+        # Get canvas dimensions
+        canvas_height, canvas_width = canvas_tensor.shape[-2:]
+
+        # Compute number of frames in the canvas
+        num_frames = Config.CANVAS_HISTORY_SIZE
+
+        # Compute randomized patch mask for the last frame slot
+        import config
+        patch_mask = compute_randomized_patch_mask_for_last_slot(
+            img_size=(canvas_height, canvas_width),
+            patch_size=16,
+            num_frame_slots=num_frames,
+            sep_width=Config.SEPARATOR_WIDTH,
+            mask_ratio_min=config.MASK_RATIO_MIN,
+            mask_ratio_max=config.MASK_RATIO_MAX,
+        ).to(self.device)
+
+        # Store the mask for visualization (no extra computation cost)
+        self.last_training_mask = patch_mask
+
+        # Train with targeted masking on last frame
         self.autoencoder.train()
-        loss_value = self.autoencoder.train_step(canvas_tensor, self.ae_optimizer)
+        loss_value = self.autoencoder.train_on_canvas(canvas_tensor, patch_mask, self.ae_optimizer)
         self.ae_scheduler.step()
         return loss_value
 
@@ -136,15 +157,61 @@ class AutoencoderConcatPredictorWorldModel:
         self.interleaved_history = []
         self.last_prediction = None
         self.last_training_canvas = None
-        self.last_training_canvas_reconstruction = None
+        self.last_training_mask = None
         self.last_training_loss = None
         self.last_training_iterations = 0
         self.last_training_loss_history = []
         self.last_prediction_canvas = None
 
+    def get_canvas_with_mask_overlay(self, canvas: np.ndarray, patch_mask: torch.Tensor) -> np.ndarray:
+        """
+        Visualize which patches are masked by overlaying a semi-transparent color.
+
+        Shows the original canvas with masked patches highlighted in red overlay.
+
+        Args:
+            canvas: HxWx3 canvas numpy array (uint8)
+            patch_mask: [1, num_patches] boolean tensor; True = masked patches
+
+        Returns:
+            Canvas with red overlay on masked patches as HxWx3 uint8 array
+        """
+        # Start with original canvas
+        canvas_overlay = canvas.copy().astype(np.float32)
+
+        # Get canvas dimensions and patch size
+        canvas_height, canvas_width = canvas.shape[:2]
+        patch_size = int(getattr(self.autoencoder, "patch_size", 16))
+        num_patches_height = canvas_height // patch_size
+        num_patches_width = canvas_width // patch_size
+
+        # Reshape patch mask to 2D grid: [1, num_patches] -> [num_patches_height, num_patches_width]
+        mask_grid = patch_mask.cpu().view(num_patches_height, num_patches_width).numpy()
+
+        # Create red overlay for masked patches
+        for patch_row in range(num_patches_height):
+            for patch_col in range(num_patches_width):
+                if mask_grid[patch_row, patch_col]:
+                    # Calculate pixel boundaries for this patch
+                    y_start = patch_row * patch_size
+                    y_end = y_start + patch_size
+                    x_start = patch_col * patch_size
+                    x_end = x_start + patch_size
+
+                    # Apply semi-transparent red overlay (50% blend)
+                    canvas_overlay[y_start:y_end, x_start:x_end, 0] = canvas_overlay[y_start:y_end, x_start:x_end, 0] * 0.5 + 255 * 0.5  # Red
+                    canvas_overlay[y_start:y_end, x_start:x_end, 1] = canvas_overlay[y_start:y_end, x_start:x_end, 1] * 0.5  # Green
+                    canvas_overlay[y_start:y_end, x_start:x_end, 2] = canvas_overlay[y_start:y_end, x_start:x_end, 2] * 0.5  # Blue
+
+        return canvas_overlay.astype(np.uint8)
+
     def get_canvas_reconstruction(self, canvas: np.ndarray) -> np.ndarray:
         """
         Get reconstruction of a canvas for visualization.
+
+        This performs a standard autoencoder reconstruction WITHOUT masking,
+        so the model can see all regions of the canvas. This is NOT what
+        happens during training.
 
         Args:
             canvas: HxWx3 canvas numpy array (uint8)
@@ -160,6 +227,94 @@ class AutoencoderConcatPredictorWorldModel:
                 reconstructed.clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
             ).astype(np.uint8)
         return reconstructed_np
+
+    def get_canvas_inpainting_full_output(self, canvas: np.ndarray, patch_mask: torch.Tensor) -> np.ndarray:
+        """
+        Get full model output when inpainting a canvas with specified patches masked.
+
+        Returns what the model reconstructs for ALL patches (both masked and unmasked).
+        Useful for debugging: shows if the model does anything weird with unmasked regions.
+
+        Args:
+            canvas: HxWx3 canvas numpy array (uint8)
+            patch_mask: [1, num_patches] boolean tensor; True = masked patches to inpaint
+
+        Returns:
+            Full model output as HxWx3 uint8 array
+        """
+        # Convert canvas to tensor
+        canvas_tensor = canvas_to_tensor(canvas).to(self.device)
+
+        # Run forward pass with masking - model predicts all patches
+        self.autoencoder.eval()
+        with torch.no_grad():
+            pred_patches, _ = self.autoencoder.forward_with_patch_mask(canvas_tensor, patch_mask)
+            img_pred = self.autoencoder.unpatchify(pred_patches)  # [1, 3, H, W]
+            full_output_np = (
+                img_pred.clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
+            ).astype(np.uint8)
+
+        return full_output_np
+
+    def get_canvas_inpainting_composite(self, canvas: np.ndarray, patch_mask: torch.Tensor) -> np.ndarray:
+        """
+        Get composite inpainting result: original pixels + model inpainted regions.
+
+        Returns a composite canvas showing:
+        - Original canvas pixels where patches are NOT masked (visible to encoder)
+        - Model predictions where patches ARE masked (inpainted by model)
+
+        This clearly shows only what the model must generate from scratch.
+
+        Args:
+            canvas: HxWx3 canvas numpy array (uint8)
+            patch_mask: [1, num_patches] boolean tensor; True = masked patches to inpaint
+
+        Returns:
+            Composite canvas as HxWx3 uint8 array (original + inpainted regions)
+        """
+        # Convert canvas to tensor
+        canvas_tensor = canvas_to_tensor(canvas).to(self.device)
+
+        # Run forward pass with masking to get predictions for all patches
+        self.autoencoder.eval()
+        with torch.no_grad():
+            pred_patches, _ = self.autoencoder.forward_with_patch_mask(canvas_tensor, patch_mask)
+            img_pred = self.autoencoder.unpatchify(pred_patches)  # [1, 3, H, W]
+
+        # Create composite: original pixels where mask=False, predictions where mask=True
+        # Get canvas dimensions and patch size
+        _, _, canvas_height, canvas_width = canvas_tensor.shape
+        patch_size = int(getattr(self.autoencoder, "patch_size", 16))
+        num_patches_height = canvas_height // patch_size
+        num_patches_width = canvas_width // patch_size
+
+        # Start with original canvas
+        composite_tensor = canvas_tensor.clone()
+
+        # Reshape patch mask to 2D grid: [1, num_patches] -> [num_patches_height, num_patches_width]
+        mask_grid = patch_mask.view(num_patches_height, num_patches_width)
+
+        # Replace masked patch regions with model predictions
+        for patch_row in range(num_patches_height):
+            for patch_col in range(num_patches_width):
+                # If this patch is masked, copy the prediction to the composite
+                if mask_grid[patch_row, patch_col]:
+                    # Calculate pixel boundaries for this patch
+                    y_start = patch_row * patch_size
+                    y_end = y_start + patch_size
+                    x_start = patch_col * patch_size
+                    x_end = x_start + patch_size
+
+                    # Copy predicted pixels for this masked patch
+                    composite_tensor[:, :, y_start:y_end, x_start:x_end] = img_pred[:, :, y_start:y_end, x_start:x_end]
+
+        # Convert composite tensor to numpy
+        composite_np = (
+            composite_tensor.clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
+        ).astype(np.uint8)
+
+        return composite_np
 
     def predict_next_frame(self, prediction_canvas_history: list) -> np.ndarray:
         """
@@ -187,12 +342,15 @@ class AutoencoderConcatPredictorWorldModel:
         # Convert to tensor
         canvas_tensor = canvas_to_tensor(prediction_canvas).to(self.device)
 
+        # Get patch size from the autoencoder model (don't hard-code)
+        patch_size = int(getattr(self.autoencoder, "patch_size", 16))
+
         # Compute patch mask for last slot
         num_frames = (len(prediction_canvas_history) + 1) // 2 + 1  # +1 for blank frame
         Ht, Wt = canvas_tensor.shape[-2:]
         patch_mask = compute_patch_mask_for_last_slot(
             img_size=(Ht, Wt),
-            patch_size=16,
+            patch_size=patch_size,
             K=num_frames,
             sep_width=Config.SEPARATOR_WIDTH,
         ).to(self.device)
@@ -262,7 +420,7 @@ class AutoencoderConcatPredictorWorldModel:
                     iterations = 0
                     self.last_training_loss_history = []
 
-                    while loss > Config.CANVAS_RECONSTRUCTION_THRESHOLD:
+                    while loss > Config.CANVAS_INPAINTING_THRESHOLD:
                         loss = self.train_autoencoder(training_canvas)
                         iterations += 1
                         self.last_training_loss_history.append(loss)
