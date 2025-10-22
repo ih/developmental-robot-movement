@@ -7,7 +7,7 @@ TRANSFORM = transforms.Compose([
 ])
 
 # Shared Autoencoder Training Parameters
-MASK_RATIO_MIN = .3   # Minimum mask ratio for randomized masking
+MASK_RATIO_MIN = .7   # Minimum mask ratio for randomized masking
 MASK_RATIO_MAX = 1  # Maximum mask ratio for randomized masking
 
 # Autoencoder Latent Predictor World Model Parameters
@@ -116,7 +116,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
 
     # Training thresholds
-    CANVAS_INPAINTING_THRESHOLD = 0.0016  # Threshold for stopping autoencoder training (loss on masked patches only)
+    CANVAS_INPAINTING_THRESHOLD = 0.0001  # Threshold for stopping autoencoder training (loss on masked patches only)
 
     # Optimizer parameters
     AUTOENCODER_LR = 1e-4          # Learning rate for autoencoder training

@@ -126,12 +126,10 @@ def load_session(session_choice):
         action, _ = recorded_selector()
         return action
 
-    # Note: training_callback will be set dynamically in run_world_model when progress is available
     world_model = AutoencoderConcatPredictorWorldModel(
         replay_robot,
         action_selector=action_selector_adapter,
         device=device,
-        training_callback=None  # Will be set in run_world_model
     )
 
     info += "\n\n**World model initialized and ready to run**"
@@ -153,99 +151,30 @@ def update_frame(frame_idx):
 
     return frame, frame_info
 
-def run_world_model(num_iterations, progress=gr.Progress()):
-    """Run the world model for N iterations with live metrics tracking"""
+def run_world_model(num_iterations):
+    """Run the world model for N iterations with live metrics tracking and periodic UI updates"""
     global world_model, replay_robot
 
     if world_model is None:
-        return "Please load a session first", "", None, None, None, None, None, None, None, None, None, "", "--"
+        yield "Please load a session first", "", None, None, None, None, None, None, None, None, "", "--"
+        return
 
     if num_iterations <= 0:
-        return "Number of iterations must be greater than 0", "", None, None, None, None, None, None, None, None, None, "", "--"
+        yield "Number of iterations must be greater than 0", "", None, None, None, None, None, None, None, None, "", "--"
+        return
 
     # Initialize or retrieve metrics history
     if not hasattr(world_model, '_metrics_history'):
         world_model._metrics_history = {
             'iteration': [],
             'training_loss': [],
-            'training_iterations': [],
             'prediction_error': [],
             'iteration_time': [],
         }
 
-    try:
-        import time
-        loop_count = 0  # Track how many times we loop back to the beginning
-
-        # Run world model with progress updates and metric tracking
-        for i in range(num_iterations):
-            start_time = time.time()
-
-            # Set up training callback to update progress bar during training
-            iter_num = len(world_model._metrics_history['iteration']) + 1
-
-            def training_progress_callback(train_iter, train_loss):
-                desc = f"Iter {iter_num}: Training step {train_iter}, loss={format_loss(train_loss)}"
-                progress((i + 0.5) / num_iterations, desc=desc)
-
-            world_model.training_callback = training_progress_callback
-
-            # Run one iteration, catching StopIteration to loop the session
-            iteration_successful = False
-            while not iteration_successful:
-                try:
-                    world_model.run(max_iterations=1)
-                    iteration_successful = True
-                except StopIteration:
-                    # Session ended, reset reader to loop back to beginning
-                    # Model training progress is preserved (weights, optimizer state)
-                    # but we need to clear the frame/action history buffer
-                    loop_count += 1
-                    print(f"Session ended at iteration {i+1}/{num_iterations}, looping back to beginning (loop #{loop_count})...")
-                    replay_robot.reader.reset()
-                    # Clear the interleaved history to avoid corrupted frame/action structure
-                    world_model.interleaved_history = []
-                    # Clear prediction state for clean restart
-                    world_model.last_prediction = None
-                    world_model.last_prediction_canvas = None
-                    # Retry the iteration from the beginning of the session
-
-            iteration_time = time.time() - start_time
-
-            # Get current metrics from world model's stored state
-            # Don't call get_observation() again as it would skip a frame
-            last_prediction_np = world_model.last_prediction
-            prediction_error = None
-
-            # Get current frame from history if available
-            if len(world_model.interleaved_history) > 0 and last_prediction_np is not None:
-                # Find the last frame in history (skip actions)
-                for idx in range(len(world_model.interleaved_history) - 1, -1, -1):
-                    if idx % 2 == 0:  # Even indices are frames
-                        import world_model_utils
-                        current_frame_np = world_model.interleaved_history[idx]
-                        pred_tensor = world_model_utils.to_model_tensor(last_prediction_np, device)
-                        curr_tensor = world_model_utils.to_model_tensor(current_frame_np, device)
-                        prediction_error = torch.nn.functional.mse_loss(pred_tensor, curr_tensor).item()
-                        break
-
-            # Record metrics
-            iter_num = len(world_model._metrics_history['iteration']) + 1
-            world_model._metrics_history['iteration'].append(iter_num)
-            world_model._metrics_history['training_loss'].append(world_model.last_training_loss if world_model.last_training_loss else None)
-            world_model._metrics_history['training_iterations'].append(world_model.last_training_iterations)
-            world_model._metrics_history['prediction_error'].append(prediction_error)
-            world_model._metrics_history['iteration_time'].append(iteration_time)
-
-            # Update progress with final iteration metrics
-            desc = f"Iter {iter_num} complete: "
-            if world_model.last_training_loss:
-                desc += f"Final Loss={format_loss(world_model.last_training_loss)} ({world_model.last_training_iterations} steps) "
-            if prediction_error:
-                desc += f"Pred Err={format_loss(prediction_error)} "
-            desc += f"Time={iteration_time:.2f}s"
-
-            progress((i + 1) / num_iterations, desc=desc)
+    # Helper function to generate all visualizations
+    def generate_visualizations(loop_count, completed=False):
+        """Generate all plots and metrics for current state"""
 
         # Get final state from world model's stored state
         last_prediction_np = world_model.last_prediction
@@ -266,62 +195,59 @@ def run_world_model(num_iterations, progress=gr.Progress()):
             prediction_error = torch.nn.functional.mse_loss(pred_tensor, curr_tensor).item()
 
         # Create current metrics display
-        current_metrics = f"**Latest Iteration Metrics:**\n\n"
-        current_metrics += f"- Training Loss: {format_loss(world_model.last_training_loss)}\n"
-        current_metrics += f"- Training Iterations: {world_model.last_training_iterations}\n"
-        current_metrics += f"- Prediction Error: {format_loss(prediction_error)}\n"
-        current_metrics += f"- Iteration Time: {world_model._metrics_history['iteration_time'][-1]:.2f}s\n"
+        current_metrics = ""
+        if len(world_model._metrics_history['iteration']) > 0:
+            current_metrics = f"**Latest Iteration Metrics:**\n\n"
+            current_metrics += f"- Training Loss: {format_loss(world_model.last_training_loss)}\n"
+            current_metrics += f"- Prediction Error: {format_loss(prediction_error)}\n"
+            current_metrics += f"- Iteration Time: {world_model._metrics_history['iteration_time'][-1]:.2f}s\n"
 
-        # Create metrics history plots
-        fig_metrics, axes = plt.subplots(2, 2, figsize=(12, 10))
+        # Create metrics history plots (3 plots in a row)
+        fig_metrics = None
+        if len(world_model._metrics_history['iteration']) > 0:
+            fig_metrics, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-        # Training Loss over iterations
-        valid_train_loss = [(i, loss) for i, loss in zip(world_model._metrics_history['iteration'],
-                                                          world_model._metrics_history['training_loss']) if loss is not None]
-        if valid_train_loss:
-            iters, losses = zip(*valid_train_loss)
-            axes[0, 0].plot(iters, losses, 'b-o', linewidth=2, markersize=4)
-            axes[0, 0].set_xlabel('Iteration')
-            axes[0, 0].set_ylabel('Training Loss')
-            axes[0, 0].set_title('Training Loss Over Time')
-            axes[0, 0].grid(True, alpha=0.3)
+            # Training Loss over iterations
+            valid_train_loss = [(i, loss) for i, loss in zip(world_model._metrics_history['iteration'],
+                                                              world_model._metrics_history['training_loss']) if loss is not None]
+            if valid_train_loss:
+                iters, losses = zip(*valid_train_loss)
+                axes[0].plot(iters, losses, 'b-o', linewidth=2, markersize=4)
+                axes[0].set_xlabel('Iteration')
+                axes[0].set_ylabel('Training Loss')
+                axes[0].set_title('Training Loss Over Time')
+                axes[0].grid(True, alpha=0.3)
 
-        # Training Iterations over iterations
-        valid_train_iters = [(i, ti) for i, ti in zip(world_model._metrics_history['iteration'],
-                                                        world_model._metrics_history['training_iterations']) if ti > 0]
-        if valid_train_iters:
-            iters, train_iters = zip(*valid_train_iters)
-            axes[0, 1].plot(iters, train_iters, 'g-o', linewidth=2, markersize=4)
-            axes[0, 1].set_xlabel('Iteration')
-            axes[0, 1].set_ylabel('Training Iterations')
-            axes[0, 1].set_title('Training Iterations Per World Model Iteration')
-            axes[0, 1].grid(True, alpha=0.3)
+            # Prediction Error over iterations
+            valid_pred_error = [(i, err) for i, err in zip(world_model._metrics_history['iteration'],
+                                                            world_model._metrics_history['prediction_error']) if err is not None]
+            if valid_pred_error:
+                iters, errors = zip(*valid_pred_error)
+                axes[1].plot(iters, errors, 'r-o', linewidth=2, markersize=4)
+                axes[1].set_xlabel('Iteration')
+                axes[1].set_ylabel('Prediction Error (MSE)')
+                axes[1].set_title('Prediction Error Over Time')
+                axes[1].grid(True, alpha=0.3)
 
-        # Prediction Error over iterations
-        valid_pred_error = [(i, err) for i, err in zip(world_model._metrics_history['iteration'],
-                                                        world_model._metrics_history['prediction_error']) if err is not None]
-        if valid_pred_error:
-            iters, errors = zip(*valid_pred_error)
-            axes[1, 0].plot(iters, errors, 'r-o', linewidth=2, markersize=4)
-            axes[1, 0].set_xlabel('Iteration')
-            axes[1, 0].set_ylabel('Prediction Error (MSE)')
-            axes[1, 0].set_title('Prediction Error Over Time')
-            axes[1, 0].grid(True, alpha=0.3)
+            # Iteration Time over iterations
+            axes[2].plot(world_model._metrics_history['iteration'],
+                           world_model._metrics_history['iteration_time'], 'purple', linewidth=2, marker='o', markersize=4)
+            axes[2].set_xlabel('Iteration')
+            axes[2].set_ylabel('Time (seconds)')
+            axes[2].set_title('Iteration Time Over Time')
+            axes[2].grid(True, alpha=0.3)
 
-        # Iteration Time over iterations
-        axes[1, 1].plot(world_model._metrics_history['iteration'],
-                       world_model._metrics_history['iteration_time'], 'purple', linewidth=2, marker='o', markersize=4)
-        axes[1, 1].set_xlabel('Iteration')
-        axes[1, 1].set_ylabel('Time (seconds)')
-        axes[1, 1].set_title('Iteration Time Over Time')
-        axes[1, 1].grid(True, alpha=0.3)
+            plt.tight_layout()
 
-        plt.tight_layout()
+        # Create status message
+        total_iters = len(world_model._metrics_history['iteration'])
+        if completed:
+            status_msg = f"**Completed {num_iterations} iterations** (Total: {total_iters} iterations)"
+        else:
+            status_msg = f"**Running... {total_iters}/{num_iterations} iterations complete**"
 
-        # Create visualizations
-        status_msg = f"**Completed {num_iterations} iterations** (Total: {len(world_model._metrics_history['iteration'])} iterations)"
         if loop_count > 0:
-            status_msg += f"\n\n*Session looped {loop_count} time{'s' if loop_count > 1 else ''} to complete all iterations*"
+            status_msg += f"\n\n*Session looped {loop_count} time{'s' if loop_count > 1 else ''}*"
 
         # Current frame and prediction
         fig_frames = None
@@ -347,7 +273,6 @@ def run_world_model(num_iterations, progress=gr.Progress()):
         fig_training_canvas_masked = None
         fig_training_inpainting_full = None
         fig_training_inpainting_composite = None
-        fig_training_loss_plot = None
         training_info = ""
 
         if world_model.last_training_canvas is not None:
@@ -358,20 +283,7 @@ def run_world_model(num_iterations, progress=gr.Progress()):
             ax.axis("off")
             plt.tight_layout()
 
-            training_info = f"**Training Loss:** {format_loss(world_model.last_training_loss)}\n\n"
-            training_info += f"**Training Iterations:** {world_model.last_training_iterations}"
-
-            # Plot training loss history
-            if world_model.last_training_loss_history:
-                fig_training_loss_plot, ax = plt.subplots(1, 1, figsize=(10, 5))
-                ax.plot(range(1, len(world_model.last_training_loss_history) + 1),
-                       world_model.last_training_loss_history, 'b-', linewidth=2)
-                ax.set_xlabel('Training Iteration')
-                ax.set_ylabel('Loss')
-                ax.set_title('Training Loss Progress (Current Iteration)')
-                ax.grid(True, alpha=0.3)
-                ax.set_yscale('log')  # Log scale to see progress better
-                plt.tight_layout()
+            training_info = f"**Training Loss:** {format_loss(world_model.last_training_loss)}"
 
             # Generate additional visualizations if mask is available
             if world_model.last_training_mask is not None:
@@ -426,12 +338,67 @@ def run_world_model(num_iterations, progress=gr.Progress()):
             ax.axis("off")
             plt.tight_layout()
 
-        return status_msg, current_metrics, fig_metrics, fig_frames, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite, fig_training_loss_plot, fig_prediction_canvas, fig_predicted_frame, training_info, format_loss(prediction_error)
+        return status_msg, current_metrics, fig_metrics, fig_frames, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite, fig_prediction_canvas, fig_predicted_frame, training_info, format_loss(prediction_error)
+
+    try:
+        import time
+        loop_count = 0
+        UPDATE_INTERVAL = 5  # Update UI every N iterations
+
+        # Run world model with metric tracking and periodic UI updates
+        for i in range(num_iterations):
+            start_time = time.time()
+
+            # Run one iteration, catching StopIteration to loop the session
+            iteration_successful = False
+            while not iteration_successful:
+                try:
+                    world_model.run(max_iterations=1)
+                    iteration_successful = True
+                except StopIteration:
+                    # Session ended, reset reader to loop back to beginning
+                    loop_count += 1
+                    print(f"Session ended at iteration {i+1}/{num_iterations}, looping back to beginning (loop #{loop_count})...")
+                    replay_robot.reader.reset()
+                    world_model.interleaved_history = []
+                    world_model.last_prediction = None
+                    world_model.last_prediction_canvas = None
+
+            iteration_time = time.time() - start_time
+
+            # Get current metrics from world model's stored state
+            last_prediction_np = world_model.last_prediction
+            prediction_error = None
+
+            # Get current frame from history if available
+            if len(world_model.interleaved_history) > 0 and last_prediction_np is not None:
+                for idx in range(len(world_model.interleaved_history) - 1, -1, -1):
+                    if idx % 2 == 0:  # Even indices are frames
+                        import world_model_utils
+                        current_frame_np = world_model.interleaved_history[idx]
+                        pred_tensor = world_model_utils.to_model_tensor(last_prediction_np, device)
+                        curr_tensor = world_model_utils.to_model_tensor(current_frame_np, device)
+                        prediction_error = torch.nn.functional.mse_loss(pred_tensor, curr_tensor).item()
+                        break
+
+            # Record metrics
+            iter_num = len(world_model._metrics_history['iteration']) + 1
+            world_model._metrics_history['iteration'].append(iter_num)
+            world_model._metrics_history['training_loss'].append(world_model.last_training_loss if world_model.last_training_loss else None)
+            world_model._metrics_history['prediction_error'].append(prediction_error)
+            world_model._metrics_history['iteration_time'].append(iteration_time)
+
+            # Periodically yield updates to refresh the UI
+            if (i + 1) % UPDATE_INTERVAL == 0 or (i + 1) == num_iterations:
+                yield generate_visualizations(loop_count, completed=(i + 1) == num_iterations)
+
+        # Final update
+        yield generate_visualizations(loop_count, completed=True)
 
     except Exception as e:
         import traceback
         error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
-        return error_msg, "", None, None, None, None, None, None, None, None, None, "", "--"
+        yield error_msg, "", None, None, None, None, None, None, None, None, "", "--"
 
 # Build Gradio interface
 with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as demo:
@@ -496,7 +463,6 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     training_canvas_masked_plot = gr.Plot(label="2. Training Canvas with Mask Overlay")
     training_inpainting_full_plot = gr.Plot(label="3. Training Inpainting - Full Model Output")
     training_inpainting_composite_plot = gr.Plot(label="4. Training Inpainting - Composite")
-    training_loss_history_plot = gr.Plot(label="Training Loss Progress")
 
     gr.Markdown("### Prediction Results")
     prediction_canvas_plot = gr.Plot(label="Prediction Canvas")
@@ -544,7 +510,6 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             training_canvas_masked_plot,
             training_inpainting_full_plot,
             training_inpainting_composite_plot,
-            training_loss_history_plot,
             prediction_canvas_plot,
             predicted_frame_plot,
             training_info_display,

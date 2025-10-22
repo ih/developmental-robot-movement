@@ -30,7 +30,7 @@ class AutoencoderConcatPredictorWorldModel:
     1. Get current frame and add to interleaved history
     2. Output reconstruction loss between last prediction and current frame
     3. Create training canvas from history ending in current frame
-    4. Train autoencoder on canvas until reconstruction loss below threshold
+    4. Train autoencoder on canvas (one step)
     5. Select action and add to history
     6. Create prediction canvas with selected action and masked next frame
     7. Run reconstruction and store predicted next frame
@@ -204,29 +204,6 @@ class AutoencoderConcatPredictorWorldModel:
                     canvas_overlay[y_start:y_end, x_start:x_end, 2] = canvas_overlay[y_start:y_end, x_start:x_end, 2] * 0.5  # Blue
 
         return canvas_overlay.astype(np.uint8)
-
-    def get_canvas_reconstruction(self, canvas: np.ndarray) -> np.ndarray:
-        """
-        Get reconstruction of a canvas for visualization.
-
-        This performs a standard autoencoder reconstruction WITHOUT masking,
-        so the model can see all regions of the canvas. This is NOT what
-        happens during training.
-
-        Args:
-            canvas: HxWx3 canvas numpy array (uint8)
-
-        Returns:
-            Reconstructed canvas as HxWx3 uint8 array
-        """
-        canvas_tensor = canvas_to_tensor(canvas).to(self.device)
-        self.autoencoder.eval()
-        with torch.no_grad():
-            reconstructed = self.autoencoder.reconstruct(canvas_tensor)
-            reconstructed_np = (
-                reconstructed.clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
-            ).astype(np.uint8)
-        return reconstructed_np
 
     def get_canvas_inpainting_full_output(self, canvas: np.ndarray, patch_mask: torch.Tensor) -> np.ndarray:
         """
@@ -414,24 +391,18 @@ class AutoencoderConcatPredictorWorldModel:
                     # Store for visualization
                     self.last_training_canvas = training_canvas.copy()
 
-                    # Train autoencoder until reconstruction loss below threshold
-                    print("Training autoencoder on canvas...")
-                    loss = float('inf')
-                    iterations = 0
-                    self.last_training_loss_history = []
+                    # Train autoencoder on canvas (one step)
+                    print("Training autoencoder on canvas (one step)...")
+                    loss = self.train_autoencoder(training_canvas)
+                    self.last_training_loss_history = [loss]
 
-                    while loss > Config.CANVAS_INPAINTING_THRESHOLD:
-                        loss = self.train_autoencoder(training_canvas)
-                        iterations += 1
-                        self.last_training_loss_history.append(loss)
-
-                        # Call training callback if provided
-                        if self.training_callback:
-                            self.training_callback(iterations, loss)
+                    # Call training callback if provided
+                    if self.training_callback:
+                        self.training_callback(1, loss)
 
                     self.last_training_loss = loss
-                    self.last_training_iterations = iterations
-                    print(f"Training complete, final loss: {loss:.6f}, iterations: {iterations}")
+                    self.last_training_iterations = 1
+                    print(f"Training step complete, loss: {loss:.6f}")
                 else:
                     print(f"Skipping training (need exactly {2 * Config.CANVAS_HISTORY_SIZE - 1} elements, have {len(self.interleaved_history)})")
 
