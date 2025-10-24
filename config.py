@@ -7,7 +7,7 @@ TRANSFORM = transforms.Compose([
 ])
 
 # Shared Autoencoder Training Parameters
-MASK_RATIO_MIN = .7   # Minimum mask ratio for randomized masking
+MASK_RATIO_MIN = 1   # Minimum mask ratio for randomized masking
 MASK_RATIO_MAX = 1  # Maximum mask ratio for randomized masking
 
 # Autoencoder Latent Predictor World Model Parameters

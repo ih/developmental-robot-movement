@@ -50,14 +50,15 @@ This repository contains research code for developmental robot movement with a m
 
 ### Autoencoder Concat Predictor World Model
 - **Canvas-based approach**: Concatenates history frames horizontally with action-colored separators between them
-- **Targeted masking**: Uses masked autoencoder to inpaint masked next-frame slot for prediction
-- **Main loop architecture**: Get frame → compute prediction error → train on canvas → select action → predict next frame → execute action
+- **Targeted masking**: Uses masked autoencoder to inpaint masked next-frame slot for prediction with full masking (MASK_RATIO = 1.0)
+- **Main loop architecture**: Get frame → compute prediction error → single-step train on canvas → select action → predict next frame → execute action
+- **MAE-native training**: Optimizes masked patches only (not full canvas reconstruction) for efficient inpainting learning
 - **Action encoding**: Actions encoded as thin colored separators (e.g., red for stay, green for move)
 - **Non-square canvases**: Supports non-square image dimensions (e.g., 224x688 for 3 frames + 2 separators)
 - **Pluggable action selectors**: Custom action selection via `action_selector` parameter (returns action only, no metadata)
-- **Visualization state**: Tracks last training canvas, reconstruction, prediction canvas, and predicted frame
-- **Training callback**: Optional callback for live training progress updates in UI
-- **Quality gating**: Trains autoencoder until reconstruction loss below threshold before proceeding
+- **Visualization state**: Tracks training canvas with mask overlay, inpainting output, composite reconstruction, and predicted frame
+- **Training callback**: Optional callback for periodic UI updates during training
+- **Quality gating**: Single training step per iteration with inpainting threshold of 0.0001
 
 ### Robot Runner
 - **RobotRunner class**: Lightweight runner for executing actions without learning or world model components
@@ -94,18 +95,18 @@ This repository contains research code for developmental robot movement with a m
 
 ### Concat World Model Explorer
 - **concat_world_model_explorer_gradio.py**: Web-based Gradio interface for running AutoencoderConcatPredictorWorldModel on recorded toroidal dot sessions
-- **Canvas-based approach**: Uses targeted masked autoencoder with canvas-based frame concatenation instead of latent-space prediction
-- **Session replay**: Load and replay recorded sessions with authentic world model training
-- **Live progress tracking**: Real-time display of training loss, prediction error, and iteration timing during execution
-- **Training loss visualization**: Live plot of training loss (log scale) during autoencoder training iterations shown in progress bar
-- **Comprehensive metrics**: Tracks training loss, training iterations, prediction error, and iteration time across all iterations
-- **Visual feedback**: Displays current frame, predicted frame, training canvas, reconstructed canvas, and prediction canvas
-- **Metric graphs**: Four plots showing training loss history, training iterations, prediction error, and iteration time over all iterations
-- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method for real training experience
+- **Canvas-based approach**: Uses targeted masked autoencoder with full masking (MASK_RATIO = 1.0) for next-frame inpainting
+- **Session replay**: Load and replay recorded sessions with authentic single-step world model training
+- **Live progress tracking**: Real-time display of prediction error and iteration timing during execution
+- **Comprehensive visualizations**: Shows 4 training views - original canvas, masked canvas overlay, full inpainting output, and composite reconstruction
+- **Prediction display**: Current frame, predicted next frame, and prediction error visualization
+- **Metric graphs**: Plots showing prediction error and iteration time over all iterations
+- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method with periodic UI updates
 
 ### Neural Vision System
-- **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
-- **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for better generalization
+- **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful transformer encoder and powerful transformer decoder
+- **Symmetric architecture**: Decoder uses transformer blocks with same depth and attention heads as encoder by default (configurable via `decoder_depth` and `decoder_num_heads` parameters)
+- **Dynamic masking**: Randomized mask ratios for better generalization (shared config: MASK_RATIO_MIN and MASK_RATIO_MAX)
 - **TransformerActionConditionedPredictor**: Causal transformer that interleaves visual features with action tokens
 - **FiLM conditioning**: Feature-wise Linear Modulation integrates action information into transformer layers via learned affine transformations (gamma, beta)
 - **Action normalization**: All action channels mapped to [-1, 1] range before embedding for consistent FiLM conditioning
@@ -238,12 +239,13 @@ python concat_world_model_explorer_gradio.py
 - **Canvas-based world model**: Interactive web UI for exploring AutoencoderConcatPredictorWorldModel on toroidal dot sessions
 - **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/`
 - **Frame navigation**: Browse session frames with slider and text input
-- **World model execution**: Run world model for specified number of iterations with real-time progress
-- **Live training metrics**: Display of reconstruction loss, prediction error, and iteration timing during execution
-- **Training loss progress**: Live plot of training loss during autoencoder training iterations (log scale) shown in progress bar
-- **Post-run visualizations**: Current frame, predicted frame, prediction error, training canvas, reconstructed canvas, and prediction canvas
-- **Comprehensive graphs**: Four plots tracking training loss, training iterations, prediction error, and iteration time
-- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method for real training experience
+- **World model execution**: Run world model for specified number of iterations with single-step training per iteration
+- **Full masking approach**: Uses MASK_RATIO = 1.0 for complete next-frame inpainting
+- **Live progress tracking**: Real-time display of prediction error and iteration timing during execution
+- **Comprehensive visualizations**: Four training views (original canvas, masked overlay, full inpainting output, composite) plus prediction display
+- **Post-run visualizations**: Current frame, predicted frame, and prediction error
+- **Metric graphs**: Plots tracking prediction error and iteration time over all iterations
+- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method with MAE-native masked patch optimization
 
 ## Dependencies
 
@@ -273,10 +275,15 @@ Required Python packages:
 - `toroidal_dot_interface.py`: ToroidalDotRobot implementation of RobotInterface
 - `models/`: Neural network architectures directory
   - `models/__init__.py`: Module exports for clean imports
-  - `models/autoencoder.py`: MaskedAutoencoderViT implementation with fixed positional embeddings
-  - `models/predictor.py`: TransformerActionConditionedPredictor with FiLM conditioning, delta latent prediction, image-based action classification, and attention introspection
+  - `models/base_autoencoder.py`: Base class for autoencoder implementations
+  - `models/base_predictor.py`: Base class for predictor implementations
+  - `models/vit_autoencoder.py`: MaskedAutoencoderViT with powerful transformer encoder and decoder
+  - `models/cnn_autoencoder.py`: CNN-based autoencoder implementation
+  - `models/transformer_predictor.py`: TransformerActionConditionedPredictor with FiLM conditioning, delta latent prediction, image-based action classification, and attention introspection
+  - `models/lstm_predictor.py`: LSTM-based predictor implementation
+  - `models/action_classifier.py`: Action classification module for action reconstruction loss
   - `models/encoder_layer_with_attn.py`: Custom transformer encoder layer that optionally returns attention maps
-  - `models/autoencoder_concat_predictor.py`: Canvas building utilities and TargetedMAEWrapper for masked autoencoder with custom patch masks
+  - `models/autoencoder_concat_predictor.py`: Canvas building utilities and TargetedMAEWrapper for targeted masked autoencoder inpainting
 - `autoencoder_latent_predictor_world_model.py`: Main world model implementation with comprehensive training and logging
 - `autoencoder_concat_predictor_world_model.py`: Canvas-based world model using targeted masked autoencoder with frame concatenation
 - `robot_runner.py`: Lightweight runner for executing actions without learning components

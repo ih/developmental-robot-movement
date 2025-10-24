@@ -356,9 +356,15 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
         # Now add decoder positional embedding and re-insert CLS at the front
         dec_input = torch.cat([dec[:, :1, :], full_tokens], dim=1) + self.decoder_pos_embed
 
+        # Pass through transformer decoder blocks (same as forward_decoder)
+        x = dec_input
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+
         # Predict patches
-        pred = self.decoder_pred(dec_input)  # [B, 1+L, P^2*3]
-        pred = pred[:, 1:, :]                # drop CLS
+        pred = self.decoder_pred(x)     # [B, 1+L, P^2*3]
+        pred = pred[:, 1:, :]           # drop CLS
         return pred, latent  # pred is per-patch predictions in *original* order
 
 # ------------------------------

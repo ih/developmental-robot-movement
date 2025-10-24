@@ -11,10 +11,11 @@ from models.base_autoencoder import BaseAutoencoder
 class MaskedAutoencoderViT(BaseAutoencoder):
     """
     A Vision Transformer (ViT) based Masked Autoencoder (MAE)
-    with a POWERFUL encoder and a LIGHTWEIGHT MLP decoder.
+    with a POWERFUL encoder and a POWERFUL TRANSFORMER decoder.
     """
     def __init__(self, img_height=224, img_width=224, patch_size=16, embed_dim=256,
-                 decoder_embed_dim=128, depth=5, num_heads=4, mlp_ratio=4.):
+                 decoder_embed_dim=128, depth=5, num_heads=4, mlp_ratio=4.,
+                 decoder_depth=None, decoder_num_heads=None):
         super().__init__()
 
         # Store dimensions for base class interface
@@ -38,17 +39,23 @@ class MaskedAutoencoderViT(BaseAutoencoder):
         # --------------------------------------------------------------------------
 
         # --------------------------------------------------------------------------
-        # MAE DECODER (Lightweight MLP) - NEW AND SIMPLER!
+        # MAE DECODER (Powerful Transformer) - Same power as encoder!
+        # Default to same depth and num_heads as encoder if not specified
+        decoder_depth = decoder_depth if decoder_depth is not None else depth
+        decoder_num_heads = decoder_num_heads if decoder_num_heads is not None else num_heads
+
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)
-        
-        # A simple MLP head is enough for the decoder
-        self.decoder_pred = nn.Sequential(
-            nn.Linear(decoder_embed_dim, decoder_embed_dim),
-            nn.ReLU(),
-            nn.Linear(decoder_embed_dim, patch_size**2 * 3) # Predict the RGB values for each patch
-        )
+
+        # Powerful transformer decoder blocks (same architecture as encoder)
+        self.decoder_blocks = nn.ModuleList([
+            timm.models.vision_transformer.Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True)
+            for _ in range(decoder_depth)])
+        self.decoder_norm = nn.LayerNorm(decoder_embed_dim)
+
+        # Final prediction head (projects to pixel values)
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * 3, bias=True)
         # --------------------------------------------------------------------------
 
         # Initialize fixed 2D sin-cos positional embeddings for encoder/decoder
@@ -143,21 +150,30 @@ class MaskedAutoencoderViT(BaseAutoencoder):
         return x, ids_restore
 
     def forward_decoder(self, x, ids_restore):
-        # (This function is now much simpler)
+        # Embed encoder output to decoder dimension
         x = self.decoder_embed(x)
         B, N, C = x.shape
         L = ids_restore.shape[1]
         len_keep = N - 1
+
+        # Insert mask tokens for masked patches
         mask_tokens = self.mask_token.repeat(B, L - len_keep, 1)
         x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)
         x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, C))
         x = torch.cat([x[:, :1, :], x_], dim=1)
+
+        # Add positional embeddings
         x = x + self.decoder_pos_embed
-        
-        # Pass through our simple MLP head
+
+        # Pass through transformer decoder blocks
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+
+        # Final prediction head
         x = self.decoder_pred(x)
-        
-        # remove cls token
+
+        # Remove cls token
         x = x[:, 1:, :]
         return x
 

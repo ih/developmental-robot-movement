@@ -82,17 +82,18 @@ This repository contains research code for developmental robot movement with a m
 
 ### Concat World Model Explorer
 - **concat_world_model_explorer_gradio.py**: Web-based Gradio interface for running AutoencoderConcatPredictorWorldModel on recorded toroidal dot sessions
-- **Canvas-based approach**: Uses targeted masked autoencoder with canvas-based frame concatenation
-- **Session replay**: Load and replay recorded sessions with world model training
-- **Live progress tracking**: Real-time display of training loss, prediction error, and iteration timing
-- **Comprehensive metrics**: Tracks training loss, training iterations, prediction error, and iteration time across all iterations
-- **Visual feedback**: Displays current frame, predicted frame, training canvas, reconstructed canvas, and prediction canvas
-- **Training loss visualization**: Live plot of training loss (log scale) during autoencoder training iterations
-- **Metric graphs**: Four plots showing training loss, training iterations, prediction error, and iteration time over all iterations
+- **Canvas-based approach**: Uses targeted masked autoencoder with full masking (MASK_RATIO = 1.0) for next-frame inpainting
+- **Session replay**: Load and replay recorded sessions with authentic single-step world model training
+- **Live progress tracking**: Real-time display of prediction error and iteration timing during execution
+- **Comprehensive visualizations**: Shows 4 training views - original canvas, masked canvas overlay, full inpainting output, and composite reconstruction
+- **Prediction display**: Current frame, predicted next frame, and prediction error visualization
+- **Metric graphs**: Plots showing prediction error and iteration time over all iterations
+- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method with periodic UI updates
 
 ### Neural Vision System
-- **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful encoder and lightweight MLP decoder
-- **Dynamic masking**: Randomized mask ratios (30%-85%) during autoencoder training for improved generalization
+- **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful transformer encoder and powerful transformer decoder
+- **Symmetric architecture**: Decoder uses transformer blocks with same depth and attention heads as encoder by default (configurable via `decoder_depth` and `decoder_num_heads` parameters)
+- **Dynamic masking**: Randomized mask ratios for improved generalization (shared config: MASK_RATIO_MIN and MASK_RATIO_MAX)
 - **TransformerActionConditionedPredictor**: Causal transformer that interleaves visual features with action tokens
 - **Fresh prediction training**: Predictors trained using fresh predictions with consistent loss calculation
 - **Dual loss training**: Combined patch-space reconstruction + latent-space prediction losses for encoder optimization (current weights: 0.8 patch, 0.2 latent)
@@ -262,12 +263,13 @@ python concat_world_model_explorer_gradio.py
 - **Canvas-based world model**: Interactive web UI for exploring AutoencoderConcatPredictorWorldModel on toroidal dot sessions
 - **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/`
 - **Frame navigation**: Browse session frames with slider and text input
-- **World model execution**: Run world model for specified number of iterations with real-time progress
-- **Live training metrics**: Display of reconstruction loss, prediction error, and iteration timing during execution
-- **Training loss progress**: Live plot of training loss during autoencoder training iterations (log scale)
-- **Post-run visualizations**: Current frame, predicted frame, prediction error, training canvas, reconstructed canvas, and prediction canvas
-- **Comprehensive graphs**: Four plots tracking training loss, training iterations, prediction error, and iteration time
-- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method for real training experience
+- **World model execution**: Run world model for specified number of iterations with single-step training per iteration
+- **Full masking approach**: Uses MASK_RATIO = 1.0 for complete next-frame inpainting
+- **Live progress tracking**: Real-time display of prediction error and iteration timing during execution
+- **Comprehensive visualizations**: Four training views (original canvas, masked overlay, full inpainting output, composite) plus prediction display
+- **Post-run visualizations**: Current frame, predicted frame, and prediction error
+- **Metric graphs**: Plots tracking prediction error and iteration time over all iterations
+- **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method with MAE-native masked patch optimization
 
 ### Interactive JetBot Testing
 ```bash
