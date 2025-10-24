@@ -151,6 +151,146 @@ def update_frame(frame_idx):
 
     return frame, frame_info
 
+def train_on_single_canvas(frame_idx, num_training_steps):
+    """Train autoencoder on a single canvas built from selected frame and its history"""
+    global world_model, session_state
+
+    if world_model is None:
+        return "Please load a session first", "", None, None, None, None, None
+
+    if not session_state.get("observations") or not session_state.get("actions"):
+        return "No session data available", "", None, None, None, None, None
+
+    observations = session_state["observations"]
+    actions = session_state["actions"]
+
+    # Validate frame index
+    frame_idx = int(frame_idx)
+    if frame_idx >= len(observations):
+        return f"Frame index {frame_idx} out of range (max: {len(observations)-1})", "", None, None, None, None, None
+
+    # Check if we have enough history
+    min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+    if frame_idx < min_frames_needed - 1:
+        return f"Need at least {min_frames_needed} frames of history. Selected frame {frame_idx+1} doesn't have enough history.", "", None, None, None, None, None
+
+    # Extract frames for canvas (need CANVAS_HISTORY_SIZE frames)
+    start_idx = frame_idx - (min_frames_needed - 1)
+    selected_frames = []
+    for idx in range(start_idx, frame_idx + 1):
+        frame_img = load_frame_image(observations[idx]["full_path"])
+        selected_frames.append(np.array(frame_img))
+
+    # Extract actions between those frames
+    selected_actions = []
+    for idx in range(start_idx, frame_idx):
+        # Find action that corresponds to transition from frame idx to idx+1
+        # Actions list should align with observations
+        if idx < len(actions):
+            selected_actions.append(actions[idx])
+        else:
+            # Fallback: use default action if not enough actions recorded
+            selected_actions.append({"action": 0})  # Default toroidal dot action
+
+    # Build interleaved history
+    interleaved = [selected_frames[0]]
+    for i in range(len(selected_actions)):
+        interleaved.append(selected_actions[i])
+        if i + 1 < len(selected_frames):
+            interleaved.append(selected_frames[i + 1])
+
+    # Build training canvas
+    from models.autoencoder_concat_predictor import build_canvas
+    training_canvas = build_canvas(
+        interleaved,
+        frame_size=config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+        sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+    )
+
+    # Train N times and collect losses
+    num_training_steps = int(num_training_steps)
+    if num_training_steps <= 0:
+        return "Number of training steps must be greater than 0", "", None, None, None, None, None
+
+    loss_history = []
+    for step in range(num_training_steps):
+        loss = world_model.train_autoencoder(training_canvas)
+        loss_history.append(loss)
+
+    # Store training canvas and mask for visualization
+    world_model.last_training_canvas = training_canvas
+    world_model.last_training_loss = loss_history[-1] if loss_history else None
+
+    # Generate visualizations
+    status_msg = f"**Trained on canvas from frames {start_idx+1}-{frame_idx+1}**\n\n"
+    status_msg += f"Training steps: {num_training_steps}\n\n"
+    status_msg += f"Final loss: {format_loss(loss_history[-1] if loss_history else None)}"
+
+    # Training info
+    training_info = f"**Training Loss:** {format_loss(loss_history[-1] if loss_history else None)}"
+
+    # Loss history plot
+    fig_loss_history = None
+    if len(loss_history) > 1:
+        fig_loss_history, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.plot(range(1, len(loss_history) + 1), loss_history, 'b-o', linewidth=2, markersize=4)
+        ax.set_xlabel('Training Step')
+        ax.set_ylabel('Loss')
+        ax.set_title('Training Loss History')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+    # Training canvas visualizations
+    fig_training_canvas = None
+    fig_training_canvas_masked = None
+    fig_training_inpainting_full = None
+    fig_training_inpainting_composite = None
+
+    if world_model.last_training_canvas is not None:
+        # 1. Original training canvas
+        fig_training_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
+        ax.imshow(world_model.last_training_canvas)
+        ax.set_title(f"Training Canvas (Frames {start_idx+1}-{frame_idx+1})")
+        ax.axis("off")
+        plt.tight_layout()
+
+        # Generate additional visualizations if mask is available
+        if world_model.last_training_mask is not None:
+            # 2. Canvas with mask overlay
+            canvas_with_mask = world_model.get_canvas_with_mask_overlay(
+                world_model.last_training_canvas,
+                world_model.last_training_mask
+            )
+            fig_training_canvas_masked, ax = plt.subplots(1, 1, figsize=(12, 4))
+            ax.imshow(canvas_with_mask)
+            ax.set_title("Training Canvas with Mask (Red = Masked Patches)")
+            ax.axis("off")
+            plt.tight_layout()
+
+            # 3. Full model output
+            inpainting_full = world_model.get_canvas_inpainting_full_output(
+                world_model.last_training_canvas,
+                world_model.last_training_mask
+            )
+            fig_training_inpainting_full, ax = plt.subplots(1, 1, figsize=(12, 4))
+            ax.imshow(inpainting_full)
+            ax.set_title("Training Inpainting - Full Model Output")
+            ax.axis("off")
+            plt.tight_layout()
+
+            # 4. Composite
+            inpainting_composite = world_model.get_canvas_inpainting_composite(
+                world_model.last_training_canvas,
+                world_model.last_training_mask
+            )
+            fig_training_inpainting_composite, ax = plt.subplots(1, 1, figsize=(12, 4))
+            ax.imshow(inpainting_composite)
+            ax.set_title("Training Inpainting - Composite")
+            ax.axis("off")
+            plt.tight_layout()
+
+    return status_msg, training_info, fig_loss_history, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite
+
 def run_world_model(num_iterations):
     """Run the world model for N iterations with live metrics tracking and periodic UI updates"""
     global world_model, replay_robot
@@ -431,6 +571,27 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     gr.Markdown("---")
 
+    # Single Canvas Training
+    gr.Markdown("## Train on Single Canvas")
+    gr.Markdown("Train the autoencoder on a canvas built from the selected frame and its history.")
+
+    with gr.Row():
+        single_canvas_training_steps = gr.Number(value=10, label="Training Steps", precision=0, minimum=1)
+        single_canvas_train_btn = gr.Button("Train on Selected Frame", variant="primary")
+
+    single_canvas_status = gr.Markdown("")
+
+    # Single Canvas Training Visualizations (collapsible)
+    with gr.Accordion("Single Canvas Training Results", open=False):
+        single_canvas_training_info = gr.Markdown("")
+        single_canvas_loss_history = gr.Plot(label="Training Loss History")
+        single_canvas_training_canvas = gr.Plot(label="1. Training Canvas")
+        single_canvas_training_masked = gr.Plot(label="2. Canvas with Mask Overlay")
+        single_canvas_inpainting_full = gr.Plot(label="3. Full Inpainting Output")
+        single_canvas_inpainting_composite = gr.Plot(label="4. Composite Reconstruction")
+
+    gr.Markdown("---")
+
     # World Model Runner
     gr.Markdown("## Run World Model")
     gr.Markdown("Execute the world model for a specified number of iterations.")
@@ -496,6 +657,20 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         fn=jump_to_frame,
         inputs=[frame_number_input],
         outputs=[frame_image, frame_info, frame_slider]
+    )
+
+    single_canvas_train_btn.click(
+        fn=train_on_single_canvas,
+        inputs=[frame_slider, single_canvas_training_steps],
+        outputs=[
+            single_canvas_status,
+            single_canvas_training_info,
+            single_canvas_loss_history,
+            single_canvas_training_canvas,
+            single_canvas_training_masked,
+            single_canvas_inpainting_full,
+            single_canvas_inpainting_composite,
+        ]
     )
 
     run_btn.click(
