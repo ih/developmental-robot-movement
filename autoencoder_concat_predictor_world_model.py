@@ -101,6 +101,7 @@ class AutoencoderConcatPredictorWorldModel:
         self.last_training_iterations = 0
         self.last_training_loss_history = []  # List of losses during last training
         self.last_prediction_canvas = None
+        self.last_grad_diagnostics = None  # Gradient diagnostics from last training step
 
         print(f"AutoencoderConcatPredictorWorldModel initialized on {self.device}")
         print(f"Canvas history size: {Config.CANVAS_HISTORY_SIZE}")
@@ -148,7 +149,8 @@ class AutoencoderConcatPredictorWorldModel:
 
         # Train with targeted masking on last frame
         self.autoencoder.train()
-        loss_value = self.autoencoder.train_on_canvas(canvas_tensor, patch_mask, self.ae_optimizer)
+        loss_value, grad_diagnostics = self.autoencoder.train_on_canvas(canvas_tensor, patch_mask, self.ae_optimizer)
+        self.last_grad_diagnostics = grad_diagnostics  # Store for visualization
         self.ae_scheduler.step()
         return loss_value
 
@@ -162,6 +164,7 @@ class AutoencoderConcatPredictorWorldModel:
         self.last_training_iterations = 0
         self.last_training_loss_history = []
         self.last_prediction_canvas = None
+        self.last_grad_diagnostics = None
 
     def get_canvas_with_mask_overlay(self, canvas: np.ndarray, patch_mask: torch.Tensor) -> np.ndarray:
         """

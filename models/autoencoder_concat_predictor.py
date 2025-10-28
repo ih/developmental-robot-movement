@@ -265,7 +265,7 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             optimizer: Optimizer for updating weights
 
         Returns:
-            loss: MSE loss value for masked patches only
+            tuple: (loss, grad_diagnostics) where grad_diagnostics is a dict with gradient norms
         """
         # Forward pass with masking - model predicts all patches including masked ones
         pred_patches, _ = self.forward_with_patch_mask(canvas_tensor, patch_mask)  # [1, num_patches, patch_size^2 * 3]
@@ -279,16 +279,71 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
         masked_pred = pred_patches[patch_mask]      # [num_masked_patches, patch_size^2 * 3]
         masked_target = target_patches[patch_mask]  # [num_masked_patches, patch_size^2 * 3]
 
-        # Compute MSE loss only on masked patches
-        # The loss is automatically normalized by the number of masked patches
-        loss = F.mse_loss(masked_pred, masked_target)
+        # --- DIAGNOSTIC: dot-only loss vs. black baseline (computed with standard loss) ---
+        with torch.no_grad():
+            nz = (masked_target.abs() > 1e-3).float()          # non-black pixels (the dot/edges)
+            num_nz = nz.sum().clamp_min(1.0)
 
-        # Backward pass and optimizer step
+            loss_nonblack = ((masked_pred - masked_target)**2 * nz).sum() / num_nz
+            black_baseline = (masked_target**2 * nz).sum() / num_nz
+            frac_nonblack = (num_nz / masked_target.numel()).item()
+
+            # Standard unweighted loss for tracking
+            loss_standard = F.mse_loss(masked_pred, masked_target).item()
+
+        # --- REWEIGHTED LOSS: upweight non-black (dot) pixels to overcome loss dilution ---
+        # masked_pred, masked_target: [num_masked, patch_vec] in 0..1
+        nz_train = (masked_target.abs() > 1e-3).float()   # 1 where dot/edges exist, else 0
+
+        w_bg  = 1.0
+        w_dot = 100.0                                     # upweight non-black pixels 100×
+        w = w_bg + (w_dot - w_bg) * nz_train              # upweight non-black pixels
+
+        loss = (((masked_pred - masked_target) ** 2) * w).sum() / w.sum()
+
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
+
+        # --- DIAGNOSTIC: gradient flow and LR on the masked token path ---
+        def gnorm(p):
+            return None if (p.grad is None) else p.grad.detach().norm().item()
+
+        # Current LR
+        curr_lr = optimizer.param_groups[0]['lr']
+
+        # Decoder head (directly sets pixel values)
+        # decoder_pred is a Linear layer, not a sequence
+        head_w = getattr(self.decoder_pred, 'weight', None)
+        head_b = getattr(self.decoder_pred, 'bias', None)
+
+        # Mask token (what masked positions start from)
+        mask_tok = getattr(self, 'mask_token', None)
+
+        # First decoder block weights (does attention mix anything?)
+        dec_blk = self.decoder_blocks[0] if hasattr(self, 'decoder_blocks') and len(self.decoder_blocks) > 0 else None
+        qkv_w = getattr(getattr(dec_blk, 'attn', None), 'qkv', None) if dec_blk is not None else None
+        qkv_w = getattr(qkv_w, 'weight', None) if qkv_w is not None else None
+
+        # Collect diagnostics
+        grad_diagnostics = {
+            'lr': curr_lr,
+            'head_weight_norm': gnorm(head_w),
+            'head_bias_norm': gnorm(head_b),
+            'mask_token_norm': gnorm(mask_tok),
+            'qkv_weight_norm': gnorm(qkv_w),
+            # Loss dilution diagnostics
+            'loss_weighted': loss.item(),           # Reweighted loss (used for training)
+            'loss_standard': loss_standard,         # Standard unweighted loss (for comparison)
+            'loss_nonblack': loss_nonblack.item(),  # Loss on non-black pixels only
+            'black_baseline': black_baseline.item(),
+            'frac_nonblack': frac_nonblack,
+            'w_dot': w_dot,                         # Weight multiplier for dot pixels
+        }
+
         optimizer.step()
 
-        return float(loss.detach().cpu())
+        return float(loss.detach().cpu()), grad_diagnostics
 
     def forward_with_patch_mask(self, imgs: torch.Tensor, patch_mask: torch.Tensor):
         """

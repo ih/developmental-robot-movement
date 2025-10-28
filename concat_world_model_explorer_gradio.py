@@ -47,6 +47,46 @@ def format_loss(loss_value):
     else:
         return f"{loss_value:.6f}"
 
+def format_grad_diagnostics(grad_diag):
+    """Format gradient diagnostics for display"""
+    if grad_diag is None:
+        return "No diagnostics available"
+
+    lines = []
+    lines.append("**Gradient Flow Diagnostics:**\n")
+    lines.append(f"- Learning Rate: {grad_diag['lr']:.2e}")
+    lines.append(f"- Decoder Head Weight Grad Norm: {format_loss(grad_diag['head_weight_norm'])}")
+    lines.append(f"- Decoder Head Bias Grad Norm: {format_loss(grad_diag['head_bias_norm'])}")
+    lines.append(f"- Mask Token Grad Norm: {format_loss(grad_diag['mask_token_norm'])}")
+    lines.append(f"- First Decoder QKV Weight Grad Norm: {format_loss(grad_diag['qkv_weight_norm'])}")
+
+    lines.append("\n**Loss Metrics:**\n")
+    w_dot = grad_diag.get('w_dot', 100.0)
+    lines.append(f"- **Reweighted Loss (training)**: {format_loss(grad_diag.get('loss_weighted'))} *[dot pixels weighted {w_dot:.0f}×]*")
+    lines.append(f"- Standard Loss (for comparison): {format_loss(grad_diag.get('loss_standard'))}")
+
+    lines.append("\n**Loss Dilution Diagnostics:**\n")
+    lines.append(f"- Loss on Non-Black Pixels: {format_loss(grad_diag.get('loss_nonblack'))}")
+    lines.append(f"- Black Baseline (if model predicted black): {format_loss(grad_diag.get('black_baseline'))}")
+    lines.append(f"- Fraction of Non-Black Pixels: {grad_diag.get('frac_nonblack', 0):.6f} ({grad_diag.get('frac_nonblack', 0)*100:.2f}%)")
+
+    # Add interpretation hint
+    if grad_diag.get('loss_nonblack') is not None and grad_diag.get('black_baseline') is not None:
+        loss_nb = grad_diag['loss_nonblack']
+        baseline = grad_diag['black_baseline']
+        if loss_nb is not None and baseline is not None:
+            improvement_pct = (1 - loss_nb / baseline) * 100
+            lines.append(f"\n**Dot Learning Progress:** {improvement_pct:.1f}% improvement over black baseline")
+
+            if loss_nb >= baseline * 0.95:  # Loss is close to or above baseline
+                lines.append("⚠️ **Loss on non-black pixels ≈ black baseline** → Model is NOT learning the dot (loss dilution)")
+            elif loss_nb < baseline * 0.5:  # Clear improvement
+                lines.append("✅ **Loss dropping below baseline** → Model IS learning the dot!")
+            else:
+                lines.append("📊 **Some progress** → Keep training to see if dot emerges")
+
+    return "\n".join(lines)
+
 def refresh_sessions():
     """Refresh session list"""
     sessions = list_session_dirs()
@@ -156,10 +196,10 @@ def train_on_single_canvas(frame_idx, num_training_steps):
     global world_model, session_state
 
     if world_model is None:
-        return "Please load a session first", "", None, None, None, None, None
+        return "Please load a session first", "", "", None, None, None, None, None
 
     if not session_state.get("observations") or not session_state.get("actions"):
-        return "No session data available", "", None, None, None, None, None
+        return "No session data available", "", "", None, None, None, None, None
 
     observations = session_state["observations"]
     actions = session_state["actions"]
@@ -167,12 +207,12 @@ def train_on_single_canvas(frame_idx, num_training_steps):
     # Validate frame index
     frame_idx = int(frame_idx)
     if frame_idx >= len(observations):
-        return f"Frame index {frame_idx} out of range (max: {len(observations)-1})", "", None, None, None, None, None
+        return f"Frame index {frame_idx} out of range (max: {len(observations)-1})", "", "", None, None, None, None, None
 
     # Check if we have enough history
     min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
     if frame_idx < min_frames_needed - 1:
-        return f"Need at least {min_frames_needed} frames of history. Selected frame {frame_idx+1} doesn't have enough history.", "", None, None, None, None, None
+        return f"Need at least {min_frames_needed} frames of history. Selected frame {frame_idx+1} doesn't have enough history.", "", "", None, None, None, None, None
 
     # Extract frames for canvas (need CANVAS_HISTORY_SIZE frames)
     start_idx = frame_idx - (min_frames_needed - 1)
@@ -210,7 +250,7 @@ def train_on_single_canvas(frame_idx, num_training_steps):
     # Train N times and collect losses
     num_training_steps = int(num_training_steps)
     if num_training_steps <= 0:
-        return "Number of training steps must be greater than 0", "", None, None, None, None, None
+        return "Number of training steps must be greater than 0", "", "", None, None, None, None, None
 
     loss_history = []
     for step in range(num_training_steps):
@@ -226,8 +266,17 @@ def train_on_single_canvas(frame_idx, num_training_steps):
     status_msg += f"Training steps: {num_training_steps}\n\n"
     status_msg += f"Final loss: {format_loss(loss_history[-1] if loss_history else None)}"
 
-    # Training info
-    training_info = f"**Training Loss:** {format_loss(loss_history[-1] if loss_history else None)}"
+    # Training info with gradient diagnostics
+    final_loss = loss_history[-1] if loss_history else None
+    training_info = f"**Training Loss (Reweighted):** {format_loss(final_loss)}"
+
+    # Add standard loss if available from diagnostics
+    if world_model.last_grad_diagnostics and 'loss_standard' in world_model.last_grad_diagnostics:
+        std_loss = world_model.last_grad_diagnostics['loss_standard']
+        training_info += f"\n\n**Standard Loss (unweighted):** {format_loss(std_loss)}"
+
+    # Gradient diagnostics
+    grad_diag_info = format_grad_diagnostics(world_model.last_grad_diagnostics)
 
     # Loss history plot
     fig_loss_history = None
@@ -289,18 +338,18 @@ def train_on_single_canvas(frame_idx, num_training_steps):
             ax.axis("off")
             plt.tight_layout()
 
-    return status_msg, training_info, fig_loss_history, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite
+    return status_msg, training_info, grad_diag_info, fig_loss_history, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite
 
 def run_world_model(num_iterations):
     """Run the world model for N iterations with live metrics tracking and periodic UI updates"""
     global world_model, replay_robot
 
     if world_model is None:
-        yield "Please load a session first", "", None, None, None, None, None, None, None, None, "", "--"
+        yield "Please load a session first", "", "", None, None, None, None, None, None, None, None, "", "--"
         return
 
     if num_iterations <= 0:
-        yield "Number of iterations must be greater than 0", "", None, None, None, None, None, None, None, None, "", "--"
+        yield "Number of iterations must be greater than 0", "", "", None, None, None, None, None, None, None, None, "", "--"
         return
 
     # Initialize or retrieve metrics history
@@ -423,7 +472,12 @@ def run_world_model(num_iterations):
             ax.axis("off")
             plt.tight_layout()
 
-            training_info = f"**Training Loss:** {format_loss(world_model.last_training_loss)}"
+            training_info = f"**Training Loss (Reweighted):** {format_loss(world_model.last_training_loss)}"
+
+            # Add standard loss if available from diagnostics
+            if world_model.last_grad_diagnostics and 'loss_standard' in world_model.last_grad_diagnostics:
+                std_loss = world_model.last_grad_diagnostics['loss_standard']
+                training_info += f"\n\n**Standard Loss (unweighted):** {format_loss(std_loss)}"
 
             # Generate additional visualizations if mask is available
             if world_model.last_training_mask is not None:
@@ -460,6 +514,9 @@ def run_world_model(num_iterations):
                 ax.axis("off")
                 plt.tight_layout()
 
+        # Gradient diagnostics
+        grad_diag_info = format_grad_diagnostics(world_model.last_grad_diagnostics)
+
         # Prediction canvas and predicted frame
         fig_prediction_canvas = None
         fig_predicted_frame = None
@@ -478,7 +535,7 @@ def run_world_model(num_iterations):
             ax.axis("off")
             plt.tight_layout()
 
-        return status_msg, current_metrics, fig_metrics, fig_frames, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite, fig_prediction_canvas, fig_predicted_frame, training_info, format_loss(prediction_error)
+        return status_msg, current_metrics, fig_metrics, fig_frames, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite, fig_prediction_canvas, fig_predicted_frame, training_info, grad_diag_info, format_loss(prediction_error)
 
     try:
         import time
@@ -538,7 +595,7 @@ def run_world_model(num_iterations):
     except Exception as e:
         import traceback
         error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
-        yield error_msg, "", None, None, None, None, None, None, None, None, "", "--"
+        yield error_msg, "", "", None, None, None, None, None, None, None, None, "", "", "--"
 
 # Build Gradio interface
 with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as demo:
@@ -584,6 +641,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     # Single Canvas Training Visualizations (collapsible)
     with gr.Accordion("Single Canvas Training Results", open=False):
         single_canvas_training_info = gr.Markdown("")
+        single_canvas_grad_diag = gr.Markdown("")
         single_canvas_loss_history = gr.Plot(label="Training Loss History")
         single_canvas_training_canvas = gr.Plot(label="1. Training Canvas")
         single_canvas_training_masked = gr.Plot(label="2. Canvas with Mask Overlay")
@@ -620,6 +678,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     gr.Markdown("### Training Results")
     training_info_display = gr.Markdown("")
+    grad_diag_display = gr.Markdown("")
     training_canvas_plot = gr.Plot(label="1. Training Canvas (Original)")
     training_canvas_masked_plot = gr.Plot(label="2. Training Canvas with Mask Overlay")
     training_inpainting_full_plot = gr.Plot(label="3. Training Inpainting - Full Model Output")
@@ -665,6 +724,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         outputs=[
             single_canvas_status,
             single_canvas_training_info,
+            single_canvas_grad_diag,
             single_canvas_loss_history,
             single_canvas_training_canvas,
             single_canvas_training_masked,
@@ -688,6 +748,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             prediction_canvas_plot,
             predicted_frame_plot,
             training_info_display,
+            grad_diag_display,
             prediction_error_display,
         ]
     )
