@@ -124,4 +124,9 @@ class AutoencoderConcatPredictorWorldModelConfig:
     WARMUP_STEPS = 600             # Warmup steps for learning rate scheduler
     LR_MIN_RATIO = 0.01            # Minimum LR as ratio of base LR
 
+    # Focal loss parameters (for loss dilution)
+    FOCAL_BETA = 10.0              # Temperature for exponential weighting (try 5-15)
+    FOCAL_W_CAP = 50.0             # Max weight cap to prevent gradient explosion
+    FOCAL_MIX = 0.5                # Blend between focal (0) and uniform (1) weighting
+
 

@@ -61,9 +61,15 @@ def format_grad_diagnostics(grad_diag):
     lines.append(f"- First Decoder QKV Weight Grad Norm: {format_loss(grad_diag['qkv_weight_norm'])}")
 
     lines.append("\n**Loss Metrics:**\n")
-    w_dot = grad_diag.get('w_dot', 100.0)
-    lines.append(f"- **Reweighted Loss (training)**: {format_loss(grad_diag.get('loss_weighted'))} *[dot pixels weighted {w_dot:.0f}×]*")
+    focal_beta = grad_diag.get('focal_beta', 10.0)
+    focal_mix = grad_diag.get('focal_mix_ratio', 0.5)
+    lines.append(f"- **Focal Loss (training)**: {format_loss(grad_diag.get('loss_focal'))} *[error-adaptive, β={focal_beta:.1f}, mix={focal_mix:.2f}]*")
     lines.append(f"- Standard Loss (for comparison): {format_loss(grad_diag.get('loss_standard'))}")
+
+    lines.append("\n**Focal Weight Statistics:**\n")
+    lines.append(f"- Mean Focal Weight: {grad_diag.get('focal_weight_mean', 1.0):.3f}")
+    lines.append(f"- Max Focal Weight: {grad_diag.get('focal_weight_max', 1.0):.3f}")
+    lines.append("  *(Focal weights adaptively upweight high-error pixels)*")
 
     lines.append("\n**Loss Dilution Diagnostics:**\n")
     lines.append(f"- Loss on Non-Black Pixels: {format_loss(grad_diag.get('loss_nonblack'))}")
@@ -72,15 +78,15 @@ def format_grad_diagnostics(grad_diag):
 
     # Add interpretation hint
     if grad_diag.get('loss_nonblack') is not None and grad_diag.get('black_baseline') is not None:
-        loss_nb = grad_diag['loss_nonblack']
+        loss_nonblack = grad_diag['loss_nonblack']
         baseline = grad_diag['black_baseline']
-        if loss_nb is not None and baseline is not None:
-            improvement_pct = (1 - loss_nb / baseline) * 100
+        if loss_nonblack is not None and baseline is not None:
+            improvement_pct = (1 - loss_nonblack / baseline) * 100
             lines.append(f"\n**Dot Learning Progress:** {improvement_pct:.1f}% improvement over black baseline")
 
-            if loss_nb >= baseline * 0.95:  # Loss is close to or above baseline
+            if loss_nonblack >= baseline * 0.95:  # Loss is close to or above baseline
                 lines.append("⚠️ **Loss on non-black pixels ≈ black baseline** → Model is NOT learning the dot (loss dilution)")
-            elif loss_nb < baseline * 0.5:  # Clear improvement
+            elif loss_nonblack < baseline * 0.5:  # Clear improvement
                 lines.append("✅ **Loss dropping below baseline** → Model IS learning the dot!")
             else:
                 lines.append("📊 **Some progress** → Keep training to see if dot emerges")
@@ -268,7 +274,7 @@ def train_on_single_canvas(frame_idx, num_training_steps):
 
     # Training info with gradient diagnostics
     final_loss = loss_history[-1] if loss_history else None
-    training_info = f"**Training Loss (Reweighted):** {format_loss(final_loss)}"
+    training_info = f"**Training Loss (Focal):** {format_loss(final_loss)}"
 
     # Add standard loss if available from diagnostics
     if world_model.last_grad_diagnostics and 'loss_standard' in world_model.last_grad_diagnostics:
@@ -472,7 +478,7 @@ def run_world_model(num_iterations):
             ax.axis("off")
             plt.tight_layout()
 
-            training_info = f"**Training Loss (Reweighted):** {format_loss(world_model.last_training_loss)}"
+            training_info = f"**Training Loss (Focal):** {format_loss(world_model.last_training_loss)}"
 
             # Add standard loss if available from diagnostics
             if world_model.last_grad_diagnostics and 'loss_standard' in world_model.last_grad_diagnostics:

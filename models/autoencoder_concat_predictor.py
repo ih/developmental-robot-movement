@@ -281,25 +281,43 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
 
         # --- DIAGNOSTIC: dot-only loss vs. black baseline (computed with standard loss) ---
         with torch.no_grad():
-            nz = (masked_target.abs() > 1e-3).float()          # non-black pixels (the dot/edges)
-            num_nz = nz.sum().clamp_min(1.0)
+            nonblack_mask = (masked_target.abs() > 1e-3).float()  # non-black pixels (the dot/edges)
+            num_nonblack_pixels = nonblack_mask.sum().clamp_min(1.0)
 
-            loss_nonblack = ((masked_pred - masked_target)**2 * nz).sum() / num_nz
-            black_baseline = (masked_target**2 * nz).sum() / num_nz
-            frac_nonblack = (num_nz / masked_target.numel()).item()
+            loss_nonblack = ((masked_pred - masked_target)**2 * nonblack_mask).sum() / num_nonblack_pixels
+            black_baseline = (masked_target**2 * nonblack_mask).sum() / num_nonblack_pixels
+            frac_nonblack = (num_nonblack_pixels / masked_target.numel()).item()
 
             # Standard unweighted loss for tracking
             loss_standard = F.mse_loss(masked_pred, masked_target).item()
 
-        # --- REWEIGHTED LOSS: upweight non-black (dot) pixels to overcome loss dilution ---
-        # masked_pred, masked_target: [num_masked, patch_vec] in 0..1
-        nz_train = (masked_target.abs() > 1e-3).float()   # 1 where dot/edges exist, else 0
+        # --- FOCAL MSE LOSS: adaptively upweight high-error pixels ---
+        # Import config for focal loss parameters
+        from config import AutoencoderConcatPredictorWorldModelConfig as Config
 
-        w_bg  = 1.0
-        w_dot = 100.0                                     # upweight non-black pixels 100×
-        w = w_bg + (w_dot - w_bg) * nz_train              # upweight non-black pixels
+        # Per-pixel absolute error
+        pixel_error = (masked_pred - masked_target).abs()  # [num_masked_patches, patch_vec]
 
-        loss = (((masked_pred - masked_target) ** 2) * w).sum() / w.sum()
+        # Focal weighting from error (detach to avoid backprop through weights)
+        focal_beta = Config.FOCAL_BETA
+        focal_weights_raw = torch.exp(focal_beta * pixel_error).detach()  # bigger weight where error is large
+
+        # Cap and normalize to keep things stable
+        weight_cap = Config.FOCAL_W_CAP
+        focal_weights = torch.clamp(focal_weights_raw, max=weight_cap)
+        focal_weights = focal_weights / (focal_weights.mean() + 1e-8)  # avg weight ≈ 1 (prevents LR drift)
+
+        # Blend with uniform weighting to avoid ignoring flat regions entirely
+        uniform_mix_ratio = Config.FOCAL_MIX
+        focal_weights = uniform_mix_ratio * focal_weights + (1.0 - uniform_mix_ratio)
+
+        # Focal MSE
+        loss = ((masked_pred - masked_target) ** 2 * focal_weights).mean()
+
+        # Track focal weight statistics for diagnostics
+        with torch.no_grad():
+            focal_weight_mean = focal_weights.mean().item()
+            focal_weight_max = focal_weights.max().item()
 
         # Backward pass
         optimizer.zero_grad()
@@ -333,12 +351,16 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             'mask_token_norm': gnorm(mask_tok),
             'qkv_weight_norm': gnorm(qkv_w),
             # Loss dilution diagnostics
-            'loss_weighted': loss.item(),           # Reweighted loss (used for training)
+            'loss_focal': loss.item(),              # Focal loss (used for training)
             'loss_standard': loss_standard,         # Standard unweighted loss (for comparison)
             'loss_nonblack': loss_nonblack.item(),  # Loss on non-black pixels only
             'black_baseline': black_baseline.item(),
             'frac_nonblack': frac_nonblack,
-            'w_dot': w_dot,                         # Weight multiplier for dot pixels
+            # Focal weight statistics
+            'focal_weight_mean': focal_weight_mean,
+            'focal_weight_max': focal_weight_max,
+            'focal_beta': focal_beta,
+            'focal_mix_ratio': uniform_mix_ratio,
         }
 
         optimizer.step()
