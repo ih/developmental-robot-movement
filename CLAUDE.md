@@ -102,6 +102,13 @@ This repository contains research code for developmental robot movement with a m
 - **Prediction display**: Current frame, predicted next frame, and prediction error visualization
 - **Metric graphs**: Plots showing prediction error and iteration time over all iterations
 - **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method with periodic UI updates
+- **Decoder attention visualization**: Interactive visualization of decoder attention patterns from masked patches to unmasked patches
+  - Quantile-based filtering: Show top N% of attention connections (e.g., 95% = strongest 5%)
+  - Layer selection: Toggle individual decoder layers (0-4) on/off
+  - Head selection: Toggle individual attention heads (0-3) on/off for fine-grained analysis
+  - Aggregation methods: Mean, max, or sum across selected heads
+  - Visualization types: Patch-to-patch lines (color-coded by layer, thickness by magnitude) or heatmap matrix
+  - Real-time statistics: Connection counts, attention weights, and per-layer/per-head metrics
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful transformer encoder and powerful transformer decoder
@@ -300,6 +307,7 @@ Required Python packages:
 - `session_explorer_lib.py`: Shared library of utilities for session management, frame processing, and model operations
 - `SESSION_EXPLORER_GRADIO.md`: Documentation for the Gradio session explorer interface
 - `concat_world_model_explorer_gradio.py`: Web-based Gradio interface for AutoencoderConcatPredictorWorldModel exploration
+- `attention_viz.py`: Decoder attention visualization utilities for patch-to-patch attention analysis with quantile-based filtering and head/layer selection
 - `test_concat_world_model.py`: Test script for AutoencoderConcatPredictorWorldModel
 - `test_jetbot_actions.ipynb`: Jupyter notebook for interactive JetBot action space testing
 - `test_toroidal_dot_actions.ipynb`: Jupyter notebook for interactive toroidal dot environment testing

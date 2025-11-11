@@ -25,6 +25,13 @@ from session_explorer_lib import (
     format_timestamp,
 )
 from recorded_policy import create_recorded_action_selector
+from models.autoencoder_concat_predictor import canvas_to_tensor, compute_patch_mask_for_last_slot
+from attention_viz import (
+    compute_patch_centers,
+    draw_attention_connections,
+    create_attention_statistics,
+    create_attention_heatmap,
+)
 
 # Session directories
 TOROIDAL_DOT_SESSIONS_DIR = config.TOROIDAL_DOT_RECORDING_DIR
@@ -603,6 +610,139 @@ def run_world_model(num_iterations):
         error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
         yield error_msg, "", "", None, None, None, None, None, None, None, None, "", "", "--"
 
+def generate_attention_visualization(
+    quantile,
+    layer0_enabled,
+    layer1_enabled,
+    layer2_enabled,
+    layer3_enabled,
+    layer4_enabled,
+    head0_enabled,
+    head1_enabled,
+    head2_enabled,
+    head3_enabled,
+    aggregation,
+    viz_type
+):
+    """Generate decoder attention visualization from the last training canvas"""
+    global world_model
+
+    if world_model is None:
+        return "Please load a session and train/run the world model first", None, None
+
+    if world_model.last_training_canvas is None or world_model.last_training_mask is None:
+        return "No training canvas available. Please train or run the world model first.", None, None
+
+    try:
+        # Convert canvas to tensor
+        canvas_tensor = canvas_to_tensor(world_model.last_training_canvas).to(device)
+        patch_mask = world_model.last_training_mask.to(device)
+
+        # Run forward pass with attention capture
+        with torch.no_grad():
+            _, _, attn_weights_list, patch_mask_out = world_model.autoencoder.forward_with_patch_mask(
+                canvas_tensor,
+                patch_mask,
+                return_attn=True
+            )
+
+        # Get patch centers
+        img_height, img_width = world_model.last_training_canvas.shape[:2]
+        patch_size = 16  # Hardcoded in model initialization
+        patch_centers = compute_patch_centers(img_height, img_width, patch_size)
+
+        # Configure which layers to show
+        enabled_layers = [
+            layer0_enabled,
+            layer1_enabled,
+            layer2_enabled,
+            layer3_enabled,
+            layer4_enabled
+        ]
+
+        # Configure which heads to show
+        head_checkboxes = [head0_enabled, head1_enabled, head2_enabled, head3_enabled]
+        enabled_heads = [i for i, enabled in enumerate(head_checkboxes) if enabled]
+
+        # Validate that at least one head is selected
+        if len(enabled_heads) == 0:
+            return "Error: At least one attention head must be selected", None, ""
+
+        # Generate visualization based on type
+        if viz_type == "Patch-to-Patch Lines":
+            fig = draw_attention_connections(
+                canvas_img=world_model.last_training_canvas,
+                patch_centers=patch_centers,
+                attn_weights_list=attn_weights_list,
+                patch_mask=patch_mask_out,
+                quantile=quantile,
+                enabled_layers=enabled_layers,
+                enabled_heads=enabled_heads,
+                aggregation=aggregation,
+                alpha=0.6
+            )
+        else:  # Heatmap
+            # For heatmap, show the first enabled layer
+            layer_idx = 0
+            for i, enabled in enumerate(enabled_layers):
+                if enabled:
+                    layer_idx = i
+                    break
+
+            fig = create_attention_heatmap(
+                attn_weights_list=attn_weights_list,
+                patch_mask=patch_mask_out,
+                layer_idx=layer_idx,
+                aggregation=aggregation,
+                enabled_heads=enabled_heads
+            )
+
+        # Generate statistics
+        stats = create_attention_statistics(
+            attn_weights_list=attn_weights_list,
+            patch_mask=patch_mask_out,
+            quantile=quantile,
+            aggregation=aggregation,
+            enabled_heads=enabled_heads
+        )
+
+        # Format statistics for display
+        heads_display = str(enabled_heads) if len(enabled_heads) < 4 else "All (0,1,2,3)"
+
+        stats_text = f"**Attention Statistics:**\n\n"
+        stats_text += f"- **Masked patches:** {stats['num_masked_patches']}\n"
+        stats_text += f"- **Unmasked patches:** {stats['num_unmasked_patches']}\n"
+        stats_text += f"- **Total connections:** {stats['total_connections']}\n"
+        stats_text += f"- **Max attention weight:** {stats['max_layer_weight']:.4f}\n"
+        stats_text += f"- **Quantile:** {stats['quantile']:.1f}%\n"
+        stats_text += f"- **Avg threshold:** {stats['avg_threshold']:.4f}\n"
+        stats_text += f"- **Aggregation:** {stats['aggregation']}\n"
+        stats_text += f"- **Enabled heads:** {heads_display}\n\n"
+
+        stats_text += "**Per-Layer Statistics:**\n\n"
+        for layer_stats in stats['per_layer_stats']:
+            layer_idx = layer_stats['layer']
+            if enabled_layers[layer_idx]:
+                stats_text += f"- **Layer {layer_idx}:**\n"
+                stats_text += f"  - Connections: {layer_stats['num_connections']}\n"
+                stats_text += f"  - Threshold: {layer_stats['threshold']:.4f}\n"
+                stats_text += f"  - Max weight: {layer_stats['max_weight']:.4f}\n"
+                stats_text += f"  - Mean weight: {layer_stats['mean_weight']:.4f}\n"
+                stats_text += f"  - Total weight: {layer_stats['total_weight']:.4f}\n"
+
+        status_msg = f"**Attention visualization generated successfully**\n\n"
+        status_msg += f"Using last training canvas from world model\n"
+        status_msg += f"Canvas size: {img_height}x{img_width} pixels\n"
+        status_msg += f"Patch size: {patch_size}x{patch_size} pixels\n"
+        status_msg += f"Quantile: {quantile:.1f}% (showing top {100-quantile:.1f}% of connections)"
+
+        return status_msg, fig, stats_text
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Error generating attention visualization:\n\n{str(e)}\n\n{traceback.format_exc()}"
+        return error_msg, None, ""
+
 # Build Gradio interface
 with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as demo:
     gr.Markdown("# Concat World Model Explorer")
@@ -694,6 +834,67 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     prediction_canvas_plot = gr.Plot(label="Prediction Canvas")
     predicted_frame_plot = gr.Plot(label="Predicted Next Frame")
 
+    gr.Markdown("---")
+
+    # Attention Visualization
+    gr.Markdown("## Decoder Attention Visualization")
+    gr.Markdown("Visualize decoder attention from masked patches to unmasked patches.")
+    gr.Markdown("*Note: Uses the last training canvas from training or world model execution.*")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### Controls")
+
+            # Visualization type
+            attn_viz_type = gr.Radio(
+                choices=["Patch-to-Patch Lines", "Heatmap"],
+                value="Patch-to-Patch Lines",
+                label="Visualization Type"
+            )
+
+            # Aggregation method
+            attn_aggregation = gr.Radio(
+                choices=["mean", "max", "sum"],
+                value="mean",
+                label="Head Aggregation Method"
+            )
+
+            # Quantile slider
+            attn_quantile = gr.Slider(
+                minimum=0.0,
+                maximum=100.0,
+                value=95.0,
+                step=1.0,
+                label="Attention Quantile (%)",
+                info="Show top N% of connections (e.g., 95 = show strongest 5%)"
+            )
+
+            # Layer toggles
+            gr.Markdown("**Select Layers to Display:**")
+            attn_layer0 = gr.Checkbox(label="Layer 0", value=True)
+            attn_layer1 = gr.Checkbox(label="Layer 1", value=True)
+            attn_layer2 = gr.Checkbox(label="Layer 2", value=True)
+            attn_layer3 = gr.Checkbox(label="Layer 3", value=True)
+            attn_layer4 = gr.Checkbox(label="Layer 4", value=True)
+
+            # Head toggles
+            gr.Markdown("**Select Attention Heads to Display:**")
+            attn_head0 = gr.Checkbox(label="Head 0", value=True)
+            attn_head1 = gr.Checkbox(label="Head 1", value=True)
+            attn_head2 = gr.Checkbox(label="Head 2", value=True)
+            attn_head3 = gr.Checkbox(label="Head 3", value=True)
+
+            # Generate button
+            generate_attn_btn = gr.Button("Generate Attention Visualization", variant="primary")
+
+        with gr.Column(scale=2):
+            gr.Markdown("### Visualization")
+            attn_status = gr.Markdown("")
+            attn_plot = gr.Plot(label="Attention Visualization")
+            attn_stats = gr.Markdown("")
+
+    gr.Markdown("---")
+
     # Event handlers
     refresh_btn.click(
         fn=refresh_sessions,
@@ -756,6 +957,29 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             training_info_display,
             grad_diag_display,
             prediction_error_display,
+        ]
+    )
+
+    generate_attn_btn.click(
+        fn=generate_attention_visualization,
+        inputs=[
+            attn_quantile,
+            attn_layer0,
+            attn_layer1,
+            attn_layer2,
+            attn_layer3,
+            attn_layer4,
+            attn_head0,
+            attn_head1,
+            attn_head2,
+            attn_head3,
+            attn_aggregation,
+            attn_viz_type,
+        ],
+        outputs=[
+            attn_status,
+            attn_plot,
+            attn_stats,
         ]
     )
 

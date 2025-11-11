@@ -121,11 +121,67 @@ class MaskedAutoencoderViT(BaseAutoencoder):
         emb = torch.cat([torch.sin(out), torch.cos(out)], dim=1)  # [N, D]
         return emb
 
+    def _forward_block_with_attn(self, block, x):
+        """
+        Forward pass through a transformer block while capturing attention weights.
+
+        Args:
+            block: timm.models.vision_transformer.Block instance
+            x: input tensor [B, N, C]
+
+        Returns:
+            output: transformed tensor [B, N, C]
+            attn_weights: attention weights [B, num_heads, N, N]
+        """
+        # timm Block structure: norm1 -> attn -> drop_path -> norm2 -> mlp -> drop_path
+        # We need to intercept the attention module's forward pass
+
+        # First norm + attention
+        x_normed = block.norm1(x)
+
+        # Get attention module
+        attn_module = block.attn
+        B, N, C = x_normed.shape
+
+        # Run through attention's qkv projection
+        qkv = attn_module.qkv(x_normed)
+        qkv = qkv.reshape(B, N, 3, attn_module.num_heads, C // attn_module.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Compute attention weights
+        attn_weights = (q @ k.transpose(-2, -1)) * attn_module.scale
+        attn_weights = attn_weights.softmax(dim=-1)
+        attn_weights_saved = attn_weights.clone()  # Save for return
+        attn_weights = attn_module.attn_drop(attn_weights)
+
+        # Apply attention to values
+        x_attn = (attn_weights @ v).transpose(1, 2).reshape(B, N, C)
+        x_attn = attn_module.proj(x_attn)
+        x_attn = attn_module.proj_drop(x_attn)
+
+        # Add residual + drop_path
+        if hasattr(block, 'drop_path1'):
+            x = x + block.drop_path1(x_attn)
+        else:
+            x = x + x_attn
+
+        # Second norm + MLP
+        x_normed2 = block.norm2(x)
+        x_mlp = block.mlp(x_normed2)
+
+        # Add residual + drop_path
+        if hasattr(block, 'drop_path2'):
+            x = x + block.drop_path2(x_mlp)
+        else:
+            x = x + x_mlp
+
+        return x, attn_weights_saved
+
     def forward_encoder(self, x, mask_ratio=0.75):
         x = self.patch_embed(x)
         x = x + self.pos_embed[:, 1:, :]
         B, L, D = x.shape
-        
+
         # Skip masking/shuffling when mask_ratio=0 for consistent ordering
         if mask_ratio == 0.0:
             cls_token = self.cls_token + self.pos_embed[:, :1, :]
@@ -143,13 +199,13 @@ class MaskedAutoencoderViT(BaseAutoencoder):
             cls_token = self.cls_token + self.pos_embed[:, :1, :]
             cls_tokens = cls_token.expand(x_masked.shape[0], -1, -1)
             x = torch.cat((cls_tokens, x_masked), dim=1)
-        
+
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
         return x, ids_restore
 
-    def forward_decoder(self, x, ids_restore):
+    def forward_decoder(self, x, ids_restore, return_attn=False):
         # Embed encoder output to decoder dimension
         x = self.decoder_embed(x)
         B, N, C = x.shape
@@ -165,9 +221,15 @@ class MaskedAutoencoderViT(BaseAutoencoder):
         # Add positional embeddings
         x = x + self.decoder_pos_embed
 
-        # Pass through transformer decoder blocks
-        for blk in self.decoder_blocks:
-            x = blk(x)
+        # Pass through transformer decoder blocks, optionally capturing attention
+        attn_weights = []
+        if return_attn:
+            for blk in self.decoder_blocks:
+                x, attn = self._forward_block_with_attn(blk, x)
+                attn_weights.append(attn)
+        else:
+            for blk in self.decoder_blocks:
+                x = blk(x)
         x = self.decoder_norm(x)
 
         # Final prediction head
@@ -175,6 +237,9 @@ class MaskedAutoencoderViT(BaseAutoencoder):
 
         # Remove cls token
         x = x[:, 1:, :]
+
+        if return_attn:
+            return x, attn_weights
         return x
 
     def forward(self, imgs, mask_ratio=0.75):
@@ -188,15 +253,17 @@ class MaskedAutoencoderViT(BaseAutoencoder):
         # Return all features including cls token and patch tokens
         return latent  # Shape: [batch_size, num_patches + 1, embed_dim]
 
-    def decode(self, latent_features):
+    def decode(self, latent_features, return_attn=False):
         """
         Decode latent features back to images (for visualization).
 
         Args:
             latent_features: (batch_size, num_patches+1, embed_dim) tensor from encode()
+            return_attn: if True, return attention weights from decoder layers
 
         Returns:
             decoded_imgs: (batch_size, 3, H, W) tensor
+            attn_weights: (optional) list of [B, num_heads, N, N] tensors, one per decoder layer
         """
         B = latent_features.shape[0]
         num_patches = self.patch_embed.num_patches
@@ -206,11 +273,16 @@ class MaskedAutoencoderViT(BaseAutoencoder):
 
         # latent_features already has shape [B, num_patches+1, embed_dim]
         # Pass directly to decoder
-        pred = self.forward_decoder(latent_features, ids_restore)
-
-        # Reshape patches to image
-        pred = self.unpatchify(pred)
-        return pred
+        if return_attn:
+            pred, attn_weights = self.forward_decoder(latent_features, ids_restore, return_attn=True)
+            # Reshape patches to image
+            pred = self.unpatchify(pred)
+            return pred, attn_weights
+        else:
+            pred = self.forward_decoder(latent_features, ids_restore, return_attn=False)
+            # Reshape patches to image
+            pred = self.unpatchify(pred)
+            return pred
 
     def unpatchify(self, x):
         """Convert patches back to image format"""

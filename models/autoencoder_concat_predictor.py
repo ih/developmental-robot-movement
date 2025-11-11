@@ -367,12 +367,17 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
 
         return float(loss.detach().cpu()), grad_diagnostics
 
-    def forward_with_patch_mask(self, imgs: torch.Tensor, patch_mask: torch.Tensor):
+    def forward_with_patch_mask(self, imgs: torch.Tensor, patch_mask: torch.Tensor, return_attn: bool = False):
         """
         imgs: [B,3,H,W]
         patch_mask: [B, num_patches] boolean tensor; True = masked.
-        Returns predicted patches for masked locations (same shape as self.forward() decoder output),
-        and latent features.
+        return_attn: if True, return decoder attention weights
+
+        Returns:
+            pred: predicted patches for masked locations (same shape as self.forward() decoder output)
+            latent: latent features
+            attn_weights: (optional) list of [B, num_heads, N, N] tensors per decoder layer
+            patch_mask_out: (optional) the patch mask for identifying masked/unmasked patches
         """
         # Encode without shuffling, but drop masked patches
         x = self.patch_embed(imgs)                      # [B, L, D]
@@ -433,15 +438,24 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
         # Now add decoder positional embedding and re-insert CLS at the front
         dec_input = torch.cat([dec[:, :1, :], full_tokens], dim=1) + self.decoder_pos_embed
 
-        # Pass through transformer decoder blocks (same as forward_decoder)
+        # Pass through transformer decoder blocks, optionally capturing attention
         x = dec_input
-        for blk in self.decoder_blocks:
-            x = blk(x)
+        attn_weights = []
+        if return_attn:
+            for blk in self.decoder_blocks:
+                x, attn = self._forward_block_with_attn(blk, x)
+                attn_weights.append(attn)
+        else:
+            for blk in self.decoder_blocks:
+                x = blk(x)
         x = self.decoder_norm(x)
 
         # Predict patches
         pred = self.decoder_pred(x)     # [B, 1+L, P^2*3]
         pred = pred[:, 1:, :]           # drop CLS
+
+        if return_attn:
+            return pred, latent, attn_weights, patch_mask
         return pred, latent  # pred is per-patch predictions in *original* order
 
 # ------------------------------
