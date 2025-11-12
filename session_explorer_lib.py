@@ -29,7 +29,7 @@ from matplotlib.colors import ListedColormap
 from PIL import Image
 
 import config
-from models import MaskedAutoencoderViT, TransformerActionConditionedPredictor
+from models import MaskedAutoencoderViT
 from robot_interface import RobotInterface
 
 
@@ -467,29 +467,6 @@ def load_autoencoder_model(path, device):
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
-    return model
-
-
-def load_predictor_model(path, device):
-    """
-    Load predictor model from checkpoint.
-
-    Args:
-        path: Path to checkpoint file
-        device: Torch device to load model on
-
-    Returns:
-        Loaded TransformerActionConditionedPredictor model in eval mode
-    """
-    model = TransformerActionConditionedPredictor()
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state_dict, strict=False)
-    level = checkpoint.get("level")
-    if level is not None:
-        model.level = level
     model.to(device)
     model.eval()
     return model

@@ -4,35 +4,24 @@ Models package for the developmental robot movement system.
 
 # Base classes
 from .base_autoencoder import BaseAutoencoder
-from .base_predictor import BasePredictor
 
 # Autoencoder implementations
 from .vit_autoencoder import MaskedAutoencoderViT
-from .cnn_autoencoder import CNNAutoencoder
 
-# Predictor implementations
-from .transformer_predictor import (
-    TransformerActionConditionedPredictor,
-    get_action_config_for_robot,
-    create_transformer_predictor_for_robot
+# Canvas-based concat predictor utilities
+from .autoencoder_concat_predictor import (
+    build_canvas,
+    TargetedMAEWrapper,
+    canvas_to_tensor
 )
-from .lstm_predictor import LSTMActionConditionedPredictor
-
-# Action classification
-from .action_classifier import ActionClassifier
 
 __all__ = [
     # Base classes
     'BaseAutoencoder',
-    'BasePredictor',
     # Autoencoder implementations
     'MaskedAutoencoderViT',
-    'CNNAutoencoder',
-    # Predictor implementations
-    'TransformerActionConditionedPredictor',
-    'LSTMActionConditionedPredictor',
-    'get_action_config_for_robot',
-    'create_transformer_predictor_for_robot',
-    # Action classification
-    'ActionClassifier'
+    # Canvas utilities
+    'build_canvas',
+    'TargetedMAEWrapper',
+    'canvas_to_tensor'
 ]
