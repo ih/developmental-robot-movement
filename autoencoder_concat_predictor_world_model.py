@@ -68,7 +68,7 @@ class AutoencoderConcatPredictorWorldModel:
         self.autoencoder = TargetedMAEWrapper(
             img_height=canvas_height,
             img_width=canvas_width,
-            patch_size=16,
+            patch_size=Config.PATCH_SIZE,
             embed_dim=256,
             decoder_embed_dim=128,
         ).to(self.device)

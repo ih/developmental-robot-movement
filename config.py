@@ -25,8 +25,11 @@ TOROIDAL_DOT_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints/toroidal_dot"
 class AutoencoderConcatPredictorWorldModelConfig:
     # Canvas construction
     FRAME_SIZE = (224, 224)        # Size of each frame in canvas
-    SEPARATOR_WIDTH = 8            # Width of action-colored separator between frames
+    SEPARATOR_WIDTH = 16            # Width of action-colored separator between frames
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
+
+    # Model architecture
+    PATCH_SIZE = 16                # Size of patches for Vision Transformer (WARNING: changing requires retraining)
 
     # Optimizer parameters
     AUTOENCODER_LR = 1e-4          # Learning rate for autoencoder training

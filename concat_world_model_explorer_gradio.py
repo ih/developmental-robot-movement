@@ -297,7 +297,7 @@ def infer_on_single_canvas(frame_idx):
     import config as cfg
     patch_mask = compute_randomized_patch_mask_for_last_slot(
         img_size=(canvas_height, canvas_width),
-        patch_size=16,
+        patch_size=cfg.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
         num_frame_slots=num_frames,
         sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
         mask_ratio_min=cfg.MASK_RATIO_MIN,
@@ -443,7 +443,7 @@ def evaluate_full_session():
         import config as cfg
         patch_mask = compute_randomized_patch_mask_for_last_slot(
             img_size=(canvas_height, canvas_width),
-            patch_size=16,
+            patch_size=cfg.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
             num_frame_slots=num_frames,
             sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
             mask_ratio_min=cfg.MASK_RATIO_MIN,
@@ -991,7 +991,7 @@ def generate_attention_visualization(
 
         # Get patch centers
         img_height, img_width = world_model.last_training_canvas.shape[:2]
-        patch_size = 16  # Hardcoded in model initialization
+        patch_size = config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE
         patch_centers = compute_patch_centers(img_height, img_width, patch_size)
 
         # Configure which layers to show
