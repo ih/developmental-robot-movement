@@ -27,7 +27,12 @@ from session_explorer_lib import (
     format_timestamp,
 )
 from recorded_policy import create_recorded_action_selector
-from models.autoencoder_concat_predictor import canvas_to_tensor, compute_patch_mask_for_last_slot
+from models.autoencoder_concat_predictor import (
+    canvas_to_tensor,
+    compute_patch_mask_for_last_slot,
+    compute_randomized_patch_mask_for_last_slot,
+    compute_hybrid_loss_on_masked_patches,
+)
 from attention_viz import (
     compute_patch_centers,
     draw_attention_connections,
@@ -212,15 +217,9 @@ def update_frame(frame_idx):
 
     return frame, frame_info
 
-def train_on_single_canvas(frame_idx, num_training_steps):
-    """Train autoencoder on a single canvas built from selected frame and its history"""
-    global world_model, session_state
-
-    if world_model is None:
-        return "Please load a session first", "", "", None, None, None, None, None
-
-    if not session_state.get("observations") or not session_state.get("actions"):
-        return "No session data available", "", "", None, None, None, None, None
+def build_canvas_from_frame(frame_idx):
+    """Build canvas from selected frame and its history (helper function)"""
+    global session_state
 
     observations = session_state["observations"]
     actions = session_state["actions"]
@@ -228,12 +227,12 @@ def train_on_single_canvas(frame_idx, num_training_steps):
     # Validate frame index
     frame_idx = int(frame_idx)
     if frame_idx >= len(observations):
-        return f"Frame index {frame_idx} out of range (max: {len(observations)-1})", "", "", None, None, None, None, None
+        return None, f"Frame index {frame_idx} out of range (max: {len(observations)-1})", None, None
 
     # Check if we have enough history
     min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
     if frame_idx < min_frames_needed - 1:
-        return f"Need at least {min_frames_needed} frames of history. Selected frame {frame_idx+1} doesn't have enough history.", "", "", None, None, None, None, None
+        return None, f"Need at least {min_frames_needed} frames of history. Selected frame {frame_idx+1} doesn't have enough history.", None, None
 
     # Extract frames for canvas (need CANVAS_HISTORY_SIZE frames)
     start_idx = frame_idx - (min_frames_needed - 1)
@@ -267,6 +266,160 @@ def train_on_single_canvas(frame_idx, num_training_steps):
         frame_size=config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
         sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
     )
+
+    return training_canvas, None, start_idx, interleaved
+
+def infer_on_single_canvas(frame_idx):
+    """Run inference only on a single canvas built from selected frame and its history"""
+    global world_model, session_state
+
+    if world_model is None:
+        return "Please load a session first", "", None, None, None, None
+
+    if not session_state.get("observations") or not session_state.get("actions"):
+        return "No session data available", "", None, None, None, None
+
+    # Build canvas
+    training_canvas, error, start_idx, interleaved = build_canvas_from_frame(frame_idx)
+    if training_canvas is None:
+        return error, "", None, None, None, None
+
+    frame_idx = int(frame_idx)
+
+    # Store canvas for visualization
+    world_model.last_training_canvas = training_canvas
+
+    # Compute patch mask for last slot
+    canvas_tensor = canvas_to_tensor(training_canvas).to(device)
+    canvas_height, canvas_width = canvas_tensor.shape[-2:]
+    num_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+
+    import config as cfg
+    patch_mask = compute_randomized_patch_mask_for_last_slot(
+        img_size=(canvas_height, canvas_width),
+        patch_size=16,
+        num_frame_slots=num_frames,
+        sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+        mask_ratio_min=cfg.MASK_RATIO_MIN,
+        mask_ratio_max=cfg.MASK_RATIO_MAX,
+    ).to(device)
+
+    # Store the mask for visualization
+    world_model.last_training_mask = patch_mask
+
+    # Run inference (no training)
+    world_model.autoencoder.eval()
+    with torch.no_grad():
+        pred_patches, _ = world_model.autoencoder.forward_with_patch_mask(canvas_tensor, patch_mask)
+        img_pred = world_model.autoencoder.unpatchify(pred_patches)
+
+        # Compute loss using shared helper function from model module
+        target_patches = world_model.autoencoder.patchify(canvas_tensor)  # [1, num_patches, patch_dim]
+
+        # Select masked patches
+        masked_pred = pred_patches[patch_mask]
+        masked_target = target_patches[patch_mask]
+
+        # Compute loss with same function as training
+        import config as cfg
+        loss_dict = compute_hybrid_loss_on_masked_patches(
+            masked_pred,
+            masked_target,
+            focal_alpha=cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
+            focal_beta=cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA
+        )
+
+        # Convert tensor losses to scalars
+        loss_dict = {
+            'loss_hybrid': loss_dict['loss_hybrid'].item() if torch.is_tensor(loss_dict['loss_hybrid']) else loss_dict['loss_hybrid'],
+            'loss_plain': loss_dict['loss_plain'].item() if torch.is_tensor(loss_dict['loss_plain']) else loss_dict['loss_plain'],
+            'loss_focal': loss_dict['loss_focal'].item() if torch.is_tensor(loss_dict['loss_focal']) else loss_dict['loss_focal'],
+            'loss_standard': loss_dict['loss_standard'].item() if torch.is_tensor(loss_dict['loss_standard']) else loss_dict['loss_standard'],
+            'focal_alpha': cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
+            'focal_beta': cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA,
+            'focal_weight_mean': loss_dict['focal_weight_mean'],
+            'focal_weight_max': loss_dict['focal_weight_max'],
+        }
+
+    # Generate visualizations
+    status_msg = f"**Inference on canvas from frames {start_idx+1}-{frame_idx+1}**\n\n"
+    status_msg += f"(No training performed - weights unchanged)\n\n"
+    status_msg += f"Hybrid loss: {format_loss(loss_dict['loss_hybrid'])}\n"
+    status_msg += f"Standard loss: {format_loss(loss_dict['loss_standard'])}"
+
+    # Inference info (matches training display format)
+    inference_info = f"**Reconstruction Loss (Hybrid):** {format_loss(loss_dict['loss_hybrid'])} *[α={loss_dict['focal_alpha']:.2f}]*\n\n"
+    inference_info += f"**Standard Loss (unweighted):** {format_loss(loss_dict['loss_standard'])}\n\n"
+    inference_info += f"*Note: Using same loss calculation as training (hybrid: α * plain_mse + (1-α) * focal_mse with β={loss_dict['focal_beta']:.1f})*\n\n"
+    inference_info += f"*Model weights are unchanged (inference only)*"
+
+    # Training canvas visualizations
+    fig_inference_canvas = None
+    fig_inference_canvas_masked = None
+    fig_inference_inpainting_full = None
+    fig_inference_inpainting_composite = None
+
+    if world_model.last_training_canvas is not None:
+        # 1. Original canvas
+        fig_inference_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
+        ax.imshow(world_model.last_training_canvas)
+        ax.set_title(f"Inference Canvas (Frames {start_idx+1}-{frame_idx+1})")
+        ax.axis("off")
+        plt.tight_layout()
+
+        # Generate additional visualizations if mask is available
+        if world_model.last_training_mask is not None:
+            # 2. Canvas with mask overlay
+            canvas_with_mask = world_model.get_canvas_with_mask_overlay(
+                world_model.last_training_canvas,
+                world_model.last_training_mask
+            )
+            fig_inference_canvas_masked, ax = plt.subplots(1, 1, figsize=(12, 4))
+            ax.imshow(canvas_with_mask)
+            ax.set_title("Inference Canvas with Mask (Red = Masked Patches)")
+            ax.axis("off")
+            plt.tight_layout()
+
+            # 3. Full model output
+            inpainting_full = world_model.get_canvas_inpainting_full_output(
+                world_model.last_training_canvas,
+                world_model.last_training_mask
+            )
+            fig_inference_inpainting_full, ax = plt.subplots(1, 1, figsize=(12, 4))
+            ax.imshow(inpainting_full)
+            ax.set_title("Inference - Full Model Output")
+            ax.axis("off")
+            plt.tight_layout()
+
+            # 4. Composite
+            inpainting_composite = world_model.get_canvas_inpainting_composite(
+                world_model.last_training_canvas,
+                world_model.last_training_mask
+            )
+            fig_inference_inpainting_composite, ax = plt.subplots(1, 1, figsize=(12, 4))
+            ax.imshow(inpainting_composite)
+            ax.set_title("Inference - Composite")
+            ax.axis("off")
+            plt.tight_layout()
+
+    return status_msg, inference_info, fig_inference_canvas, fig_inference_canvas_masked, fig_inference_inpainting_full, fig_inference_inpainting_composite
+
+def train_on_single_canvas(frame_idx, num_training_steps):
+    """Train autoencoder on a single canvas built from selected frame and its history"""
+    global world_model, session_state
+
+    if world_model is None:
+        return "Please load a session first", "", "", None, None, None, None, None
+
+    if not session_state.get("observations") or not session_state.get("actions"):
+        return "No session data available", "", "", None, None, None, None, None
+
+    # Build canvas
+    training_canvas, error, start_idx, interleaved = build_canvas_from_frame(frame_idx)
+    if training_canvas is None:
+        return error, "", "", None, None, None, None, None
+
+    frame_idx = int(frame_idx)
 
     # Train N times and collect losses
     num_training_steps = int(num_training_steps)
@@ -968,6 +1121,25 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     gr.Markdown("---")
 
+    # Single Canvas Inference
+    gr.Markdown("## Inference on Single Canvas")
+    gr.Markdown("Run inference (no training) on a canvas built from the selected frame and its history to see what the model predicts.")
+
+    with gr.Row():
+        single_canvas_infer_btn = gr.Button("🔍 Run Inference on Selected Frame", variant="secondary")
+
+    single_canvas_infer_status = gr.Markdown("")
+
+    # Single Canvas Inference Visualizations (collapsible)
+    with gr.Accordion("Single Canvas Inference Results", open=False):
+        single_canvas_inference_info = gr.Markdown("")
+        single_canvas_inference_canvas = gr.Plot(label="1. Inference Canvas")
+        single_canvas_inference_masked = gr.Plot(label="2. Canvas with Mask Overlay")
+        single_canvas_inference_full = gr.Plot(label="3. Full Inpainting Output")
+        single_canvas_inference_composite = gr.Plot(label="4. Composite Reconstruction")
+
+    gr.Markdown("---")
+
     # Single Canvas Training
     gr.Markdown("## Train on Single Canvas")
     gr.Markdown("Train the autoencoder on a canvas built from the selected frame and its history.")
@@ -1136,6 +1308,19 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         fn=jump_to_frame,
         inputs=[frame_number_input],
         outputs=[frame_image, frame_info, frame_slider]
+    )
+
+    single_canvas_infer_btn.click(
+        fn=infer_on_single_canvas,
+        inputs=[frame_slider],
+        outputs=[
+            single_canvas_infer_status,
+            single_canvas_inference_info,
+            single_canvas_inference_canvas,
+            single_canvas_inference_masked,
+            single_canvas_inference_full,
+            single_canvas_inference_composite,
+        ]
     )
 
     single_canvas_train_btn.click(

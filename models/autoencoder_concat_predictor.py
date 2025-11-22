@@ -288,38 +288,24 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             black_baseline = (masked_target**2 * nonblack_mask).sum() / num_nonblack_pixels
             frac_nonblack = (num_nonblack_pixels / masked_target.numel()).item()
 
-            # Standard unweighted loss for tracking
-            loss_standard = F.mse_loss(masked_pred, masked_target).item()
-
-        # --- HYBRID LOSS: plain MSE + normalized focal MSE ---
-        # Import config for focal loss parameters
+        # --- HYBRID LOSS: Use shared helper function ---
         from config import AutoencoderConcatPredictorWorldModelConfig as Config
 
-        # Per-pixel squared error
-        pixel_error = (masked_pred - masked_target) ** 2  # [num_masked_patches, patch_vec]
+        loss_dict = compute_hybrid_loss_on_masked_patches(
+            masked_pred,
+            masked_target,
+            focal_alpha=Config.FOCAL_LOSS_ALPHA,
+            focal_beta=Config.FOCAL_BETA
+        )
 
-        # 1) Plain MSE term (on masked region)
-        loss_plain = pixel_error.mean()
-
-        # 2) Normalized focal term
-        if Config.FOCAL_BETA > 0:
-            w = torch.exp(Config.FOCAL_BETA * pixel_error).detach()
-            focal_loss = (w * pixel_error).sum() / (w.sum() + 1e-8)
-        else:
-            focal_loss = loss_plain
-
-        # Hybrid combination
+        # Extract values from loss dict
+        loss = loss_dict['loss_hybrid']
+        loss_plain = loss_dict['loss_plain']
+        focal_loss = loss_dict['loss_focal']
+        loss_standard = loss_dict['loss_standard'].item()
+        focal_weight_mean = loss_dict['focal_weight_mean']
+        focal_weight_max = loss_dict['focal_weight_max']
         alpha = Config.FOCAL_LOSS_ALPHA
-        loss = alpha * loss_plain + (1.0 - alpha) * focal_loss
-
-        # Track focal weight statistics for diagnostics
-        with torch.no_grad():
-            if Config.FOCAL_BETA > 0:
-                focal_weight_mean = w.mean().item()
-                focal_weight_max = w.max().item()
-            else:
-                focal_weight_mean = 1.0
-                focal_weight_max = 1.0
 
         # Backward pass
         optimizer.zero_grad()
@@ -461,6 +447,68 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
         if return_attn:
             return pred, latent, attn_weights, patch_mask
         return pred, latent  # pred is per-patch predictions in *original* order
+
+# ------------------------------
+# Loss calculation utilities
+# ------------------------------
+
+def compute_hybrid_loss_on_masked_patches(
+    masked_pred: torch.Tensor,
+    masked_target: torch.Tensor,
+    focal_alpha: float,
+    focal_beta: float
+) -> dict:
+    """
+    Compute hybrid loss (plain MSE + normalized focal MSE) on masked patches.
+
+    This is the shared loss calculation used for both training and inference evaluation.
+
+    Args:
+        masked_pred: [num_masked_patches, patch_dim] predicted patches
+        masked_target: [num_masked_patches, patch_dim] ground truth patches
+        focal_alpha: Blend ratio for hybrid loss (alpha * plain + (1-alpha) * focal)
+        focal_beta: Temperature for focal weighting (higher = more focus on errors)
+
+    Returns:
+        dict containing:
+            - loss_hybrid: Combined loss used for training
+            - loss_plain: Plain MSE component
+            - loss_focal: Focal MSE component
+            - loss_standard: Standard unweighted MSE (for comparison)
+            - focal_weight_mean: Mean focal weight
+            - focal_weight_max: Max focal weight
+    """
+    # Per-pixel squared error
+    pixel_error = (masked_pred - masked_target) ** 2
+
+    # 1) Plain MSE term
+    loss_plain = pixel_error.mean()
+
+    # 2) Normalized focal term
+    if focal_beta > 0:
+        w = torch.exp(focal_beta * pixel_error).detach()  # Detach for stability
+        loss_focal = (w * pixel_error).sum() / (w.sum() + 1e-8)
+        focal_weight_mean = w.mean().item()
+        focal_weight_max = w.max().item()
+    else:
+        loss_focal = loss_plain
+        focal_weight_mean = 1.0
+        focal_weight_max = 1.0
+
+    # 3) Hybrid combination
+    loss_hybrid = focal_alpha * loss_plain + (1.0 - focal_alpha) * loss_focal
+
+    # 4) Standard MSE for comparison
+    loss_standard = F.mse_loss(masked_pred, masked_target)
+
+    return {
+        'loss_hybrid': loss_hybrid,
+        'loss_plain': loss_plain,
+        'loss_focal': loss_focal,
+        'loss_standard': loss_standard,
+        'focal_weight_mean': focal_weight_mean,
+        'focal_weight_max': focal_weight_max,
+    }
 
 # ------------------------------
 # Canvas tensor conversion
