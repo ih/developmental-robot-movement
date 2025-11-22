@@ -86,13 +86,29 @@ python concat_world_model_explorer_gradio.py
   - Predicted next frame
   - Prediction error
 - **Metric graphs**: Plots tracking prediction error and iteration time
+- **Model checkpoint management**:
+  - Save/load model weights, optimizer, and scheduler state
+  - Metadata tracking (timestamp, config, training metrics)
+  - Checkpoint browser for easy model comparison
+- **Inference-only evaluation**:
+  - Single canvas inference on selected frame (no training)
+  - Full session evaluation with comprehensive statistics
+  - Metrics: mean, median, std dev, percentiles, loss plots, distributions
 - **Decoder attention visualization**: Interactive exploration of attention patterns
-  - Quantile-based filtering (show top N% strongest connections)
-  - Layer selection (toggle decoder layers 0-4 on/off)
-  - Head selection (toggle attention heads 0-3 for fine-grained analysis)
-  - Aggregation methods (mean, max, or sum across selected heads)
-  - Visualization types (patch-to-patch connection lines or heatmap matrix)
-  - Real-time statistics (connection counts, attention weights, per-layer/head metrics)
+  - **Patch selection**: Automatic dot detection (brightness-based) or manual selection (indices/ranges)
+  - **Frame-based analysis**: Visualize attention from selected frame (not just training canvas)
+  - **Attention direction**: Shows attention FROM selected patches TO all patches in canvas
+  - **Three visualization types**:
+    - Patch-to-patch connection lines (color-coded by layer, thickness by attention strength)
+    - Attention matrix heatmap (numerical view of selected → all patches)
+    - Heatmap overlay on canvas (spatial attention visualization)
+  - **Quantile filtering**: Show top N% strongest connections (for line visualization)
+  - **Layer selection**: Toggle decoder layers 0-4 on/off
+  - **Head selection**: Toggle attention heads 0-3 for fine-grained analysis
+  - **Aggregation methods**:
+    - Head aggregation: mean, max, or sum across selected heads
+    - Selected patch aggregation: mean, max, or sum across multiple selected patches
+  - **Real-time statistics**: Selected patches, connection counts, attention weights, per-layer/head metrics
 
 Access the interface at http://localhost:7860 after starting the server.
 
@@ -179,7 +195,12 @@ Required Python packages:
 - `replay_robot.py`: Robot interface for replaying sessions
 
 ### Visualization and Analysis
-- `attention_viz.py`: Decoder attention visualization with quantile filtering and layer/head selection
+- `attention_viz.py`: Decoder attention visualization with multiple visualization modes
+  - Patch-to-patch connection lines (FROM selected patches TO all patches)
+  - Attention matrix heatmaps for numerical analysis
+  - Heatmap overlay on canvas for spatial visualization
+  - Automatic dot detection and manual patch selection
+  - Quantile-based filtering and layer/head selection
 - `session_explorer_lib.py`: Session management, frame processing, and model operations
 
 ### Testing and Development
@@ -229,15 +250,24 @@ To add support for a new robot:
 
 The concat world model explorer provides powerful attention visualization:
 
-- **Quantile filtering**: Focus on strongest attention by filtering to top percentiles
-- **Layer/head selection**: Toggle individual decoder layers and attention heads
-- **Aggregation methods**: Mean, max, or sum across selected heads
-- **Two visualization modes**:
-  - Patch-to-patch connection lines (color-coded by layer, thickness by attention magnitude)
-  - Attention heatmap matrices showing full attention patterns
-- **Real-time statistics**: Connection counts, attention weights, per-layer/head metrics
+- **Patch selection modes**:
+  - **Automatic dot detection**: Identifies bright patches using configurable brightness threshold (0-1)
+  - **Manual selection**: Specify indices manually (supports formats: "0,5,10" or "0-10" or "0,5,10-15")
+- **Frame-based analysis**: Visualize attention from selected frame (builds canvas from current frame context)
+- **Attention direction**: Shows attention FROM selected patches (e.g., dot patches) TO all other patches in canvas
+- **Three visualization types**:
+  - **Patch-to-patch lines**: Connection lines color-coded by layer, thickness by attention strength
+  - **Matrix heatmap**: Numerical heatmap showing selected patches to all patches
+  - **Overlay heatmap**: Spatial attention heatmap overlaid on full canvas
+- **Quantile filtering**: Focus on strongest connections by filtering to top percentiles (for line visualization)
+- **Layer/head selection**: Toggle individual decoder layers (0-4) and attention heads (0-3)
+- **Aggregation methods**:
+  - Head aggregation: Mean, max, or sum across selected heads
+  - Selected patch aggregation: Mean, max, or sum across multiple selected patches
+- **Canvas-aware coordinates**: Automatically adjusts patch coordinates from frame space to canvas space
+- **Real-time statistics**: Selected patches, connection counts, attention weights, per-layer/head metrics
 
-Use this to understand how the decoder attends to different parts of the canvas when predicting the next frame.
+Use this to understand how specific patches (like those containing the dot) attend to different parts of the canvas when the decoder is reconstructing the next frame.
 
 ### Configuration
 

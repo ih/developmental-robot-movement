@@ -461,3 +461,389 @@ def create_attention_heatmap(
 
     plt.tight_layout()
     return fig
+
+
+def detect_dot_patches(
+    frame_img: np.ndarray,
+    patch_size: int,
+    brightness_threshold: float = 0.5
+) -> np.ndarray:
+    """
+    Automatically detect patches containing the dot based on brightness.
+
+    Args:
+        frame_img: [H, W, 3] RGB image (uint8)
+        patch_size: Size of each square patch
+        brightness_threshold: Minimum average brightness (0-1) to consider a patch as containing the dot
+
+    Returns:
+        selected_indices: array of patch indices that contain the dot
+    """
+    img_height, img_width = frame_img.shape[:2]
+    num_patches_h = img_height // patch_size
+    num_patches_w = img_width // patch_size
+
+    selected_patches = []
+
+    for patch_idx in range(num_patches_h * num_patches_w):
+        row = patch_idx // num_patches_w
+        col = patch_idx % num_patches_w
+
+        # Extract patch region
+        y_start = row * patch_size
+        y_end = (row + 1) * patch_size
+        x_start = col * patch_size
+        x_end = (col + 1) * patch_size
+
+        patch = frame_img[y_start:y_end, x_start:x_end]
+
+        # Calculate average brightness (0-1 scale)
+        avg_brightness = patch.mean() / 255.0
+
+        if avg_brightness >= brightness_threshold:
+            selected_patches.append(patch_idx)
+
+    return np.array(selected_patches, dtype=int)
+
+
+def filter_attention_from_selected(
+    attn_weights: np.ndarray,
+    selected_indices: np.ndarray,
+    quantile: float
+) -> Tuple[List[Tuple[int, int, float]], float]:
+    """
+    Filter attention connections FROM selected patches TO all other patches by quantile.
+
+    Args:
+        attn_weights: [N, N] aggregated attention weights (includes CLS token at index 0)
+        selected_indices: patch indices that are selected
+        quantile: percentile threshold (0-100). E.g., 95 means show top 5% of connections
+
+    Returns:
+        connections: list of (from_patch, to_patch, weight) tuples
+        threshold: computed threshold value corresponding to the quantile
+    """
+    # Collect all weights FROM selected patches TO all other patches
+    all_weights = []
+    num_patches = attn_weights.shape[0] - 1  # Exclude CLS token
+
+    for selected_idx in selected_indices:
+        selected_token_idx = selected_idx + 1  # Add 1 for CLS token
+
+        # Get attention from this selected patch to all other patches (excluding CLS)
+        for target_idx in range(num_patches):
+            target_token_idx = target_idx + 1
+            weight = attn_weights[selected_token_idx, target_token_idx]
+            all_weights.append(weight)
+
+    # Compute threshold from quantile
+    if len(all_weights) == 0:
+        return [], 0.0
+
+    threshold = np.quantile(all_weights, quantile / 100.0)
+
+    # Second pass: filter connections by computed threshold
+    connections = []
+
+    for selected_idx in selected_indices:
+        selected_token_idx = selected_idx + 1
+
+        for target_idx in range(num_patches):
+            target_token_idx = target_idx + 1
+            weight = attn_weights[selected_token_idx, target_token_idx]
+
+            if weight >= threshold:
+                connections.append((selected_idx, target_idx, weight))
+
+    return connections, threshold
+
+
+def draw_attention_from_selected(
+    canvas_img: np.ndarray,
+    patch_centers: np.ndarray,
+    attn_weights_list: List[torch.Tensor],
+    selected_indices: np.ndarray,
+    quantile: float = 95.0,
+    layer_colors: List[str] = None,
+    enabled_layers: List[bool] = None,
+    enabled_heads: List[int] = None,
+    line_width_range: Tuple[float, float] = (0.5, 5.0),
+    aggregation: str = 'mean',
+    selected_patch_aggregation: str = 'mean',
+    alpha: float = 0.6
+) -> plt.Figure:
+    """
+    Draw attention connections FROM selected patches TO all other patches.
+
+    Args:
+        canvas_img: [H, W, 3] RGB image (uint8)
+        patch_centers: [num_patches, 2] array of (x, y) centers
+        attn_weights_list: list of [B, num_heads, N, N] tensors (one per decoder layer)
+        selected_indices: array of selected patch indices
+        quantile: percentile threshold (0-100). E.g., 95 means show top 5% of connections
+        layer_colors: list of color names for each layer
+        enabled_layers: list of booleans indicating which layers to show
+        enabled_heads: list of head indices to include. If None, use all heads.
+        line_width_range: (min_width, max_width) for scaling line thickness
+        aggregation: 'mean', 'max', or 'sum' for aggregating across attention heads
+        selected_patch_aggregation: 'mean', 'max', or 'sum' for aggregating across selected patches
+        alpha: transparency for lines
+
+    Returns:
+        fig: matplotlib figure with visualization
+    """
+    num_layers = len(attn_weights_list)
+
+    # Default layer colors
+    if layer_colors is None:
+        cmap = plt.cm.get_cmap('tab10')
+        layer_colors = [cmap(i / num_layers) for i in range(num_layers)]
+
+    # Default to all layers enabled
+    if enabled_layers is None:
+        enabled_layers = [True] * num_layers
+
+    # Create figure
+    fig, ax = plt.subplots(1, 1, figsize=(16, 6))
+    ax.imshow(canvas_img)
+    ax.axis('off')
+
+    # Calculate number of patches in canvas
+    img_height, img_width = canvas_img.shape[:2]
+    patch_size_calc = patch_centers[1][0] - patch_centers[0][0] if len(patch_centers) > 1 else 16  # Infer patch size
+    num_patches_w = img_width // int(patch_size_calc) if patch_size_calc > 0 else img_width // 16
+
+    # Highlight selected patches
+    for selected_idx in selected_indices:
+        # Calculate row and col from selected_idx using canvas dimensions
+        row = selected_idx // num_patches_w
+        col = selected_idx % num_patches_w
+
+        # Draw a circle at the center of the selected patch
+        center_x = col * patch_size_calc + patch_size_calc // 2
+        center_y = row * patch_size_calc + patch_size_calc // 2
+        radius = patch_size_calc // 2  # Half the patch size
+        circle = plt.Circle((center_x, center_y), radius=radius, color='cyan', fill=False, linewidth=2, zorder=50)
+        ax.add_patch(circle)
+
+    # Track statistics
+    all_weights = []
+    computed_thresholds = []
+
+    # Process each layer
+    for layer_idx in range(num_layers):
+        if not enabled_layers[layer_idx]:
+            continue
+
+        # Aggregate attention across heads
+        attn_aggregated = aggregate_attention_heads(
+            attn_weights_list[layer_idx],
+            aggregation=aggregation,
+            enabled_heads=enabled_heads
+        )
+
+        # Filter connections by quantile
+        connections, threshold = filter_attention_from_selected(
+            attn_aggregated,
+            selected_indices,
+            quantile
+        )
+        computed_thresholds.append(threshold)
+
+        if len(connections) == 0:
+            continue
+
+        # Extract weights for normalization
+        all_weights.extend([w for _, _, w in connections])
+
+        # Draw lines for this layer
+        layer_color = layer_colors[layer_idx]
+
+        for from_patch, to_patch, weight in connections:
+            from_center = patch_centers[from_patch]
+            to_center = patch_centers[to_patch]
+
+            # Scale line width by attention weight
+            layer_weights = [w for _, _, w in connections]
+            min_w = min(layer_weights)
+            max_w = max(layer_weights)
+            if max_w > min_w:
+                normalized_weight = (weight - min_w) / (max_w - min_w)
+            else:
+                normalized_weight = 0.5
+
+            line_width = (
+                line_width_range[0] +
+                normalized_weight * (line_width_range[1] - line_width_range[0])
+            )
+
+            # Draw line
+            ax.plot(
+                [from_center[0], to_center[0]],
+                [from_center[1], to_center[1]],
+                color=layer_color,
+                linewidth=line_width,
+                alpha=alpha,
+                zorder=10 + layer_idx
+            )
+
+    # Create legend
+    legend_patches = []
+    for layer_idx in range(num_layers):
+        if enabled_layers[layer_idx]:
+            legend_patches.append(
+                mpatches.Patch(color=layer_colors[layer_idx], label=f'Layer {layer_idx}')
+            )
+
+    if legend_patches:
+        ax.legend(handles=legend_patches, loc='upper right', fontsize=10)
+
+    # Statistics
+    total_connections = sum([
+        len(filter_attention_from_selected(
+            aggregate_attention_heads(attn_weights_list[i], aggregation, enabled_heads),
+            selected_indices,
+            quantile
+        )[0])
+        for i in range(num_layers) if enabled_layers[i]
+    ])
+
+    max_attention = max(all_weights) if all_weights else 0.0
+    avg_threshold = np.mean(computed_thresholds) if computed_thresholds else 0.0
+
+    # Format head display
+    if enabled_heads is None:
+        heads_str = "All"
+    else:
+        heads_str = f"[{','.join(map(str, enabled_heads))}]"
+
+    ax.set_title(
+        f'Attention FROM Selected Patches ({len(selected_indices)}) TO All Patches\n'
+        f'Connections: {total_connections} | Quantile: {quantile:.1f}% (threshold ≈ {avg_threshold:.4f}) | '
+        f'Heads: {heads_str} | Aggregation: {aggregation} | Selected Agg: {selected_patch_aggregation}',
+        fontsize=12,
+        pad=10
+    )
+
+    plt.tight_layout()
+    return fig
+
+
+def create_attention_heatmap_overlay(
+    frame_img: np.ndarray,
+    attn_weights_list: List[torch.Tensor],
+    selected_indices: np.ndarray,
+    patch_size: int,
+    layer_idx: int = 0,
+    aggregation: str = 'mean',
+    enabled_heads: List[int] = None,
+    selected_patch_aggregation: str = 'mean',
+    alpha: float = 0.6
+) -> plt.Figure:
+    """
+    Create a heatmap overlay on the frame showing attention FROM selected patches TO all patches.
+
+    Args:
+        frame_img: [H, W, 3] RGB image (uint8)
+        attn_weights_list: list of [B, num_heads, N, N] tensors
+        selected_indices: array of selected patch indices
+        patch_size: Size of each square patch
+        layer_idx: which decoder layer to visualize
+        aggregation: head aggregation method ('mean', 'max', or 'sum')
+        enabled_heads: list of head indices to include. If None, use all heads.
+        selected_patch_aggregation: how to aggregate across selected patches ('mean', 'max', or 'sum')
+        alpha: transparency for heatmap overlay
+
+    Returns:
+        fig: matplotlib figure with heatmap overlay
+    """
+    img_height, img_width = frame_img.shape[:2]
+    num_patches_h = img_height // patch_size
+    num_patches_w = img_width // patch_size
+    num_patches = num_patches_h * num_patches_w
+
+    # Aggregate attention across heads
+    attn_aggregated = aggregate_attention_heads(
+        attn_weights_list[layer_idx],
+        aggregation=aggregation,
+        enabled_heads=enabled_heads
+    )
+
+    # Aggregate attention FROM all selected patches TO each target patch
+    attention_map = np.zeros(num_patches)
+
+    for target_idx in range(num_patches):
+        target_token_idx = target_idx + 1  # Add 1 for CLS token
+
+        # Collect attention from all selected patches to this target
+        weights_to_target = []
+        for selected_idx in selected_indices:
+            selected_token_idx = selected_idx + 1
+            weight = attn_aggregated[selected_token_idx, target_token_idx]
+            weights_to_target.append(weight)
+
+        # Aggregate across selected patches
+        if len(weights_to_target) > 0:
+            if selected_patch_aggregation == 'mean':
+                attention_map[target_idx] = np.mean(weights_to_target)
+            elif selected_patch_aggregation == 'max':
+                attention_map[target_idx] = np.max(weights_to_target)
+            elif selected_patch_aggregation == 'sum':
+                attention_map[target_idx] = np.sum(weights_to_target)
+
+    # Reshape to 2D grid
+    attention_grid = attention_map.reshape(num_patches_h, num_patches_w)
+
+    # Upsample to match image resolution
+    from scipy.ndimage import zoom
+    zoom_factor = patch_size
+    attention_heatmap = zoom(attention_grid, zoom_factor, order=1)
+
+    # Ensure heatmap matches image size exactly
+    attention_heatmap = attention_heatmap[:img_height, :img_width]
+
+    # Create figure
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    ax.imshow(frame_img)
+
+    # Overlay heatmap
+    im = ax.imshow(attention_heatmap, cmap='hot', alpha=alpha, interpolation='bilinear')
+
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Attention Weight', fontsize=12)
+
+    # Highlight selected patches
+    for selected_idx in selected_indices:
+        row = selected_idx // num_patches_w
+        col = selected_idx % num_patches_w
+
+        # Draw rectangle around selected patch
+        rect = plt.Rectangle(
+            (col * patch_size, row * patch_size),
+            patch_size,
+            patch_size,
+            linewidth=2,
+            edgecolor='cyan',
+            facecolor='none',
+            zorder=10
+        )
+        ax.add_patch(rect)
+
+    ax.axis('off')
+
+    # Format head display
+    if enabled_heads is None:
+        heads_str = "All"
+    else:
+        heads_str = f"[{','.join(map(str, enabled_heads))}]"
+
+    ax.set_title(
+        f'Attention Heatmap: FROM Selected Patches ({len(selected_indices)}) TO All Patches\n'
+        f'Layer {layer_idx} | Heads: {heads_str} | Aggregation: {aggregation} | Selected Agg: {selected_patch_aggregation}',
+        fontsize=12,
+        pad=10
+    )
+
+    plt.tight_layout()
+    return fig
