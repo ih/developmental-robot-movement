@@ -69,6 +69,11 @@ This repository contains research code for developmental robot movement with a c
 - **Prediction display**: Current frame, predicted next frame, and prediction error visualization
 - **Metric graphs**: Plots showing prediction error and iteration time over all iterations
 - **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method with periodic UI updates
+- **Model checkpoint management**: Save and load trained model weights with full optimizer and scheduler state
+  - Save weights with custom names to `saved/checkpoints/toroidal_dot/`
+  - Load previously saved checkpoints to resume training
+  - Checkpoint metadata includes timestamp, config, and training metrics
+  - Preserves optimizer and scheduler state for seamless training continuation
 - **Decoder attention visualization**: Interactive visualization of decoder attention patterns from masked patches to unmasked patches
   - Quantile-based filtering: Show top N% of attention connections (e.g., 95% = strongest 5%)
   - Layer selection: Toggle individual decoder layers (0-4) on/off
@@ -131,6 +136,11 @@ python concat_world_model_explorer_gradio.py
 - **Post-run visualizations**: Current frame, predicted frame, and prediction error
 - **Metric graphs**: Plots tracking prediction error and iteration time over all iterations
 - **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method with MAE-native masked patch optimization
+- **Model checkpoint management**:
+  - **Save weights**: Enter checkpoint name and click "💾 Save Weights" to save model, optimizer, and scheduler state
+  - **Load weights**: Select checkpoint from dropdown and click "📂 Load Weights" to restore previous training state
+  - **Checkpoint location**: All checkpoints saved to `saved/checkpoints/toroidal_dot/`
+  - **Metadata tracking**: Each checkpoint includes timestamp, config parameters, and training metrics
 - **Decoder attention visualization**: Explore how the decoder attends to different patches during inpainting
 
 ### Recording Sessions

@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import gradio as gr
+from datetime import datetime
+from pathlib import Path
 
 import config
 from autoencoder_concat_predictor_world_model import AutoencoderConcatPredictorWorldModel
@@ -37,6 +39,9 @@ from attention_viz import (
 TOROIDAL_DOT_SESSIONS_DIR = config.TOROIDAL_DOT_RECORDING_DIR
 TOROIDAL_DOT_CHECKPOINT_DIR = config.TOROIDAL_DOT_CHECKPOINT_DIR
 
+# Ensure checkpoint directory exists
+os.makedirs(TOROIDAL_DOT_CHECKPOINT_DIR, exist_ok=True)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -44,6 +49,7 @@ print(f"Using device: {device}")
 session_state = {}
 world_model = None
 replay_robot = None
+current_checkpoint_name = None
 
 def format_loss(loss_value):
     """Format loss value for display"""
@@ -746,6 +752,158 @@ def generate_attention_visualization(
         error_msg = f"Error generating attention visualization:\n\n{str(e)}\n\n{traceback.format_exc()}"
         return error_msg, None, ""
 
+def list_available_checkpoints():
+    """List all available checkpoint files in the checkpoint directory"""
+    checkpoint_dir = Path(TOROIDAL_DOT_CHECKPOINT_DIR)
+    if not checkpoint_dir.exists():
+        return []
+
+    # Find all .pth files
+    checkpoint_files = sorted(checkpoint_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [f.name for f in checkpoint_files]
+
+def refresh_checkpoints():
+    """Refresh checkpoint dropdown list"""
+    checkpoints = list_available_checkpoints()
+    choices = checkpoints if checkpoints else ["No checkpoints available"]
+    return gr.Dropdown(choices=choices, value=choices[0] if checkpoints else None)
+
+def save_model_weights(checkpoint_name):
+    """Save current model weights to a checkpoint file"""
+    global world_model, current_checkpoint_name
+
+    if world_model is None:
+        return "Error: No model loaded. Please load a session first.", gr.Dropdown()
+
+    if not checkpoint_name or checkpoint_name.strip() == "":
+        return "Error: Please provide a checkpoint name.", gr.Dropdown()
+
+    checkpoint_name = checkpoint_name.strip()
+
+    # Add .pth extension if not present
+    if not checkpoint_name.endswith('.pth'):
+        checkpoint_name += '.pth'
+
+    checkpoint_path = os.path.join(TOROIDAL_DOT_CHECKPOINT_DIR, checkpoint_name)
+
+    try:
+        # Save model state dict, optimizer state, scheduler state, and metadata
+        checkpoint = {
+            'model_state_dict': world_model.autoencoder.state_dict(),
+            'optimizer_state_dict': world_model.ae_optimizer.state_dict(),
+            'scheduler_state_dict': world_model.ae_scheduler.state_dict(),
+            'timestamp': datetime.now().isoformat(),
+            'config': {
+                'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+                'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+                'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+            }
+        }
+
+        # Add training metrics if available
+        if hasattr(world_model, '_metrics_history') and world_model._metrics_history['iteration']:
+            checkpoint['metrics'] = {
+                'total_iterations': len(world_model._metrics_history['iteration']),
+                'final_training_loss': world_model._metrics_history['training_loss'][-1] if world_model._metrics_history['training_loss'] else None,
+                'final_prediction_error': world_model._metrics_history['prediction_error'][-1] if world_model._metrics_history['prediction_error'] else None,
+            }
+
+        torch.save(checkpoint, checkpoint_path)
+        current_checkpoint_name = checkpoint_name
+
+        status_msg = f"✅ **Model weights saved successfully!**\n\n"
+        status_msg += f"**Checkpoint:** {checkpoint_name}\n"
+        status_msg += f"**Location:** {checkpoint_path}\n"
+        status_msg += f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+
+        if 'metrics' in checkpoint:
+            status_msg += f"\n**Training Metrics:**\n"
+            status_msg += f"- Total iterations: {checkpoint['metrics']['total_iterations']}\n"
+            if checkpoint['metrics']['final_training_loss'] is not None:
+                status_msg += f"- Final training loss: {format_loss(checkpoint['metrics']['final_training_loss'])}\n"
+            if checkpoint['metrics']['final_prediction_error'] is not None:
+                status_msg += f"- Final prediction error: {format_loss(checkpoint['metrics']['final_prediction_error'])}\n"
+
+        return status_msg, refresh_checkpoints()
+
+    except Exception as e:
+        import traceback
+        error_msg = f"❌ **Error saving checkpoint:**\n\n{str(e)}\n\n{traceback.format_exc()}"
+        return error_msg, gr.Dropdown()
+
+def load_model_weights(checkpoint_name):
+    """Load model weights from a checkpoint file"""
+    global world_model, current_checkpoint_name
+
+    if world_model is None:
+        return "Error: No model loaded. Please load a session first."
+
+    if not checkpoint_name or checkpoint_name == "No checkpoints available":
+        return "Error: Please select a valid checkpoint."
+
+    checkpoint_path = os.path.join(TOROIDAL_DOT_CHECKPOINT_DIR, checkpoint_name)
+
+    if not os.path.exists(checkpoint_path):
+        return f"Error: Checkpoint file not found: {checkpoint_path}"
+
+    try:
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        # Load model state
+        if 'model_state_dict' in checkpoint:
+            world_model.autoencoder.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            # Fallback: assume entire checkpoint is the state dict
+            world_model.autoencoder.load_state_dict(checkpoint)
+
+        # Load optimizer state if available
+        if 'optimizer_state_dict' in checkpoint:
+            world_model.ae_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        # Load scheduler state if available
+        if 'scheduler_state_dict' in checkpoint:
+            world_model.ae_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        current_checkpoint_name = checkpoint_name
+
+        status_msg = f"✅ **Model weights loaded successfully!**\n\n"
+        status_msg += f"**Checkpoint:** {checkpoint_name}\n"
+        status_msg += f"**Location:** {checkpoint_path}\n"
+
+        if 'timestamp' in checkpoint:
+            status_msg += f"**Saved at:** {checkpoint['timestamp']}\n"
+
+        if 'config' in checkpoint:
+            status_msg += f"\n**Model Configuration:**\n"
+            status_msg += f"- Frame size: {checkpoint['config'].get('frame_size')}\n"
+            status_msg += f"- Separator width: {checkpoint['config'].get('separator_width')}\n"
+            status_msg += f"- Canvas history size: {checkpoint['config'].get('canvas_history_size')}\n"
+
+        if 'metrics' in checkpoint:
+            status_msg += f"\n**Training Metrics (at save time):**\n"
+            status_msg += f"- Total iterations: {checkpoint['metrics']['total_iterations']}\n"
+            if checkpoint['metrics']['final_training_loss'] is not None:
+                status_msg += f"- Final training loss: {format_loss(checkpoint['metrics']['final_training_loss'])}\n"
+            if checkpoint['metrics']['final_prediction_error'] is not None:
+                status_msg += f"- Final prediction error: {format_loss(checkpoint['metrics']['final_prediction_error'])}\n"
+
+        return status_msg
+
+    except Exception as e:
+        import traceback
+        error_msg = f"❌ **Error loading checkpoint:**\n\n{str(e)}\n\n{traceback.format_exc()}"
+        return error_msg
+
+def get_checkpoint_info():
+    """Get current checkpoint status information"""
+    global current_checkpoint_name
+
+    if current_checkpoint_name:
+        return f"**Current checkpoint:** {current_checkpoint_name}"
+    else:
+        return "**Current checkpoint:** None (using fresh model)"
+
 # Build Gradio interface
 with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as demo:
     gr.Markdown("# Concat World Model Explorer")
@@ -758,6 +916,39 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         load_session_btn = gr.Button("Load Session", variant="primary")
 
     session_info = gr.Markdown("No session loaded.")
+
+    gr.Markdown("---")
+
+    # Model Checkpoint Management
+    gr.Markdown("## Model Checkpoint Management")
+    gr.Markdown("Save and load trained model weights.")
+
+    checkpoint_status = gr.Markdown("**Current checkpoint:** None (using fresh model)")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### Save Model Weights")
+            save_checkpoint_name = gr.Textbox(
+                label="Checkpoint Name",
+                placeholder="e.g., my_model_checkpoint",
+                info="Extension .pth will be added automatically"
+            )
+            save_checkpoint_btn = gr.Button("💾 Save Weights", variant="primary")
+            save_checkpoint_status = gr.Markdown("")
+
+        with gr.Column(scale=1):
+            gr.Markdown("### Load Model Weights")
+            checkpoint_dropdown = gr.Dropdown(
+                label="Select Checkpoint",
+                choices=[],
+                interactive=True
+            )
+            with gr.Row():
+                refresh_checkpoints_btn = gr.Button("🔄 Refresh", size="sm")
+                load_checkpoint_btn = gr.Button("📂 Load Weights", variant="primary", scale=2)
+            load_checkpoint_status = gr.Markdown("")
+
+    gr.Markdown("---")
 
     # Frame Viewer
     gr.Markdown("## Current Frame")
@@ -911,6 +1102,25 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         outputs=[session_info, frame_image, frame_info, frame_slider, frame_slider]
     )
 
+    # Checkpoint management event handlers
+    save_checkpoint_btn.click(
+        fn=save_model_weights,
+        inputs=[save_checkpoint_name],
+        outputs=[save_checkpoint_status, checkpoint_dropdown]
+    )
+
+    refresh_checkpoints_btn.click(
+        fn=refresh_checkpoints,
+        inputs=[],
+        outputs=[checkpoint_dropdown]
+    )
+
+    load_checkpoint_btn.click(
+        fn=load_model_weights,
+        inputs=[checkpoint_dropdown],
+        outputs=[load_checkpoint_status]
+    )
+
     frame_slider.change(
         fn=update_frame,
         inputs=[frame_slider],
@@ -986,11 +1196,16 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         ]
     )
 
-    # Initialize session dropdown on load
+    # Initialize session dropdown and checkpoint dropdown on load
+    def initialize_ui():
+        sessions = refresh_sessions()
+        checkpoints = refresh_checkpoints()
+        return sessions, checkpoints
+
     demo.load(
-        fn=refresh_sessions,
+        fn=initialize_ui,
         inputs=[],
-        outputs=[session_dropdown]
+        outputs=[session_dropdown, checkpoint_dropdown]
     )
 
 if __name__ == "__main__":
