@@ -291,33 +291,35 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             # Standard unweighted loss for tracking
             loss_standard = F.mse_loss(masked_pred, masked_target).item()
 
-        # --- FOCAL MSE LOSS: adaptively upweight high-error pixels ---
+        # --- HYBRID LOSS: plain MSE + normalized focal MSE ---
         # Import config for focal loss parameters
         from config import AutoencoderConcatPredictorWorldModelConfig as Config
 
-        # Per-pixel absolute error
-        pixel_error = (masked_pred - masked_target).abs()  # [num_masked_patches, patch_vec]
+        # Per-pixel squared error
+        pixel_error = (masked_pred - masked_target) ** 2  # [num_masked_patches, patch_vec]
 
-        # Focal weighting from error (detach to avoid backprop through weights)
-        focal_beta = Config.FOCAL_BETA
-        focal_weights_raw = torch.exp(focal_beta * pixel_error).detach()  # bigger weight where error is large
+        # 1) Plain MSE term (on masked region)
+        loss_plain = pixel_error.mean()
 
-        # Cap and normalize to keep things stable
-        weight_cap = Config.FOCAL_W_CAP
-        focal_weights = torch.clamp(focal_weights_raw, max=weight_cap)
-        focal_weights = focal_weights / (focal_weights.mean() + 1e-8)  # avg weight ≈ 1 (prevents LR drift)
+        # 2) Normalized focal term
+        if Config.FOCAL_BETA > 0:
+            w = torch.exp(Config.FOCAL_BETA * pixel_error).detach()
+            focal_loss = (w * pixel_error).sum() / (w.sum() + 1e-8)
+        else:
+            focal_loss = loss_plain
 
-        # Blend with uniform weighting to avoid ignoring flat regions entirely
-        uniform_mix_ratio = Config.FOCAL_MIX
-        focal_weights = uniform_mix_ratio * focal_weights + (1.0 - uniform_mix_ratio)
-
-        # Focal MSE
-        loss = ((masked_pred - masked_target) ** 2 * focal_weights).mean()
+        # Hybrid combination
+        alpha = Config.FOCAL_LOSS_ALPHA
+        loss = alpha * loss_plain + (1.0 - alpha) * focal_loss
 
         # Track focal weight statistics for diagnostics
         with torch.no_grad():
-            focal_weight_mean = focal_weights.mean().item()
-            focal_weight_max = focal_weights.max().item()
+            if Config.FOCAL_BETA > 0:
+                focal_weight_mean = w.mean().item()
+                focal_weight_max = w.max().item()
+            else:
+                focal_weight_mean = 1.0
+                focal_weight_max = 1.0
 
         # Backward pass
         optimizer.zero_grad()
@@ -350,8 +352,10 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             'head_bias_norm': gnorm(head_b),
             'mask_token_norm': gnorm(mask_tok),
             'qkv_weight_norm': gnorm(qkv_w),
-            # Loss dilution diagnostics
-            'loss_focal': loss.item(),              # Focal loss (used for training)
+            # Loss diagnostics
+            'loss_hybrid': loss.item(),             # Hybrid loss (used for training)
+            'loss_plain': loss_plain.item(),        # Plain MSE component
+            'loss_focal': focal_loss.item(),        # Focal MSE component
             'loss_standard': loss_standard,         # Standard unweighted loss (for comparison)
             'loss_nonblack': loss_nonblack.item(),  # Loss on non-black pixels only
             'black_baseline': black_baseline.item(),
@@ -359,8 +363,8 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             # Focal weight statistics
             'focal_weight_mean': focal_weight_mean,
             'focal_weight_max': focal_weight_max,
-            'focal_beta': focal_beta,
-            'focal_mix_ratio': uniform_mix_ratio,
+            'focal_beta': Config.FOCAL_BETA,
+            'focal_alpha': alpha,
         }
 
         optimizer.step()

@@ -69,8 +69,10 @@ def format_grad_diagnostics(grad_diag):
 
     lines.append("\n**Loss Metrics:**\n")
     focal_beta = grad_diag.get('focal_beta', 10.0)
-    focal_mix = grad_diag.get('focal_mix_ratio', 0.5)
-    lines.append(f"- **Focal Loss (training)**: {format_loss(grad_diag.get('loss_focal'))} *[error-adaptive, β={focal_beta:.1f}, mix={focal_mix:.2f}]*")
+    focal_alpha = grad_diag.get('focal_alpha', 0.2)
+    lines.append(f"- **Hybrid Loss (training)**: {format_loss(grad_diag.get('loss_hybrid'))} *[α={focal_alpha:.2f}]*")
+    lines.append(f"  - Plain MSE Component: {format_loss(grad_diag.get('loss_plain'))}")
+    lines.append(f"  - Focal MSE Component: {format_loss(grad_diag.get('loss_focal'))} *[β={focal_beta:.1f}]*")
     lines.append(f"- Standard Loss (for comparison): {format_loss(grad_diag.get('loss_standard'))}")
 
     lines.append("\n**Focal Weight Statistics:**\n")
@@ -281,7 +283,7 @@ def train_on_single_canvas(frame_idx, num_training_steps):
 
     # Training info with gradient diagnostics
     final_loss = loss_history[-1] if loss_history else None
-    training_info = f"**Training Loss (Focal):** {format_loss(final_loss)}"
+    training_info = f"**Training Loss (Hybrid):** {format_loss(final_loss)}"
 
     # Add standard loss if available from diagnostics
     if world_model.last_grad_diagnostics and 'loss_standard' in world_model.last_grad_diagnostics:
@@ -553,7 +555,8 @@ def run_world_model(num_iterations):
     try:
         import time
         loop_count = 0
-        UPDATE_INTERVAL = 5  # Update UI every N iterations
+        from config import AutoencoderConcatPredictorWorldModelConfig as Config
+        UPDATE_INTERVAL = Config.GRADIO_UPDATE_INTERVAL  # Update UI every N iterations
 
         # Run world model with metric tracking and periodic UI updates
         for i in range(num_iterations):
