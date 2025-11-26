@@ -39,7 +39,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
 
     # Focal loss parameters (for loss dilution)
     FOCAL_BETA = 5              # Temperature for exponential weighting (try 5-15)
-    FOCAL_LOSS_ALPHA = 0.2          # Blend ratio: alpha * plain_mse + (1-alpha) * focal_mse
+    FOCAL_LOSS_ALPHA = 0.1          # Blend ratio: alpha * plain_mse + (1-alpha) * focal_mse
 
     # Gradio UI parameters
     GRADIO_UPDATE_INTERVAL = 1      # Update visualization every N iterations during training
