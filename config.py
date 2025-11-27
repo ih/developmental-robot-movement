@@ -30,6 +30,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
 
     # Model architecture
     PATCH_SIZE = 16                # Size of patches for Vision Transformer (WARNING: changing requires retraining)
+    BATCH_SIZE = 1                 # Training batch size (1=online learning, >1=mini-batch)
 
     # Optimizer parameters
     AUTOENCODER_LR = 1e-4          # Learning rate for autoencoder training

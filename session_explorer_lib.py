@@ -304,6 +304,108 @@ def get_frame_tensor(session_dir, frame_path, transform=None):
     return transform(pil_img)
 
 
+def prebuild_all_canvases(session_dir, observations, actions, config):
+    """
+    Pre-build all valid training canvases from a session.
+
+    This function pre-loads all frames and builds all valid canvases at session load time,
+    storing them in memory. This eliminates the expensive per-batch canvas building overhead
+    (PIL resizes, disk I/O) and amortizes it across the entire session.
+
+    Args:
+        session_dir: Path to session directory
+        observations: List of observation dictionaries with 'frame_path' keys
+        actions: List of action dictionaries
+        config: AutoencoderConcatPredictorWorldModelConfig class
+
+    Returns:
+        Dictionary mapping frame_idx -> {
+            'canvas': numpy HxWx3 uint8 array,
+            'start_idx': starting frame index for canvas,
+            'interleaved': interleaved history [frame, action, frame, ...]
+        }
+    """
+    from models.autoencoder_concat_predictor import build_canvas
+    import numpy as np
+    from PIL import Image
+    import io
+
+    min_frames_needed = config.CANVAS_HISTORY_SIZE
+    canvas_cache = {}
+
+    # Pre-load all frame images to avoid repeated disk I/O
+    print(f"Pre-loading {len(observations)} frames from disk...")
+    frame_images = []
+    for i, obs in enumerate(observations):
+        if i % 100 == 0:
+            print(f"  Loading frame {i}/{len(observations)}...")
+        frame_path = obs.get("frame_path", obs.get("full_path", ""))
+        full_path = os.path.join(session_dir, frame_path) if not os.path.isabs(frame_path) else frame_path
+
+        try:
+            with open(full_path, "rb") as f:
+                img = Image.open(io.BytesIO(f.read())).convert("RGB")
+                frame_images.append(np.array(img))
+        except Exception as e:
+            print(f"  Warning: Failed to load frame {i} from {full_path}: {e}")
+            # Use black placeholder
+            frame_images.append(np.zeros((224, 224, 3), dtype=np.uint8))
+
+    print(f"Pre-loaded {len(frame_images)} frames")
+
+    # Build canvases for all valid frame indices
+    num_valid = len(observations) - (min_frames_needed - 1)
+    print(f"Pre-building {num_valid} canvases...")
+
+    for frame_idx in range(min_frames_needed - 1, len(observations)):
+        if (frame_idx - min_frames_needed + 1) % 100 == 0:
+            print(f"  Building canvas {frame_idx - min_frames_needed + 1}/{num_valid}...")
+
+        start_idx = frame_idx - (min_frames_needed - 1)
+
+        # Extract frames for canvas
+        selected_frames = frame_images[start_idx:frame_idx + 1]
+
+        # Extract actions between frames
+        selected_actions = []
+        for idx in range(start_idx, frame_idx):
+            if idx < len(actions):
+                action_data = actions[idx].get("action", {"action": 0})
+                # Handle both dict and int action formats
+                if isinstance(action_data, dict):
+                    selected_actions.append(action_data)
+                else:
+                    selected_actions.append({"action": action_data})
+            else:
+                selected_actions.append({"action": 0})  # Default fallback
+
+        # Build interleaved history [frame0, action0, frame1, action1, frame2]
+        interleaved = [selected_frames[0]]
+        for i in range(len(selected_actions)):
+            interleaved.append(selected_actions[i])
+            if i + 1 < len(selected_frames):
+                interleaved.append(selected_frames[i + 1])
+
+        # Build canvas
+        try:
+            canvas = build_canvas(
+                interleaved,
+                frame_size=config.FRAME_SIZE,
+                sep_width=config.SEPARATOR_WIDTH,
+            )
+
+            canvas_cache[frame_idx] = {
+                'canvas': canvas,  # numpy HxWx3 uint8
+                'start_idx': start_idx,
+                'interleaved': interleaved
+            }
+        except Exception as e:
+            print(f"  Warning: Failed to build canvas for frame {frame_idx}: {e}")
+
+    print(f"Pre-built {len(canvas_cache)} canvases successfully")
+    return canvas_cache
+
+
 def tensor_to_numpy_image(tensor):
     """
     Convert tensor to numpy array for visualization.

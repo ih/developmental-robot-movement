@@ -6,6 +6,8 @@ Allows running the world model for N iterations and visualizing training and pre
 """
 
 import os
+import random
+import time
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -25,14 +27,17 @@ from session_explorer_lib import (
     extract_actions,
     load_frame_image,
     format_timestamp,
+    prebuild_all_canvases,
 )
 from recorded_policy import create_recorded_action_selector
 from models.autoencoder_concat_predictor import (
     canvas_to_tensor,
     compute_patch_mask_for_last_slot,
     compute_randomized_patch_mask_for_last_slot,
+    compute_randomized_patch_mask_for_last_slot_gpu,
     compute_hybrid_loss_on_masked_patches,
 )
+from models.canvas_dataset import create_canvas_dataloader
 from attention_viz import (
     compute_patch_centers,
     draw_attention_connections,
@@ -136,6 +141,22 @@ def load_session(session_choice):
     observations = extract_observations(events, session_dir)
     actions = extract_actions(events)
 
+    # Pre-build all canvases for fast batch training
+    print("\n" + "="*60)
+    print("Pre-building all canvases for batch training...")
+    print("="*60)
+    prebuild_start = time.time()
+    canvas_cache = prebuild_all_canvases(
+        session_dir,
+        observations,
+        actions,
+        config.AutoencoderConcatPredictorWorldModelConfig
+    )
+    prebuild_time = time.time() - prebuild_start
+    print(f"Canvas pre-building completed in {prebuild_time:.2f}s")
+    print(f"Memory usage: ~{len(canvas_cache) * 224 * 688 * 3 / (1024**2):.1f} MB")
+    print("="*60 + "\n")
+
     session_state.update({
         "session_name": os.path.basename(session_dir),
         "session_dir": session_dir,
@@ -143,6 +164,7 @@ def load_session(session_choice):
         "events": events,
         "observations": observations,
         "actions": actions,
+        "canvas_cache": canvas_cache,
     })
 
     # Build session info
@@ -234,6 +256,13 @@ def build_canvas_from_frame(frame_idx):
     if frame_idx < min_frames_needed - 1:
         return None, f"Need at least {min_frames_needed} frames of history. Selected frame {frame_idx+1} doesn't have enough history.", None, None
 
+    # Try to use pre-built canvas cache first (Phase 1 optimization)
+    canvas_cache = session_state.get("canvas_cache", {})
+    if frame_idx in canvas_cache:
+        cached_data = canvas_cache[frame_idx]
+        return cached_data['canvas'], None, cached_data['start_idx'], cached_data['interleaved']
+
+    # Fallback: build canvas on-demand (for backward compatibility or if cache not available)
     # Extract frames for canvas (need CANVAS_HISTORY_SIZE frames)
     start_idx = frame_idx - (min_frames_needed - 1)
     selected_frames = []
@@ -1229,6 +1258,323 @@ def generate_attention_visualization(
         error_msg = f"Error generating attention visualization:\n\n{str(e)}\n\n{traceback.format_exc()}"
         return error_msg, None, ""
 
+def run_batch_comparison(batch_sizes_str, total_samples):
+    """
+    Compare training efficiency across different batch sizes.
+
+    Trains model with each batch size over the same total number of samples,
+    measuring time, final loss, and convergence.
+    """
+    global world_model, session_state
+
+    # Validation
+    if world_model is None:
+        yield "Please load a session first", "", None, None, None, None
+        return
+
+    if not session_state.get("observations") or not session_state.get("actions"):
+        yield "No session data available", "", None, None, None, None
+        return
+
+    # Parse batch sizes
+    try:
+        batch_sizes = [int(b.strip()) for b in batch_sizes_str.split(',') if b.strip()]
+        batch_sizes = [b for b in batch_sizes if b > 0]
+        if not batch_sizes:
+            raise ValueError("No valid batch sizes")
+    except Exception as e:
+        yield f"Error parsing batch sizes: {e}", "", None, None, None, None
+        return
+
+    total_samples = int(total_samples)
+    observations = session_state["observations"]
+    min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+    valid_frame_count = len(observations) - (min_frames_needed - 1)
+
+    if valid_frame_count < max(batch_sizes):
+        yield f"Session too small: {valid_frame_count} valid frames, need {max(batch_sizes)}", "", None, None, None, None
+        return
+
+    # Save initial model state
+    initial_state = {
+        'model': world_model.autoencoder.state_dict(),
+        'optimizer': world_model.ae_optimizer.state_dict(),
+        'scheduler': world_model.ae_scheduler.state_dict(),
+    }
+
+    # Results storage
+    results = {
+        'batch_size': [], 'total_time': [], 'num_batches': [],
+        'final_loss': [], 'final_loss_std': [],
+        'loss_history': [], 'samples_seen': [],
+    }
+
+    # Test each batch size
+    for batch_idx, batch_size in enumerate(batch_sizes):
+        # Reset model to initial state
+        world_model.autoencoder.load_state_dict(initial_state['model'])
+        world_model.ae_optimizer.load_state_dict(initial_state['optimizer'])
+        world_model.ae_scheduler.load_state_dict(initial_state['scheduler'])
+
+        status = f"Testing batch_size={batch_size} ({batch_idx+1}/{len(batch_sizes)})..."
+        yield status, "", None, None, None, None
+
+        # Training loop with DataLoader (Phase 2 optimization)
+        loss_history = []
+        samples_seen_list = []
+        total_start = time.time()
+        world_model.autoencoder.train()
+
+        # Check if we have pre-built canvas cache
+        canvas_cache = session_state.get("canvas_cache", {})
+
+        if canvas_cache:
+            # Phase 2 optimization: Use DataLoader with parallel workers
+            # Prepare valid frame indices
+            valid_start = min_frames_needed - 1
+            valid_end = len(observations) - 1
+            all_valid_indices = list(range(valid_start, valid_end + 1))
+
+            # Sample indices with replacement to reach total_samples
+            # This maintains same behavior as original code
+            sampled_all_indices = random.choices(all_valid_indices, k=total_samples)
+
+            # Determine optimal number of workers for Windows/Linux
+            # Note: Windows multiprocessing can be unstable, start with 0 workers (single-process)
+            # and enable multiprocessing only on Linux or if explicitly configured
+            import platform
+            if platform.system() == 'Windows':
+                num_workers = 0  # Conservative: single-process on Windows (avoids pickling issues)
+            else:
+                num_workers = 4  # Linux: use multiple workers for parallelism
+
+            # Create DataLoader with optimized settings
+            # Phase 4: Disable automatic GPU transfer for manual stream management
+            use_stream_pipelining = (device == 'cuda' and torch.cuda.is_available())
+
+            dataloader = create_canvas_dataloader(
+                canvas_cache=canvas_cache,
+                frame_indices=sampled_all_indices,
+                batch_size=batch_size,
+                config=config.AutoencoderConcatPredictorWorldModelConfig,
+                device=device,
+                num_workers=num_workers,
+                shuffle=False,  # Already shuffled by random.choices
+                pin_memory=True,  # Keep pinned memory for fast async transfers
+                persistent_workers=(num_workers > 0),
+                transfer_to_device=(not use_stream_pipelining),  # Phase 4: manual transfer if using streams
+            )
+
+            # Train on batches from DataLoader with CUDA stream pipelining (Phase 4 optimization)
+            samples_seen = 0
+
+            if use_stream_pipelining:
+                # Phase 4: Use CUDA streams to overlap data transfer with GPU computation
+                # Create a separate stream for async data transfers
+                transfer_stream = torch.cuda.Stream()
+
+                # Prefetching iterator with stream pipelining
+                dataloader_iter = iter(dataloader)
+
+                # Prefetch first batch and transfer to GPU
+                try:
+                    next_canvas_cpu, next_mask_cpu, next_indices = next(dataloader_iter)
+                    with torch.cuda.stream(transfer_stream):
+                        # Async transfer to GPU (non_blocking requires pinned memory)
+                        next_canvas = next_canvas_cpu.to(device, non_blocking=True)
+                        next_mask = next_mask_cpu.to(device, non_blocking=True)
+                except StopIteration:
+                    next_canvas = None
+
+                batch_num = 0
+                while next_canvas is not None:
+                    # Wait for transfer to complete (synchronize streams)
+                    torch.cuda.current_stream().wait_stream(transfer_stream)
+
+                    # Current batch is ready (transferred from next)
+                    canvas_tensor = next_canvas
+                    patch_mask = next_mask
+
+                    # Prefetch and transfer next batch in parallel with training
+                    # This overlaps GPU training (current stream) with CPU→GPU transfer (transfer stream)
+                    with torch.cuda.stream(transfer_stream):
+                        try:
+                            next_canvas_cpu, next_mask_cpu, next_indices = next(dataloader_iter)
+                            # Async transfer to GPU while current batch trains
+                            next_canvas = next_canvas_cpu.to(device, non_blocking=True)
+                            next_mask = next_mask_cpu.to(device, non_blocking=True)
+                        except StopIteration:
+                            next_canvas = None
+
+                    # Train on current batch while next batch transfers in background
+                    loss, _ = world_model.autoencoder.train_on_canvas(
+                        canvas_tensor, patch_mask, world_model.ae_optimizer
+                    )
+                    world_model.ae_scheduler.step()
+
+                    samples_seen += canvas_tensor.shape[0]
+                    loss_history.append(loss)
+                    samples_seen_list.append(samples_seen)
+                    batch_num += 1
+            else:
+                # Fallback: CPU or no CUDA - no stream pipelining (automatic transfer in collate_fn)
+                for batch_num, (canvas_tensor, patch_mask, _) in enumerate(dataloader):
+                    # Train
+                    loss, _ = world_model.autoencoder.train_on_canvas(
+                        canvas_tensor, patch_mask, world_model.ae_optimizer
+                    )
+                    world_model.ae_scheduler.step()
+
+                    samples_seen += canvas_tensor.shape[0]
+                    loss_history.append(loss)
+                    samples_seen_list.append(samples_seen)
+
+        else:
+            # Fallback: Manual batching (backward compatibility, no cache available)
+            num_batches = (total_samples + batch_size - 1) // batch_size
+
+            for batch_num in range(num_batches):
+                samples_this_batch = min(batch_size, total_samples - batch_num * batch_size)
+
+                # Sample random frames and build canvases on-demand
+                valid_start = min_frames_needed - 1
+                valid_end = len(observations) - 1
+                valid_indices = list(range(valid_start, valid_end + 1))
+                sampled_indices = random.sample(valid_indices, samples_this_batch)
+
+                batch_canvases = []
+                for frame_idx in sampled_indices:
+                    canvas, error, _, _ = build_canvas_from_frame(frame_idx)
+                    if canvas is not None:
+                        batch_canvases.append(canvas)
+
+                if not batch_canvases:
+                    continue
+
+                # Stack into batch: [B, H, W, 3]
+                canvas_batch = np.stack(batch_canvases, axis=0)
+                canvas_tensor = canvas_to_tensor(canvas_batch, batch_size=len(batch_canvases)).to(device)
+
+                # Generate masks on GPU (Phase 3 optimization)
+                canvas_height, canvas_width = canvas_tensor.shape[-2:]
+                num_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+
+                patch_mask = compute_randomized_patch_mask_for_last_slot_gpu(
+                    img_size=(canvas_height, canvas_width),
+                    patch_size=config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
+                    num_frame_slots=num_frames,
+                    sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+                    mask_ratio_min=config.MASK_RATIO_MIN,
+                    mask_ratio_max=config.MASK_RATIO_MAX,
+                    batch_size=len(batch_canvases),
+                    device=device,
+                )
+
+                # Train
+                loss, _ = world_model.autoencoder.train_on_canvas(
+                    canvas_tensor, patch_mask, world_model.ae_optimizer
+                )
+                world_model.ae_scheduler.step()
+
+                loss_history.append(loss)
+                samples_seen_list.append((batch_num + 1) * samples_this_batch)
+
+        total_time = time.time() - total_start
+
+        # Store results
+        final_losses = loss_history[-max(1, len(loss_history)//10):]
+        results['batch_size'].append(batch_size)
+        results['total_time'].append(total_time)
+        results['num_batches'].append(len(loss_history))
+        results['final_loss'].append(loss_history[-1] if loss_history else None)
+        results['final_loss_std'].append(np.std(final_losses) if len(final_losses) > 1 else 0.0)
+        results['loss_history'].append(loss_history)
+        results['samples_seen'].append(samples_seen_list)
+
+    # Restore initial state
+    world_model.autoencoder.load_state_dict(initial_state['model'])
+    world_model.ae_optimizer.load_state_dict(initial_state['optimizer'])
+    world_model.ae_scheduler.load_state_dict(initial_state['scheduler'])
+
+    # Generate visualizations
+    import pandas as pd
+
+    # 1. Time comparison
+    fig_time, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(range(len(results['batch_size'])), results['total_time'],
+                   color='skyblue', edgecolor='navy', linewidth=1.5)
+    ax.set_xticks(range(len(results['batch_size'])))
+    ax.set_xticklabels([f"BS={bs}" for bs in results['batch_size']])
+    ax.set_xlabel('Batch Size', fontsize=12)
+    ax.set_ylabel('Total Training Time (seconds)', fontsize=12)
+    ax.set_title(f'Training Time Comparison ({total_samples} samples)', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+    for bar, time_val in zip(bars, results['total_time']):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{time_val:.1f}s', ha='center', va='bottom', fontsize=10)
+    plt.tight_layout()
+
+    # 2. Quality comparison
+    fig_quality, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(range(len(results['batch_size'])), results['final_loss'],
+           yerr=results['final_loss_std'], color='lightcoral',
+           edgecolor='darkred', linewidth=1.5, capsize=5)
+    ax.set_xticks(range(len(results['batch_size'])))
+    ax.set_xticklabels([f"BS={bs}" for bs in results['batch_size']])
+    ax.set_xlabel('Batch Size', fontsize=12)
+    ax.set_ylabel('Final Loss (Hybrid)', fontsize=12)
+    ax.set_title(f'Final Loss Comparison ({total_samples} samples)', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+
+    # 3. Convergence comparison
+    fig_convergence, ax = plt.subplots(figsize=(12, 6))
+    colors = plt.cm.viridis(np.linspace(0, 1, len(results['batch_size'])))
+    for i, bs in enumerate(results['batch_size']):
+        ax.plot(results['samples_seen'][i], results['loss_history'][i],
+                label=f'BS={bs}', color=colors[i], linewidth=2, alpha=0.8)
+    ax.set_xlabel('Samples Seen', fontsize=12)
+    ax.set_ylabel('Loss (Hybrid)', fontsize=12)
+    ax.set_title('Loss Convergence Comparison', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # 4. Summary table
+    table_data = {
+        'Batch Size': results['batch_size'],
+        'Total Time (s)': [f"{t:.2f}" for t in results['total_time']],
+        'Num Batches': results['num_batches'],
+        'Samples/Sec': [f"{total_samples/t:.2f}" for t in results['total_time']],
+        'Final Loss': [format_loss(l) for l in results['final_loss']],
+        'Loss Std': [f"{s:.6f}" for s in results['final_loss_std']],
+    }
+    df = pd.DataFrame(table_data)
+
+    # Summary markdown
+    best_time_idx = np.argmin(results['total_time'])
+    best_loss_idx = np.argmin(results['final_loss'])
+
+    summary = f"## Results Summary\n\n"
+    summary += f"**Total samples trained:** {total_samples}\n\n"
+    summary += f"**Fastest:** Batch size {results['batch_size'][best_time_idx]} "
+    summary += f"({results['total_time'][best_time_idx]:.2f}s)\n\n"
+    summary += f"**Best loss:** Batch size {results['batch_size'][best_loss_idx]} "
+    summary += f"({format_loss(results['final_loss'][best_loss_idx])})\n\n"
+
+    if 1 in results['batch_size']:
+        bs1_idx = results['batch_size'].index(1)
+        speedup = results['total_time'][bs1_idx] / results['total_time'][best_time_idx]
+        summary += f"**Speedup vs BS=1:** {speedup:.2f}x\n\n"
+
+    summary += f"**Throughput range:** "
+    summary += f"{min(total_samples/t for t in results['total_time']):.1f} - "
+    summary += f"{max(total_samples/t for t in results['total_time']):.1f} samples/sec\n"
+
+    final_status = "✅ Comparison complete!"
+    yield final_status, summary, fig_time, fig_quality, fig_convergence, df
+
 def list_available_checkpoints():
     """List all available checkpoint files in the checkpoint directory"""
     checkpoint_dir = Path(TOROIDAL_DOT_CHECKPOINT_DIR)
@@ -1634,6 +1980,41 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     gr.Markdown("---")
 
+    # Batch Size Comparison Testing
+    gr.Markdown("## Batch Size Comparison")
+    gr.Markdown(
+        "Compare training efficiency across different batch sizes. "
+        "Each test trains over the same total number of samples for fair comparison."
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            batch_sizes_input = gr.Textbox(
+                value="1,2,4,8,16",
+                label="Batch Sizes to Test",
+                info="Comma-separated (e.g., 1,2,4,8,16)"
+            )
+            total_samples_input = gr.Number(
+                value=1000,
+                label="Total Samples Per Test",
+                precision=0,
+                minimum=100,
+                info="Same for all batch sizes (fair comparison)"
+            )
+            run_comparison_btn = gr.Button("🔬 Run Batch Comparison", variant="primary")
+
+        with gr.Column(scale=1):
+            comparison_status = gr.Markdown("")
+
+    with gr.Accordion("Batch Comparison Results", open=False):
+        comparison_summary = gr.Markdown("")
+        comparison_time_plot = gr.Plot(label="Total Training Time by Batch Size")
+        comparison_quality_plot = gr.Plot(label="Final Loss by Batch Size")
+        comparison_convergence_plot = gr.Plot(label="Loss Convergence (All Batch Sizes)")
+        comparison_table = gr.Dataframe(label="Detailed Results")
+
+    gr.Markdown("---")
+
     # Event handlers
     refresh_btn.click(
         fn=refresh_sessions,
@@ -1767,6 +2148,19 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             attn_status,
             attn_plot,
             attn_stats,
+        ]
+    )
+
+    run_comparison_btn.click(
+        fn=run_batch_comparison,
+        inputs=[batch_sizes_input, total_samples_input],
+        outputs=[
+            comparison_status,
+            comparison_summary,
+            comparison_time_plot,
+            comparison_quality_plot,
+            comparison_convergence_plot,
+            comparison_table,
         ]
     )
 
