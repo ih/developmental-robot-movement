@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 import config
+import world_model_utils
 from autoencoder_concat_predictor_world_model import AutoencoderConcatPredictorWorldModel
 from recording_reader import RecordingReader
 from replay_robot import ReplayRobot
@@ -612,7 +613,229 @@ def evaluate_full_session():
 
     status_msg = f"✅ **Evaluation complete!** Processed {stats['num_observations']} observations."
 
-    return status_msg, fig_loss_over_time, fig_distribution, stats_text
+    return status_msg, fig_loss_over_time, fig_distribution, stats_text, stats
+
+def create_loss_vs_samples_plot(cumulative_metrics):
+    """Create plot of loss vs samples seen"""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(cumulative_metrics['samples_seen'],
+            cumulative_metrics['loss_at_sample'],
+            'b-o', linewidth=2, markersize=6)
+    ax.set_xlabel('Samples Seen', fontsize=12)
+    ax.set_ylabel('Mean Hybrid Loss (Full Session Eval)', fontsize=12)
+    ax.set_title('Training Progress: Loss vs Samples', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+def create_loss_vs_recent_checkpoints_plot(cumulative_metrics, window_size=10):
+    """Create plot of loss vs recent checkpoints (rolling window)"""
+    import matplotlib.pyplot as plt
+
+    if not cumulative_metrics['samples_seen']:
+        return None
+
+    # Get last N checkpoints
+    samples = cumulative_metrics['samples_seen'][-window_size:]
+    losses = cumulative_metrics['loss_at_sample'][-window_size:]
+
+    if not samples:
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(samples, losses, 'g-o', linewidth=2, markersize=6)
+    ax.set_xlabel('Samples Seen', fontsize=12)
+    ax.set_ylabel('Mean Hybrid Loss', fontsize=12)
+    ax.set_title(f'Recent Progress: Last {len(samples)} Checkpoints', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+def generate_multiple_observation_canvases(observation_indices):
+    """Generate grid of canvas visualizations for multiple observations"""
+    global world_model, session_state
+    import matplotlib.pyplot as plt
+
+    if world_model is None:
+        return "Please load session and train model first", None
+
+    if not observation_indices:
+        return "No observations to visualize", None
+
+    observations = session_state.get("observations", [])
+    valid_indices = [idx for idx in observation_indices if idx < len(observations)]
+
+    if not valid_indices:
+        return "No valid observation indices", None
+
+    # Create grid: N rows × 2 columns (original + composite)
+    n_obs = len(valid_indices)
+    fig, axes = plt.subplots(n_obs, 2, figsize=(16, 4 * n_obs))
+
+    # Handle single observation case (axes won't be 2D)
+    if n_obs == 1:
+        axes = axes.reshape(1, -1)
+
+    for i, obs_idx in enumerate(valid_indices):
+        # Build canvas
+        training_canvas, error, _, _ = build_canvas_from_frame(obs_idx)
+        if training_canvas is None:
+            # Show error in both subplots
+            axes[i, 0].text(0.5, 0.5, f"Error: {error}", ha='center', va='center')
+            axes[i, 0].axis('off')
+            axes[i, 1].text(0.5, 0.5, f"Error: {error}", ha='center', va='center')
+            axes[i, 1].axis('off')
+            continue
+
+        # Convert to tensor and generate mask
+        canvas_tensor = canvas_to_tensor(training_canvas).to(device)
+        canvas_height, canvas_width = canvas_tensor.shape[-2:]
+        num_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+
+        patch_mask = compute_randomized_patch_mask_for_last_slot(
+            img_size=(canvas_height, canvas_width),
+            patch_size=config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
+            num_frame_slots=num_frames,
+            sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+            mask_ratio_min=config.MASK_RATIO_MIN,
+            mask_ratio_max=config.MASK_RATIO_MAX,
+        ).to(device)
+
+        # Run inference
+        world_model.autoencoder.eval()
+        with torch.no_grad():
+            pred_patches, _ = world_model.autoencoder.forward_with_patch_mask(
+                canvas_tensor, patch_mask
+            )
+
+        # Get composite
+        composite = world_model.get_canvas_inpainting_composite(training_canvas, patch_mask)
+
+        # Plot original canvas
+        axes[i, 0].imshow(training_canvas)
+        axes[i, 0].set_title(f"Obs {obs_idx}: Original Canvas", fontsize=10, fontweight='bold')
+        axes[i, 0].axis('off')
+
+        # Plot composite
+        axes[i, 1].imshow(composite)
+        axes[i, 1].set_title(f"Obs {obs_idx}: Composite", fontsize=10, fontweight='bold')
+        axes[i, 1].axis('off')
+
+    plt.tight_layout()
+
+    status = f"**Showing {len(valid_indices)} observations**: {valid_indices}"
+    return status, fig
+
+def generate_batch_training_update(samples_seen, total_samples, cumulative_metrics,
+                                   eval_status, eval_loss_fig, eval_dist_fig,
+                                   current_observation_idx, window_size=10, num_random_obs=5,
+                                   completed=False, elapsed_time=None):
+    """Generate all UI outputs for batch training update"""
+    global session_state
+
+    # Status message
+    if completed:
+        status = f"✅ **Training Complete: {samples_seen} samples**"
+        if elapsed_time is not None:
+            mins = int(elapsed_time // 60)
+            secs = elapsed_time % 60
+            if mins > 0:
+                status += f"\n\n⏱️ **Time elapsed:** {mins}m {secs:.1f}s"
+            else:
+                status += f"\n\n⏱️ **Time elapsed:** {secs:.1f}s"
+    else:
+        progress_pct = (samples_seen / total_samples) * 100
+        status = f"🔄 **Training... {samples_seen}/{total_samples} samples ({progress_pct:.1f}%)**"
+        if elapsed_time is not None:
+            mins = int(elapsed_time // 60)
+            secs = elapsed_time % 60
+            if mins > 0:
+                status += f"\n\n⏱️ **Elapsed:** {mins}m {secs:.1f}s"
+            else:
+                status += f"\n\n⏱️ **Elapsed:** {secs:.1f}s"
+
+    # Loss vs samples plot (full history)
+    fig_loss_vs_samples = create_loss_vs_samples_plot(cumulative_metrics)
+
+    # Create rolling window plot
+    fig_loss_vs_recent = create_loss_vs_recent_checkpoints_plot(cumulative_metrics, window_size)
+
+    # Sample observations: N random + current frame
+    observations = session_state.get("observations", [])
+    min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+    all_valid_indices = list(range(min_frames_needed - 1, len(observations)))
+
+    if all_valid_indices:
+        import random
+        # Sample N random observations
+        sample_size = min(num_random_obs, len(all_valid_indices))
+        sampled_indices = random.sample(all_valid_indices, sample_size)
+
+        # Add current observation if valid and not already sampled
+        if current_observation_idx in all_valid_indices and current_observation_idx not in sampled_indices:
+            sampled_indices.append(current_observation_idx)
+
+        obs_status, obs_combined_fig = generate_multiple_observation_canvases(sampled_indices)
+    else:
+        obs_status = "No valid observations"
+        obs_combined_fig = None
+
+    return (status, fig_loss_vs_samples, fig_loss_vs_recent, eval_loss_fig, eval_dist_fig,
+            obs_status, obs_combined_fig)
+
+def calculate_training_info(total_samples, batch_size):
+    """Calculate and display training parameters with linear scaling rule"""
+    import math
+
+    # Validate inputs
+    try:
+        total_samples = int(total_samples)
+        batch_size = int(batch_size)
+    except (ValueError, TypeError):
+        return "Invalid inputs"
+
+    if total_samples <= 0 or batch_size <= 0:
+        return "Total samples and batch size must be greater than 0"
+
+    # Calculate number of gradient updates
+    num_gradient_updates = math.ceil(total_samples / batch_size)
+
+    # Linear scaling rule: scale LR proportionally with batch size
+    # base_batch_size = 1 (base LR is defined for batch size 1)
+    base_batch_size = 1
+    base_lr = config.AutoencoderConcatPredictorWorldModelConfig.AUTOENCODER_LR  # 1e-3
+
+    # Scaled LR = base_LR * (current_batch_size / base_batch_size)
+    # For BS=1: LR=1e-3, BS=32: LR=0.032, BS=64: LR=0.064
+    scaled_lr = base_lr * (batch_size / base_batch_size)
+
+    # Scheduler parameters
+    lr_min_ratio = config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO  # 0.01
+    min_lr = scaled_lr * lr_min_ratio
+
+    # Format output
+    info = f"""**Training Configuration**
+
+📊 **Gradient Updates**: {num_gradient_updates:,} steps
+- Total samples: {total_samples:,}
+- Batch size: {batch_size}
+- Updates per epoch: {num_gradient_updates:,}
+
+📈 **Learning Rate (Linear Scaling)**
+- Base LR (BS={base_batch_size}): {base_lr:.6f}
+- Scaled LR (BS={batch_size}): {scaled_lr:.6f}
+- Scaling factor: {batch_size / base_batch_size:.2f}x
+- Min LR (cosine decay): {min_lr:.6f}
+
+🔄 **Scheduler**
+- Type: Warmup + Cosine Annealing
+- Total steps: {num_gradient_updates:,}
+- LR range: {scaled_lr:.6f} → {min_lr:.6f}
+"""
+
+    return info
 
 def train_on_single_canvas(frame_idx, num_training_steps):
     """Train autoencoder on a single canvas built from selected frame and its history"""
@@ -981,6 +1204,357 @@ def run_world_model(num_iterations):
         import traceback
         error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
         yield error_msg, "", "", None, None, None, None, None, None, None, None, "", "", "--"
+
+def run_world_model_batch(total_samples, batch_size, current_observation_idx, update_interval=100,
+                          window_size=10, num_random_obs=5):
+    """
+    Run batch training with periodic full-session evaluation.
+
+    Args:
+        total_samples: Total number of training samples
+        batch_size: Batch size for training
+        current_observation_idx: Currently selected observation to refresh during updates
+        update_interval: Evaluate every N samples (default: 100)
+        window_size: Number of recent checkpoints for rolling window plot (default: 10)
+        num_random_obs: Number of random observations to visualize (default: 5)
+
+    Yields:
+        Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
+                  obs_status, obs_combined_fig)
+    """
+    global world_model, session_state
+    import random
+    import time
+
+    print(f"[DEBUG] run_world_model_batch called with: total_samples={total_samples}, batch_size={batch_size}, update_interval={update_interval}")
+
+    # Validation
+    if world_model is None:
+        yield "Please load a session first", None, None, None, None, "", None
+        return
+
+    if not session_state.get("observations") or not session_state.get("actions"):
+        yield "No session data available", None, None, None, None, "", None
+        return
+
+    total_samples = int(total_samples)
+    batch_size = int(batch_size)
+    current_observation_idx = int(current_observation_idx)
+    update_interval = int(update_interval)
+
+    if total_samples <= 0:
+        yield "Total samples must be greater than 0", None, None, None, None, "", None
+        return
+
+    if batch_size <= 0:
+        yield "Batch size must be greater than 0", None, None, None, None, "", None
+        return
+
+    if update_interval <= 0:
+        yield "Update interval must be greater than 0", None, None, None, None, "", None
+        return
+
+    observations = session_state["observations"]
+    min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+    max_samples_per_epoch = len(observations) - (min_frames_needed - 1)
+
+    if max_samples_per_epoch <= 0:
+        yield f"Session too small: need at least {min_frames_needed} observations", None, None, None, None, "", None
+        return
+
+    # Check if canvas cache exists
+    canvas_cache = session_state.get("canvas_cache", {})
+    if not canvas_cache:
+        yield "Canvas cache not found. Please reload the session.", None, None, None, None, "", None
+        return
+
+    # Sample with replacement to reach total_samples (allows looping through session)
+    all_valid_indices = list(range(min_frames_needed - 1, len(observations)))
+    sampled_indices = random.choices(all_valid_indices, k=total_samples)
+    print(f"[DEBUG] Sampled {len(sampled_indices)} indices from {len(all_valid_indices)} valid observations")
+    print(f"[DEBUG] Expected batches: {len(sampled_indices) // batch_size} (with batch_size={batch_size})")
+
+    # Apply linear scaling rule to learning rate and recreate optimizer/scheduler
+    import math
+    num_gradient_updates = math.ceil(total_samples / batch_size)
+    base_batch_size = 1  # Base LR is defined for batch size 1
+    base_lr = config.AutoencoderConcatPredictorWorldModelConfig.AUTOENCODER_LR
+    scaled_lr = base_lr * (batch_size / base_batch_size)
+
+    print(f"[DEBUG] Linear LR scaling: base_lr={base_lr:.6f} (BS={base_batch_size}) -> scaled_lr={scaled_lr:.6f} (BS={batch_size})")
+
+    # Recreate optimizer with scaled LR
+    import torch.optim as optim
+    param_groups = [
+        {"params": world_model.autoencoder.parameters()},
+    ]
+    world_model.ae_optimizer = optim.AdamW(param_groups, lr=scaled_lr)
+
+    # Recreate scheduler with updated total steps
+    world_model.ae_scheduler = world_model_utils.create_warmup_cosine_scheduler(
+        world_model.ae_optimizer,
+        warmup_steps=config.AutoencoderConcatPredictorWorldModelConfig.WARMUP_STEPS,
+        total_steps=num_gradient_updates,
+        lr_min_ratio=config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO,
+    )
+    print(f"[DEBUG] Scheduler configured for {num_gradient_updates} steps with LR range {scaled_lr:.6f} -> {scaled_lr * config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO:.6f}")
+
+    # Determine optimal number of workers
+    import platform
+    if platform.system() == 'Windows':
+        num_workers = 0  # Single-process on Windows
+    else:
+        num_workers = 4  # Multiple workers on Linux
+
+    # Create DataLoader
+    use_stream_pipelining = (device == 'cuda' and torch.cuda.is_available())
+
+    try:
+        dataloader = create_canvas_dataloader(
+            canvas_cache=canvas_cache,
+            frame_indices=sampled_indices,
+            batch_size=batch_size,
+            config=config.AutoencoderConcatPredictorWorldModelConfig,
+            device=device,
+            num_workers=num_workers,
+            shuffle=False,  # Already sampled with replacement
+            pin_memory=True,
+            persistent_workers=(num_workers > 0),
+            transfer_to_device=(not use_stream_pipelining),
+        )
+    except Exception as e:
+        yield f"Error creating DataLoader: {str(e)}", None, None, None, None, "", None
+        return
+
+    # Initialize metrics
+    cumulative_metrics = {
+        'samples_seen': [],
+        'loss_at_sample': [],
+    }
+    samples_seen = 0
+    UPDATE_INTERVAL = int(update_interval)  # Evaluate every N samples
+    last_eval_samples = 0
+
+    # Track best loss for automatic checkpoint saving
+    best_loss = float('inf')
+
+    # Track total training time
+    training_start_time = time.time()
+
+    # Training loop
+    world_model.autoencoder.train()
+
+    batch_count = 0
+    try:
+        if use_stream_pipelining:
+            # CUDA stream pipelining for optimal performance
+            transfer_stream = torch.cuda.Stream()
+            dataloader_iter = iter(dataloader)
+
+            # Prefetch first batch
+            try:
+                next_canvas_cpu, next_mask_cpu, _ = next(dataloader_iter)
+                with torch.cuda.stream(transfer_stream):
+                    next_canvas = next_canvas_cpu.to(device, non_blocking=True)
+                    next_mask = next_mask_cpu.to(device, non_blocking=True)
+                print(f"[DEBUG] Prefetched first batch successfully")
+            except StopIteration:
+                next_canvas = None
+                print(f"[DEBUG] DataLoader empty - no batches available!")
+
+            print(f"[DEBUG] Starting training loop: next_canvas is {'not None' if next_canvas is not None else 'None'}, samples_seen={samples_seen}, total_samples={total_samples}")
+            while next_canvas is not None and samples_seen < total_samples:
+                batch_count += 1
+                # Wait for transfer to complete
+                torch.cuda.current_stream().wait_stream(transfer_stream)
+                canvas_tensor = next_canvas
+                patch_mask = next_mask
+
+                # Prefetch next batch in parallel with training
+                with torch.cuda.stream(transfer_stream):
+                    try:
+                        next_canvas_cpu, next_mask_cpu, _ = next(dataloader_iter)
+                        next_canvas = next_canvas_cpu.to(device, non_blocking=True)
+                        next_mask = next_mask_cpu.to(device, non_blocking=True)
+                    except StopIteration:
+                        next_canvas = None
+
+                # Train on current batch
+                loss, _ = world_model.autoencoder.train_on_canvas(
+                    canvas_tensor, patch_mask, world_model.ae_optimizer
+                )
+                world_model.ae_scheduler.step()
+                samples_seen += canvas_tensor.shape[0]
+
+                if batch_count <= 5 or batch_count % 10 == 0:
+                    print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{total_samples}, loss={loss:.6f}")
+
+                # Periodic evaluation checkpoint
+                if samples_seen - last_eval_samples >= UPDATE_INTERVAL:
+                    # PAUSE training, run evaluation
+                    status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
+
+                    # Update metrics
+                    cumulative_metrics['samples_seen'].append(samples_seen)
+                    current_loss = stats['hybrid']['mean']
+                    cumulative_metrics['loss_at_sample'].append(current_loss)
+                    last_eval_samples = samples_seen
+
+                    # Save best model automatically if loss improved
+                    if current_loss < best_loss:
+                        best_loss = current_loss
+                        checkpoint_name = f"best_model_auto_loss_{current_loss:.6f}.pth"
+                        checkpoint_path = os.path.join(TOROIDAL_DOT_CHECKPOINT_DIR, checkpoint_name)
+
+                        try:
+                            checkpoint = {
+                                'model_state_dict': world_model.autoencoder.state_dict(),
+                                'optimizer_state_dict': world_model.ae_optimizer.state_dict(),
+                                'scheduler_state_dict': world_model.ae_scheduler.state_dict(),
+                                'timestamp': datetime.now().isoformat(),
+                                'samples_seen': samples_seen,
+                                'loss': current_loss,
+                                'config': {
+                                    'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+                                    'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+                                    'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+                                }
+                            }
+                            torch.save(checkpoint, checkpoint_path)
+                            print(f"[AUTO-SAVE] New best loss {current_loss:.6f} at {samples_seen} samples → saved to {checkpoint_name}")
+                            status_msg += f"\n\n🏆 **New Best Model Saved!**\n- Loss: {current_loss:.6f}\n- Checkpoint: {checkpoint_name}"
+                        except Exception as e:
+                            print(f"[AUTO-SAVE ERROR] Failed to save best model: {str(e)}")
+
+                    # Yield update (includes visualization for currently selected observation)
+                    print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
+                    elapsed_time = time.time() - training_start_time
+                    yield generate_batch_training_update(
+                        samples_seen, total_samples, cumulative_metrics,
+                        status_msg, fig_loss, fig_dist, current_observation_idx,
+                        window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
+                    )
+                    print(f"[DEBUG] Resumed after yield, continuing training...")
+
+            print(f"[DEBUG] Exited training loop: batches_processed={batch_count}, samples_seen={samples_seen}, total_samples={total_samples}")
+            print(f"[DEBUG] Exit reason: next_canvas is {'None' if next_canvas is None else 'not None'}, samples_seen >= total_samples: {samples_seen >= total_samples}")
+
+        else:
+            # Fallback: no stream pipelining
+            print(f"[DEBUG] Using fallback mode (no stream pipelining)")
+            for canvas_tensor, patch_mask, _ in dataloader:
+                batch_count += 1
+                if samples_seen >= total_samples:
+                    print(f"[DEBUG] Breaking: samples_seen ({samples_seen}) >= total_samples ({total_samples})")
+                    break
+
+                # Train on batch
+                loss, _ = world_model.autoencoder.train_on_canvas(
+                    canvas_tensor, patch_mask, world_model.ae_optimizer
+                )
+                world_model.ae_scheduler.step()
+                samples_seen += canvas_tensor.shape[0]
+
+                if batch_count <= 5 or batch_count % 10 == 0:
+                    print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{total_samples}, loss={loss:.6f}")
+
+                # Periodic evaluation checkpoint
+                if samples_seen - last_eval_samples >= UPDATE_INTERVAL:
+                    # PAUSE training, run evaluation
+                    status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
+
+                    # Update metrics
+                    cumulative_metrics['samples_seen'].append(samples_seen)
+                    current_loss = stats['hybrid']['mean']
+                    cumulative_metrics['loss_at_sample'].append(current_loss)
+                    last_eval_samples = samples_seen
+
+                    # Save best model automatically if loss improved
+                    if current_loss < best_loss:
+                        best_loss = current_loss
+                        checkpoint_name = f"best_model_auto_loss_{current_loss:.6f}.pth"
+                        checkpoint_path = os.path.join(TOROIDAL_DOT_CHECKPOINT_DIR, checkpoint_name)
+
+                        try:
+                            checkpoint = {
+                                'model_state_dict': world_model.autoencoder.state_dict(),
+                                'optimizer_state_dict': world_model.ae_optimizer.state_dict(),
+                                'scheduler_state_dict': world_model.ae_scheduler.state_dict(),
+                                'timestamp': datetime.now().isoformat(),
+                                'samples_seen': samples_seen,
+                                'loss': current_loss,
+                                'config': {
+                                    'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+                                    'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+                                    'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+                                }
+                            }
+                            torch.save(checkpoint, checkpoint_path)
+                            print(f"[AUTO-SAVE] New best loss {current_loss:.6f} at {samples_seen} samples → saved to {checkpoint_name}")
+                            status_msg += f"\n\n🏆 **New Best Model Saved!**\n- Loss: {current_loss:.6f}\n- Checkpoint: {checkpoint_name}"
+                        except Exception as e:
+                            print(f"[AUTO-SAVE ERROR] Failed to save best model: {str(e)}")
+
+                    # Yield update
+                    print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
+                    elapsed_time = time.time() - training_start_time
+                    yield generate_batch_training_update(
+                        samples_seen, total_samples, cumulative_metrics,
+                        status_msg, fig_loss, fig_dist, current_observation_idx,
+                        window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
+                    )
+                    print(f"[DEBUG] Resumed after yield, continuing training...")
+
+            print(f"[DEBUG] Exited training loop (fallback): batches_processed={batch_count}, samples_seen={samples_seen}, total_samples={total_samples}")
+
+        # Final evaluation after training complete
+        print(f"[DEBUG] Running final evaluation...")
+        status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
+        cumulative_metrics['samples_seen'].append(samples_seen)
+        current_loss = stats['hybrid']['mean']
+        cumulative_metrics['loss_at_sample'].append(current_loss)
+
+        # Save best model automatically if final loss is the best
+        if current_loss < best_loss:
+            best_loss = current_loss
+            checkpoint_name = f"best_model_auto_loss_{current_loss:.6f}.pth"
+            checkpoint_path = os.path.join(TOROIDAL_DOT_CHECKPOINT_DIR, checkpoint_name)
+
+            try:
+                checkpoint = {
+                    'model_state_dict': world_model.autoencoder.state_dict(),
+                    'optimizer_state_dict': world_model.ae_optimizer.state_dict(),
+                    'scheduler_state_dict': world_model.ae_scheduler.state_dict(),
+                    'timestamp': datetime.now().isoformat(),
+                    'samples_seen': samples_seen,
+                    'loss': current_loss,
+                    'config': {
+                        'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+                        'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+                        'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+                    }
+                }
+                torch.save(checkpoint, checkpoint_path)
+                print(f"[AUTO-SAVE] Final best loss {current_loss:.6f} at {samples_seen} samples → saved to {checkpoint_name}")
+                status_msg += f"\n\n🏆 **Final Best Model Saved!**\n- Loss: {current_loss:.6f}\n- Checkpoint: {checkpoint_name}"
+            except Exception as e:
+                print(f"[AUTO-SAVE ERROR] Failed to save final best model: {str(e)}")
+
+        # Calculate total elapsed time
+        total_elapsed_time = time.time() - training_start_time
+
+        print(f"[DEBUG] Final yield: samples_seen={samples_seen}, total_samples={total_samples}, elapsed_time={total_elapsed_time:.2f}s")
+        yield generate_batch_training_update(
+            samples_seen, total_samples, cumulative_metrics,
+            status_msg, fig_loss, fig_dist, current_observation_idx,
+            window_size, num_random_obs, completed=True, elapsed_time=total_elapsed_time
+        )
+        print(f"[DEBUG] Training generator complete")
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Error during training: {str(e)}\n\n{traceback.format_exc()}"
+        yield error_msg, None, None, None, None, "", None
 
 def parse_manual_patch_indices(manual_patches_str):
     """Parse manual patch indices from string input.
@@ -1680,13 +2254,28 @@ def load_model_weights(checkpoint_name):
             # Fallback: assume entire checkpoint is the state dict
             world_model.autoencoder.load_state_dict(checkpoint)
 
-        # Load optimizer state if available
-        if 'optimizer_state_dict' in checkpoint:
-            world_model.ae_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # Track which components were loaded
+        optimizer_loaded = False
+        scheduler_loaded = False
+        warnings = []
 
-        # Load scheduler state if available
+        # Try to load optimizer state if available (may fail if parameter groups differ)
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                world_model.ae_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                optimizer_loaded = True
+            except (ValueError, KeyError) as e:
+                warnings.append(f"⚠️ Optimizer state not loaded (parameter group mismatch): {str(e)}")
+                print(f"[LOAD WARNING] Skipping optimizer state: {str(e)}")
+
+        # Try to load scheduler state if available
         if 'scheduler_state_dict' in checkpoint:
-            world_model.ae_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            try:
+                world_model.ae_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                scheduler_loaded = True
+            except (ValueError, KeyError) as e:
+                warnings.append(f"⚠️ Scheduler state not loaded: {str(e)}")
+                print(f"[LOAD WARNING] Skipping scheduler state: {str(e)}")
 
         current_checkpoint_name = checkpoint_name
 
@@ -1694,8 +2283,27 @@ def load_model_weights(checkpoint_name):
         status_msg += f"**Checkpoint:** {checkpoint_name}\n"
         status_msg += f"**Location:** {checkpoint_path}\n"
 
+        # Show what was loaded
+        status_msg += f"\n**Loaded Components:**\n"
+        status_msg += f"- Model weights: ✅\n"
+        status_msg += f"- Optimizer state: {'✅' if optimizer_loaded else '❌ (skipped)'}\n"
+        status_msg += f"- Scheduler state: {'✅' if scheduler_loaded else '❌ (skipped)'}\n"
+
+        # Add warnings if any
+        if warnings:
+            status_msg += f"\n**Warnings:**\n"
+            for warning in warnings:
+                status_msg += f"{warning}\n"
+            status_msg += f"\n*Note: Model weights loaded successfully. Optimizer/scheduler will be reinitialized on next training run.*\n"
+
         if 'timestamp' in checkpoint:
-            status_msg += f"**Saved at:** {checkpoint['timestamp']}\n"
+            status_msg += f"\n**Saved at:** {checkpoint['timestamp']}\n"
+
+        # Show loss and samples_seen for auto-saved best models
+        if 'loss' in checkpoint:
+            status_msg += f"**Loss at save:** {checkpoint['loss']:.6f}\n"
+        if 'samples_seen' in checkpoint:
+            status_msg += f"**Samples seen:** {checkpoint['samples_seen']:,}\n"
 
         if 'config' in checkpoint:
             status_msg += f"\n**Model Configuration:**\n"
@@ -1849,43 +2457,92 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     gr.Markdown("---")
 
-    # World Model Runner
-    gr.Markdown("## Run World Model")
-    gr.Markdown("Execute the world model for a specified number of iterations.")
+    # ========== BATCH TRAINING SECTION ==========
+    gr.Markdown("---")
+    gr.Markdown("## Run World Model (Batch Training)")
+    gr.Markdown("Train the model on batches of observations with periodic full-session evaluation.")
 
     with gr.Row():
-        num_iterations_input = gr.Number(value=10, label="Number of Iterations", precision=0, minimum=1)
-        run_btn = gr.Button("Run World Model", variant="primary")
+        total_samples_input = gr.Number(
+            value=500,
+            label="Total Samples",
+            precision=0,
+            minimum=1,
+            interactive=True,
+            info="Number of training samples (loops through session if needed)"
+        )
+        batch_size_input = gr.Number(
+            value=64,
+            label="Batch Size",
+            precision=0,
+            minimum=1,
+            interactive=True,
+            info="Samples per batch"
+        )
+        update_interval_input = gr.Number(
+            value=2000,
+            label="Update Interval",
+            precision=0,
+            minimum=10,
+            interactive=True,
+            info="Evaluate every N samples (lower = more frequent updates)"
+        )
+        window_size_input = gr.Number(
+            value=20,
+            label="Rolling Window Size",
+            precision=0,
+            minimum=1,
+            interactive=True,
+            info="Number of recent checkpoints to show in rolling window graph"
+        )
+        num_random_obs_input = gr.Number(
+            value=2,
+            label="Random Observations to Visualize",
+            precision=0,
+            minimum=1,
+            maximum=20,
+            interactive=True,
+            info="Number of random observations to sample and visualize on each update"
+        )
 
-    run_status = gr.Markdown("")
-
-    gr.Markdown("---")
-
-    # Metrics Display
-    gr.Markdown("## Iteration Metrics")
-    current_metrics_display = gr.Markdown("")
-    metrics_history_plot = gr.Plot(label="Metrics History")
-
-    gr.Markdown("---")
-
-    # Visualizations
-    gr.Markdown("## Visualizations")
-
-    gr.Markdown("### Current State")
-    frames_plot = gr.Plot(label="Current Frame & Last Prediction")
-    prediction_error_display = gr.Textbox(label="Prediction Error", value="--", interactive=False)
-
-    gr.Markdown("### Training Results")
+    # Training info display (dynamically updated)
     training_info_display = gr.Markdown("")
-    grad_diag_display = gr.Markdown("")
-    training_canvas_plot = gr.Plot(label="1. Training Canvas (Original)")
-    training_canvas_masked_plot = gr.Plot(label="2. Training Canvas with Mask Overlay")
-    training_inpainting_full_plot = gr.Plot(label="3. Training Inpainting - Full Model Output")
-    training_inpainting_composite_plot = gr.Plot(label="4. Training Inpainting - Composite")
 
-    gr.Markdown("### Prediction Results")
-    prediction_canvas_plot = gr.Plot(label="Prediction Canvas")
-    predicted_frame_plot = gr.Plot(label="Predicted Next Frame")
+    with gr.Row():
+        run_batch_btn = gr.Button("🚀 Run Batch Training", variant="primary")
+
+    batch_training_status = gr.Markdown("")
+
+    gr.Markdown("---")
+
+    # Training Progress
+    gr.Markdown("## Training Progress")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            loss_vs_samples_plot = gr.Plot(label="Loss vs Samples Seen (Full History)")
+        with gr.Column(scale=1):
+            loss_vs_recent_plot = gr.Plot(label="Loss vs Recent Checkpoints (Rolling Window)")
+
+    gr.Markdown("---")
+
+    # Training Observation Samples
+    gr.Markdown("---")
+
+    gr.Markdown("## Training Observation Samples")
+    gr.Markdown("Random observations + current frame, re-sampled on each training update.")
+
+    observation_samples_status = gr.Markdown("")
+    observation_samples_plot = gr.Plot(label="Observation Samples (Original + Composite Grid)")
+
+    gr.Markdown("---")
+
+    # Latest Evaluation Results
+    gr.Markdown("## Latest Evaluation Results")
+    gr.Markdown("Most recent full-session evaluation from training.")
+
+    latest_eval_loss_plot = gr.Plot(label="Loss Over Session")
+    latest_eval_dist_plot = gr.Plot(label="Loss Distribution")
 
     gr.Markdown("---")
 
@@ -1994,7 +2651,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
                 label="Batch Sizes to Test",
                 info="Comma-separated (e.g., 1,2,4,8,16)"
             )
-            total_samples_input = gr.Number(
+            comparison_total_samples_input = gr.Number(
                 value=1000,
                 label="Total Samples Per Test",
                 precision=0,
@@ -2077,8 +2734,10 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         ]
     )
 
+    # Note: evaluate_full_session now returns 5 values, but we only use 4 in the UI
+    # The 5th value (stats dict) is used internally by run_world_model_batch
     evaluate_session_btn.click(
-        fn=evaluate_full_session,
+        fn=lambda: evaluate_full_session()[:4],  # Take only first 4 return values
         inputs=[],
         outputs=[
             eval_status,
@@ -2103,23 +2762,32 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         ]
     )
 
-    run_btn.click(
-        fn=run_world_model,
-        inputs=[num_iterations_input],
+    # Dynamic training info update handlers
+    total_samples_input.change(
+        fn=calculate_training_info,
+        inputs=[total_samples_input, batch_size_input],
+        outputs=[training_info_display]
+    )
+
+    batch_size_input.change(
+        fn=calculate_training_info,
+        inputs=[total_samples_input, batch_size_input],
+        outputs=[training_info_display]
+    )
+
+    # Batch training handler (takes current slider value as input)
+    run_batch_btn.click(
+        fn=run_world_model_batch,
+        inputs=[total_samples_input, batch_size_input, frame_slider, update_interval_input,
+                window_size_input, num_random_obs_input],
         outputs=[
-            run_status,
-            current_metrics_display,
-            metrics_history_plot,
-            frames_plot,
-            training_canvas_plot,
-            training_canvas_masked_plot,
-            training_inpainting_full_plot,
-            training_inpainting_composite_plot,
-            prediction_canvas_plot,
-            predicted_frame_plot,
-            training_info_display,
-            grad_diag_display,
-            prediction_error_display,
+            batch_training_status,
+            loss_vs_samples_plot,
+            loss_vs_recent_plot,
+            latest_eval_loss_plot,
+            latest_eval_dist_plot,
+            observation_samples_status,
+            observation_samples_plot,
         ]
     )
 
@@ -2153,7 +2821,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     run_comparison_btn.click(
         fn=run_batch_comparison,
-        inputs=[batch_sizes_input, total_samples_input],
+        inputs=[batch_sizes_input, comparison_total_samples_input],
         outputs=[
             comparison_status,
             comparison_summary,
@@ -2168,12 +2836,14 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     def initialize_ui():
         sessions = refresh_sessions()
         checkpoints = refresh_checkpoints()
-        return sessions, checkpoints
+        # Initialize training info with default values
+        training_info = calculate_training_info(500, 64)  # default total_samples=500, batch_size=64
+        return sessions, checkpoints, training_info
 
     demo.load(
         fn=initialize_ui,
         inputs=[],
-        outputs=[session_dropdown, checkpoint_dropdown]
+        outputs=[session_dropdown, checkpoint_dropdown, training_info_display]
     )
 
 if __name__ == "__main__":

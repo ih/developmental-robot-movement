@@ -35,7 +35,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
     # Optimizer parameters
     AUTOENCODER_LR = 1e-4          # Learning rate for autoencoder training
     WEIGHT_DECAY = 0.01            # AdamW weight decay
-    WARMUP_STEPS = 600             # Warmup steps for learning rate scheduler
+    WARMUP_STEPS = 10             # Warmup steps for learning rate scheduler
     LR_MIN_RATIO = 0.01            # Minimum LR as ratio of base LR
 
     # Focal loss parameters (for loss dilution)
