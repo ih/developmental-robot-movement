@@ -815,6 +815,12 @@ def calculate_training_info(total_samples, batch_size):
     lr_min_ratio = config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO  # 0.01
     min_lr = scaled_lr * lr_min_ratio
 
+    # Warmup steps (scaled inversely with batch size to see same data)
+    base_warmup_steps = config.AutoencoderConcatPredictorWorldModelConfig.WARMUP_STEPS
+    scaled_warmup_steps = max(1, int(base_warmup_steps / batch_size))
+    warmup_samples_seen = scaled_warmup_steps * batch_size
+    warmup_percentage = (scaled_warmup_steps / num_gradient_updates) * 100 if num_gradient_updates > 0 else 0
+
     # Format output
     info = f"""**Training Configuration**
 
@@ -829,10 +835,13 @@ def calculate_training_info(total_samples, batch_size):
 - Scaling factor: {batch_size / base_batch_size:.2f}x
 - Min LR (cosine decay): {min_lr:.6f}
 
-🔄 **Scheduler**
-- Type: Warmup + Cosine Annealing
+🔄 **Scheduler (Warmup + Cosine Annealing)**
 - Total steps: {num_gradient_updates:,}
-- LR range: {scaled_lr:.6f} → {min_lr:.6f}
+- Warmup (base): {base_warmup_steps} steps @ BS={base_batch_size} = {base_warmup_steps} samples
+- Warmup (adjusted): {scaled_warmup_steps} steps @ BS={batch_size} = {warmup_samples_seen} samples
+- Warmup duration: {warmup_percentage:.1f}% of training
+- LR during warmup: 0.0 → {scaled_lr:.6f} (linear ramp)
+- LR after warmup: {scaled_lr:.6f} → {min_lr:.6f} (cosine decay)
 """
 
     return info
@@ -1205,8 +1214,70 @@ def run_world_model(num_iterations):
         error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
         yield error_msg, "", "", None, None, None, None, None, None, None, None, "", "", "--"
 
+def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep):
+    """
+    Save a best model checkpoint and manage the list to keep only N best models.
+
+    Args:
+        current_loss: Current loss value
+        samples_seen: Number of samples seen at this checkpoint
+        world_model: The world model instance
+        auto_saved_checkpoints: List of (loss, filepath) tuples for auto-saved checkpoints
+        num_best_models_to_keep: Maximum number of best models to keep
+
+    Returns:
+        Tuple of (success: bool, message: str, updated_checkpoints_list)
+    """
+    checkpoint_name = f"best_model_auto_loss_{current_loss:.6f}.pth"
+    checkpoint_path = os.path.join(TOROIDAL_DOT_CHECKPOINT_DIR, checkpoint_name)
+
+    try:
+        # Save the new checkpoint
+        checkpoint = {
+            'model_state_dict': world_model.autoencoder.state_dict(),
+            'optimizer_state_dict': world_model.ae_optimizer.state_dict(),
+            'scheduler_state_dict': world_model.ae_scheduler.state_dict(),
+            'timestamp': datetime.now().isoformat(),
+            'samples_seen': samples_seen,
+            'loss': current_loss,
+            'config': {
+                'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+                'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+                'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+            }
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"[AUTO-SAVE] New best loss {current_loss:.6f} at {samples_seen} samples → saved to {checkpoint_name}")
+
+        # Add to tracking list
+        auto_saved_checkpoints.append((current_loss, checkpoint_path))
+
+        # If we exceed the limit, delete the worst checkpoint
+        message = f"🏆 **New Best Model Saved!**\n- Loss: {current_loss:.6f}\n- Checkpoint: {checkpoint_name}"
+
+        if len(auto_saved_checkpoints) > num_best_models_to_keep:
+            # Sort by loss (ascending) and remove the worst one (highest loss)
+            auto_saved_checkpoints.sort(key=lambda x: x[0])
+            worst_loss, worst_path = auto_saved_checkpoints.pop()  # Remove last (highest loss)
+
+            # Delete the file
+            if os.path.exists(worst_path):
+                os.remove(worst_path)
+                worst_filename = os.path.basename(worst_path)
+                print(f"[AUTO-SAVE] Deleted worse checkpoint: {worst_filename} (loss: {worst_loss:.6f})")
+                message += f"\n- Deleted worse checkpoint: {worst_filename} (loss: {worst_loss:.6f})"
+
+        message += f"\n- Keeping {len(auto_saved_checkpoints)}/{num_best_models_to_keep} best models"
+
+        return True, message, auto_saved_checkpoints
+
+    except Exception as e:
+        error_msg = f"Failed to save best model: {str(e)}"
+        print(f"[AUTO-SAVE ERROR] {error_msg}")
+        return False, error_msg, auto_saved_checkpoints
+
 def run_world_model_batch(total_samples, batch_size, current_observation_idx, update_interval=100,
-                          window_size=10, num_random_obs=5):
+                          window_size=10, num_random_obs=5, num_best_models_to_keep=3):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -1217,6 +1288,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         update_interval: Evaluate every N samples (default: 100)
         window_size: Number of recent checkpoints for rolling window plot (default: 10)
         num_random_obs: Number of random observations to visualize (default: 5)
+        num_best_models_to_keep: Number of best model checkpoints to keep (default: 3)
 
     Yields:
         Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
@@ -1226,7 +1298,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     import random
     import time
 
-    print(f"[DEBUG] run_world_model_batch called with: total_samples={total_samples}, batch_size={batch_size}, update_interval={update_interval}")
+    print(f"[DEBUG] run_world_model_batch called with: total_samples={total_samples}, batch_size={batch_size}, update_interval={update_interval}, num_best_models_to_keep={num_best_models_to_keep}")
 
     # Validation
     if world_model is None:
@@ -1283,6 +1355,13 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
     print(f"[DEBUG] Linear LR scaling: base_lr={base_lr:.6f} (BS={base_batch_size}) -> scaled_lr={scaled_lr:.6f} (BS={batch_size})")
 
+    # Scale warmup steps inversely with batch size (to see same amount of data)
+    base_warmup_steps = config.AutoencoderConcatPredictorWorldModelConfig.WARMUP_STEPS
+    scaled_warmup_steps = max(1, int(base_warmup_steps / batch_size))  # Minimum 1 step
+    warmup_samples_seen = scaled_warmup_steps * batch_size
+
+    print(f"[DEBUG] Warmup scaling: base_warmup={base_warmup_steps} steps (BS={base_batch_size}) -> scaled_warmup={scaled_warmup_steps} steps (BS={batch_size}), samples_seen={warmup_samples_seen}")
+
     # Recreate optimizer with scaled LR
     import torch.optim as optim
     param_groups = [
@@ -1290,14 +1369,14 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     ]
     world_model.ae_optimizer = optim.AdamW(param_groups, lr=scaled_lr)
 
-    # Recreate scheduler with updated total steps
+    # Recreate scheduler with updated total steps and scaled warmup
     world_model.ae_scheduler = world_model_utils.create_warmup_cosine_scheduler(
         world_model.ae_optimizer,
-        warmup_steps=config.AutoencoderConcatPredictorWorldModelConfig.WARMUP_STEPS,
+        warmup_steps=scaled_warmup_steps,
         total_steps=num_gradient_updates,
         lr_min_ratio=config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO,
     )
-    print(f"[DEBUG] Scheduler configured for {num_gradient_updates} steps with LR range {scaled_lr:.6f} -> {scaled_lr * config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO:.6f}")
+    print(f"[DEBUG] Scheduler configured for {num_gradient_updates} steps (warmup: {scaled_warmup_steps}) with LR range {scaled_lr:.6f} -> {scaled_lr * config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO:.6f}")
 
     # Determine optimal number of workers
     import platform
@@ -1337,6 +1416,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
     # Track best loss for automatic checkpoint saving
     best_loss = float('inf')
+
+    # Track auto-saved checkpoints for this training run (list of tuples: (loss, filepath))
+    auto_saved_checkpoints = []
 
     # Track total training time
     training_start_time = time.time()
@@ -1403,28 +1485,15 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Save best model automatically if loss improved
                     if current_loss < best_loss:
                         best_loss = current_loss
-                        checkpoint_name = f"best_model_auto_loss_{current_loss:.6f}.pth"
-                        checkpoint_path = os.path.join(TOROIDAL_DOT_CHECKPOINT_DIR, checkpoint_name)
+                        success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
+                            current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep
+                        )
+                        if success:
+                            status_msg += f"\n\n{save_msg}"
 
-                        try:
-                            checkpoint = {
-                                'model_state_dict': world_model.autoencoder.state_dict(),
-                                'optimizer_state_dict': world_model.ae_optimizer.state_dict(),
-                                'scheduler_state_dict': world_model.ae_scheduler.state_dict(),
-                                'timestamp': datetime.now().isoformat(),
-                                'samples_seen': samples_seen,
-                                'loss': current_loss,
-                                'config': {
-                                    'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
-                                    'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
-                                    'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
-                                }
-                            }
-                            torch.save(checkpoint, checkpoint_path)
-                            print(f"[AUTO-SAVE] New best loss {current_loss:.6f} at {samples_seen} samples → saved to {checkpoint_name}")
-                            status_msg += f"\n\n🏆 **New Best Model Saved!**\n- Loss: {current_loss:.6f}\n- Checkpoint: {checkpoint_name}"
-                        except Exception as e:
-                            print(f"[AUTO-SAVE ERROR] Failed to save best model: {str(e)}")
+                    # Add current learning rate to status
+                    current_lr = world_model.ae_optimizer.param_groups[0]['lr']
+                    status_msg += f"\n\n📊 **Current Learning Rate**: {current_lr:.6e}"
 
                     # Yield update (includes visualization for currently selected observation)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
@@ -1472,28 +1541,15 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Save best model automatically if loss improved
                     if current_loss < best_loss:
                         best_loss = current_loss
-                        checkpoint_name = f"best_model_auto_loss_{current_loss:.6f}.pth"
-                        checkpoint_path = os.path.join(TOROIDAL_DOT_CHECKPOINT_DIR, checkpoint_name)
+                        success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
+                            current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep
+                        )
+                        if success:
+                            status_msg += f"\n\n{save_msg}"
 
-                        try:
-                            checkpoint = {
-                                'model_state_dict': world_model.autoencoder.state_dict(),
-                                'optimizer_state_dict': world_model.ae_optimizer.state_dict(),
-                                'scheduler_state_dict': world_model.ae_scheduler.state_dict(),
-                                'timestamp': datetime.now().isoformat(),
-                                'samples_seen': samples_seen,
-                                'loss': current_loss,
-                                'config': {
-                                    'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
-                                    'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
-                                    'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
-                                }
-                            }
-                            torch.save(checkpoint, checkpoint_path)
-                            print(f"[AUTO-SAVE] New best loss {current_loss:.6f} at {samples_seen} samples → saved to {checkpoint_name}")
-                            status_msg += f"\n\n🏆 **New Best Model Saved!**\n- Loss: {current_loss:.6f}\n- Checkpoint: {checkpoint_name}"
-                        except Exception as e:
-                            print(f"[AUTO-SAVE ERROR] Failed to save best model: {str(e)}")
+                    # Add current learning rate to status
+                    current_lr = world_model.ae_optimizer.param_groups[0]['lr']
+                    status_msg += f"\n\n📊 **Current Learning Rate**: {current_lr:.6e}"
 
                     # Yield update
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
@@ -1517,28 +1573,15 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         # Save best model automatically if final loss is the best
         if current_loss < best_loss:
             best_loss = current_loss
-            checkpoint_name = f"best_model_auto_loss_{current_loss:.6f}.pth"
-            checkpoint_path = os.path.join(TOROIDAL_DOT_CHECKPOINT_DIR, checkpoint_name)
+            success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
+                current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep
+            )
+            if success:
+                status_msg += f"\n\n{save_msg}"
 
-            try:
-                checkpoint = {
-                    'model_state_dict': world_model.autoencoder.state_dict(),
-                    'optimizer_state_dict': world_model.ae_optimizer.state_dict(),
-                    'scheduler_state_dict': world_model.ae_scheduler.state_dict(),
-                    'timestamp': datetime.now().isoformat(),
-                    'samples_seen': samples_seen,
-                    'loss': current_loss,
-                    'config': {
-                        'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
-                        'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
-                        'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
-                    }
-                }
-                torch.save(checkpoint, checkpoint_path)
-                print(f"[AUTO-SAVE] Final best loss {current_loss:.6f} at {samples_seen} samples → saved to {checkpoint_name}")
-                status_msg += f"\n\n🏆 **Final Best Model Saved!**\n- Loss: {current_loss:.6f}\n- Checkpoint: {checkpoint_name}"
-            except Exception as e:
-                print(f"[AUTO-SAVE ERROR] Failed to save final best model: {str(e)}")
+        # Add final learning rate to status
+        final_lr = world_model.ae_optimizer.param_groups[0]['lr']
+        status_msg += f"\n\n📊 **Final Learning Rate**: {final_lr:.6e}"
 
         # Calculate total elapsed time
         total_elapsed_time = time.time() - training_start_time
@@ -2488,7 +2531,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Evaluate every N samples (lower = more frequent updates)"
         )
         window_size_input = gr.Number(
-            value=20,
+            value=1000,
             label="Rolling Window Size",
             precision=0,
             minimum=1,
@@ -2503,6 +2546,15 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             maximum=20,
             interactive=True,
             info="Number of random observations to sample and visualize on each update"
+        )
+        num_best_models_input = gr.Number(
+            value=3,
+            label="Best Models to Keep",
+            precision=0,
+            minimum=1,
+            maximum=10,
+            interactive=True,
+            info="Maximum number of best model checkpoints to keep (auto-deletes worse models)"
         )
 
     # Training info display (dynamically updated)
@@ -2779,7 +2831,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     run_batch_btn.click(
         fn=run_world_model_batch,
         inputs=[total_samples_input, batch_size_input, frame_slider, update_interval_input,
-                window_size_input, num_random_obs_input],
+                window_size_input, num_random_obs_input, num_best_models_input],
         outputs=[
             batch_training_status,
             loss_vs_samples_plot,
