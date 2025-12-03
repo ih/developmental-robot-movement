@@ -21,6 +21,24 @@ TOROIDAL_DOT_RECORDING_DIR = f"{AUX_DIR}/sessions/toroidal_dot"
 JETBOT_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints/jetbot"
 TOROIDAL_DOT_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints/toroidal_dot"
 
+# Recording configuration
+RECORDING_SHARD_SIZE = 1000           # Steps per recording shard
+RECORDING_MAX_DISK_GB = 10.0          # Maximum disk space for recordings (per robot type)
+
+# Toroidal Dot Environment Configuration
+class ToroidalDotConfig:
+    # Environment parameters
+    IMG_SIZE = 224              # Size of square image
+    DOT_RADIUS = 5              # Radius of white dot in pixels
+    DOT_MOVE_PIXELS = 27        # Horizontal movement per action=1
+    DOT_ACTION_DELAY = 0.0      # Delay between actions in seconds
+
+    # Action space for toroidal dot
+    ACTION_CHANNELS_DOT = ["action"]
+    ACTION_RANGES_DOT = {
+        "action": (0, 1)        # Binary action: 0=stay, 1=move right
+    }
+
 # Autoencoder Concat Predictor World Model Configuration
 class AutoencoderConcatPredictorWorldModelConfig:
     # Canvas construction

@@ -9,6 +9,7 @@ import numpy as np
 from typing import Dict, List
 from robot_interface import RobotInterface
 from toroidal_dot_env import ToroidalDotEnvironment
+import config
 
 
 class ToroidalDotRobot(RobotInterface):
@@ -21,28 +22,38 @@ class ToroidalDotRobot(RobotInterface):
     """
 
     def __init__(self,
-                 img_size: int = 224,
-                 dot_radius: int = 2,
-                 move_pixels: int = 7,
-                 action_delay: float = 0.0,
-                 seed: int = None):
+                 img_size: int = None,
+                 dot_radius: int = None,
+                 move_pixels: int = None,
+                 action_delay: float = None,
+                 seed: int = None,
+                 initial_x: int = None,
+                 initial_y: int = None):
         """
         Initialize the toroidal dot robot interface.
 
         Args:
-            img_size: Size of the square image (default 224)
-            dot_radius: Radius of the white dot in pixels (default 2)
-            move_pixels: Number of pixels to move right when action=1 (default 7)
-            action_delay: Delay in seconds after each action (default 0.0)
+            img_size: Size of the square image (default from config: 224)
+            dot_radius: Radius of the white dot in pixels (default from config: 5)
+            move_pixels: Number of pixels to move right when action=1 (default from config: 27)
+            action_delay: Delay in seconds after each action (default from config: 0.0)
             seed: Random seed for reproducibility (optional)
+            initial_x: Fixed x-position for dot (None = random) (optional)
+            initial_y: Fixed y-position for dot (None = random) (optional)
         """
+        # Use config defaults if not specified
+        if action_delay is None:
+            action_delay = config.ToroidalDotConfig.DOT_ACTION_DELAY
+
+        self.action_delay = action_delay
         self.env = ToroidalDotEnvironment(
             img_size=img_size,
             dot_radius=dot_radius,
             move_pixels=move_pixels,
-            seed=seed
+            seed=seed,
+            initial_x=initial_x,
+            initial_y=initial_y
         )
-        self.action_delay = action_delay
 
     def get_observation(self) -> np.ndarray:
         """

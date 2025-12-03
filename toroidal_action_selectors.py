@@ -129,3 +129,88 @@ SEQUENCE_ALWAYS_STAY = [TOROIDAL_ACTION_STAY]
 SEQUENCE_ALTERNATE = [TOROIDAL_ACTION_STAY, TOROIDAL_ACTION_MOVE]
 SEQUENCE_DOUBLE_MOVE = [TOROIDAL_ACTION_MOVE, TOROIDAL_ACTION_MOVE, TOROIDAL_ACTION_STAY]
 SEQUENCE_TRIPLE_MOVE = [TOROIDAL_ACTION_MOVE, TOROIDAL_ACTION_MOVE, TOROIDAL_ACTION_MOVE, TOROIDAL_ACTION_STAY]
+
+
+def create_random_duration_action_selector(
+    min_duration: int = 5,
+    max_duration: int = 15,
+    seed: int = None
+):
+    """
+    Create an action selector that randomly chooses actions and maintains them
+    for a random number of consecutive steps.
+
+    This selector is useful for testing if the world model can learn to condition
+    on actions by providing sequences of consistent actions with varying durations.
+
+    The selector randomly chooses between action 0 (stay) and action 1 (move right),
+    then repeats that action for a randomly chosen duration between min_duration
+    and max_duration steps (inclusive).
+
+    Args:
+        min_duration: Minimum number of steps to maintain an action (default 5)
+        max_duration: Maximum number of steps to maintain an action (default 15)
+        seed: Random seed for reproducibility (optional)
+
+    Returns:
+        Function that returns (action, all_action_predictions) tuples
+
+    Example:
+        # Create selector with 5-15 step durations
+        selector = create_random_duration_action_selector(
+            min_duration=5,
+            max_duration=15,
+            seed=42
+        )
+
+        # Use with world model or recording
+        robot = ToroidalDotRobot(initial_y=112)  # Fixed y-position
+        for _ in range(100):
+            action, _ = selector()
+            robot.execute_action(action)
+    """
+    if min_duration < 1:
+        raise ValueError("min_duration must be at least 1")
+    if max_duration < min_duration:
+        raise ValueError("max_duration must be >= min_duration")
+
+    # Use numpy for random number generation
+    import numpy as np
+    rng = np.random.RandomState(seed)
+
+    # Use a mutable container to store state across calls
+    state = {
+        'current_action': None,
+        'remaining_steps': 0
+    }
+
+    def random_duration_action_selector(
+        current_features: Optional[Any] = None
+    ) -> Tuple[Dict[str, Any], List[Any]]:
+        """
+        Return the current action, selecting a new one with random duration
+        when the current duration expires.
+
+        Args:
+            current_features: Current visual features (ignored)
+
+        Returns:
+            Tuple of (action, all_action_predictions) where:
+            - action: The current action (maintained for duration steps)
+            - all_action_predictions: Empty list (no predictions computed)
+        """
+        # Check if we need to select a new action
+        if state['remaining_steps'] <= 0:
+            # Randomly choose action 0 or 1
+            action_value = rng.randint(0, 2)  # 0 or 1
+            state['current_action'] = {'action': action_value}
+
+            # Randomly choose duration
+            state['remaining_steps'] = rng.randint(min_duration, max_duration + 1)
+
+        # Decrement remaining steps
+        state['remaining_steps'] -= 1
+
+        return state['current_action'], []
+
+    return random_duration_action_selector

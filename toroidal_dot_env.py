@@ -7,6 +7,7 @@ The environment is toroidal (wraps around horizontally).
 
 import numpy as np
 from typing import Tuple
+import config
 
 
 class ToroidalDotEnvironment:
@@ -20,22 +21,36 @@ class ToroidalDotEnvironment:
     """
 
     def __init__(self,
-                 img_size: int = 224,
-                 dot_radius: int = 2,
-                 move_pixels: int = 7,
-                 seed: int = None):
+                 img_size: int = None,
+                 dot_radius: int = None,
+                 move_pixels: int = None,
+                 seed: int = None,
+                 initial_x: int = None,
+                 initial_y: int = None):
         """
         Initialize the toroidal dot environment.
 
         Args:
-            img_size: Size of the square image (default 224)
-            dot_radius: Radius of the white dot in pixels (default 2)
-            move_pixels: Number of pixels to move right when action=1 (default 7)
+            img_size: Size of the square image (default from config: 224)
+            dot_radius: Radius of the white dot in pixels (default from config: 5)
+            move_pixels: Number of pixels to move right when action=1 (default from config: 27)
             seed: Random seed for reproducibility (optional)
+            initial_x: Fixed x-position for dot (None = random) (optional)
+            initial_y: Fixed y-position for dot (None = random) (optional)
         """
+        # Use config defaults if not specified
+        if img_size is None:
+            img_size = config.ToroidalDotConfig.IMG_SIZE
+        if dot_radius is None:
+            dot_radius = config.ToroidalDotConfig.DOT_RADIUS
+        if move_pixels is None:
+            move_pixels = config.ToroidalDotConfig.DOT_MOVE_PIXELS
+
         self.img_size = img_size
         self.dot_radius = dot_radius
         self.move_pixels = move_pixels
+        self.initial_x = initial_x
+        self.initial_y = initial_y
 
         # Set random seed if provided
         self.rng = np.random.RandomState(seed)
@@ -54,9 +69,17 @@ class ToroidalDotEnvironment:
         Returns:
             Initial observation (224x224x3 RGB image)
         """
-        # Randomize both x and y positions
-        self.dot_x = self.rng.randint(0, self.img_size)
-        self.dot_y = self.rng.randint(0, self.img_size)
+        # Use fixed x if specified, otherwise randomize
+        if self.initial_x is not None:
+            self.dot_x = self.initial_x
+        else:
+            self.dot_x = self.rng.randint(0, self.img_size)
+
+        # Use fixed y if specified, otherwise randomize
+        if self.initial_y is not None:
+            self.dot_y = self.initial_y
+        else:
+            self.dot_y = self.rng.randint(0, self.img_size)
 
         return self.render()
 

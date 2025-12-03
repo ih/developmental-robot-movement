@@ -30,10 +30,11 @@ This repository contains research code for developmental robot movement with a c
 - **ToroidalDotEnvironment**: Simple 224x224 simulated environment with a white dot on black background
 - **Toroidal wrapping**: Horizontal movement wraps around at image edges (x-axis is toroidal)
 - **Binary action space**: Action 0 (stay), Action 1 (move right by configurable pixels)
-- **Random initialization**: Each session starts with dot at random (x, y) position
+- **Flexible initialization**: Supports both random and fixed (x, y) positions via `initial_x` and `initial_y` parameters
 - **ToroidalDotRobot class**: Implements RobotInterface for simulated environment
 - **Fast iteration**: No hardware needed, perfect for debugging and testing world model
 - **Configurable parameters**: Dot radius, movement speed, image size via ToroidalDotConfig
+- **Default parameters**: DOT_RADIUS=5, DOT_MOVE_PIXELS=27, IMG_SIZE=224, DOT_ACTION_DELAY=0.0
 
 ### Autoencoder Concat Predictor World Model
 - **Canvas-based approach**: Concatenates history frames horizontally with action-colored separators between them
@@ -52,6 +53,7 @@ This repository contains research code for developmental robot movement with a c
 - **Toroidal action selectors** (`toroidal_action_selectors.py`):
   - `create_constant_action_selector(action)`: Always returns the same action
   - `create_sequence_action_selector(sequence)`: Cycles through a sequence of actions
+  - `create_random_duration_action_selector(min_duration, max_duration, seed)`: Randomly chooses actions and maintains them for random consecutive steps
   - Pre-defined sequences: `SEQUENCE_ALWAYS_MOVE`, `SEQUENCE_ALWAYS_STAY`, `SEQUENCE_ALTERNATE`, `SEQUENCE_DOUBLE_MOVE`, `SEQUENCE_TRIPLE_MOVE`
 - **Recorded action selector** (`recorded_policy.py`):
   - `create_recorded_action_selector(reader)`: Replays actions from recorded sessions
@@ -221,8 +223,10 @@ Required Python packages:
 - `models/canvas_dataset.py`: PyTorch Dataset and DataLoader utilities for high-performance batch training with pinned memory and CUDA streams
 
 ### Action Selection and Recording
-- `toroidal_action_selectors.py`: Action selector factories for toroidal dot environment (constant and sequence selectors)
+- `toroidal_action_selectors.py`: Action selector factories for toroidal dot environment (constant, sequence, and random duration selectors)
 - `recorded_policy.py`: Action selector factory for recorded action playback
+- `record_toroidal_random_duration_sessions.py`: Script for recording training and validation sessions with random duration action selector
+- `filter_validation_overlap.py`: Utility to filter validation sessions and remove (position, last_action) pairs seen during training
 - `recording_writer.py`: Recording system with automatic disk space management
 - `recording_reader.py`: Reads recorded sessions with smart observation/action sequencing
 - `recording_robot.py`: Robot wrapper for recording sessions

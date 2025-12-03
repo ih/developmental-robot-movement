@@ -513,6 +513,18 @@ def evaluate_full_session():
     loss_hybrid_array = np.array(results['loss_hybrid'])
     loss_standard_array = np.array(results['loss_standard'])
 
+    # Check for NaN values
+    if np.any(np.isnan(loss_hybrid_array)) or np.any(np.isnan(loss_standard_array)):
+        nan_count = np.sum(np.isnan(loss_hybrid_array))
+        error_msg = f"❌ Evaluation failed: {nan_count}/{len(loss_hybrid_array)} loss values are NaN\n\n"
+        error_msg += "This indicates the model weights are corrupted (likely from gradient explosion during training).\n\n"
+        error_msg += "**Solutions:**\n"
+        error_msg += "1. Reload the page to reset the model\n"
+        error_msg += "2. Load a saved checkpoint\n"
+        error_msg += "3. Reduce learning rate in config.py and retrain\n"
+        error_msg += "4. Use gradient clipping (add to train_on_canvas)"
+        return error_msg, None, None, "", {}
+
     stats = {
         'num_observations': len(results['observation_indices']),
         'hybrid': {
@@ -1524,6 +1536,15 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 world_model.ae_scheduler.step()
                 samples_seen += canvas_tensor.shape[0]
 
+                # Check for NaN loss
+                if torch.isnan(torch.tensor(loss)) or torch.isinf(torch.tensor(loss)):
+                    error_msg = f"❌ Training failed at batch {batch_count}: Loss became NaN/Inf (loss={loss})\n"
+                    error_msg += "This usually indicates gradient explosion. Try:\n"
+                    error_msg += "1. Lower the learning rate in config.py\n"
+                    error_msg += "2. Use a smaller batch size\n"
+                    error_msg += "3. Load a pre-trained checkpoint"
+                    raise ValueError(error_msg)
+
                 if batch_count <= 5 or batch_count % 10 == 0:
                     print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{total_samples}, loss={loss:.6f}")
 
@@ -2507,7 +2528,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     with gr.Row():
         total_samples_input = gr.Number(
-            value=500,
+            value=10000000,
             label="Total Samples",
             precision=0,
             minimum=1,
@@ -2531,7 +2552,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Evaluate every N samples (lower = more frequent updates)"
         )
         window_size_input = gr.Number(
-            value=1000,
+            value=500,
             label="Rolling Window Size",
             precision=0,
             minimum=1,
@@ -2889,7 +2910,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         sessions = refresh_sessions()
         checkpoints = refresh_checkpoints()
         # Initialize training info with default values
-        training_info = calculate_training_info(500, 64)  # default total_samples=500, batch_size=64
+        training_info = calculate_training_info(10000000, 64)  
         return sessions, checkpoints, training_info
 
     demo.load(
