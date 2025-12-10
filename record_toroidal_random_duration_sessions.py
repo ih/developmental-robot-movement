@@ -67,7 +67,7 @@ def parse_args():
     parser.add_argument(
         '--max-duration',
         type=int,
-        default=3,
+        default=1,
         help='Maximum action duration in steps (default: 3)'
     )
 
@@ -76,7 +76,7 @@ def parse_args():
         '--train-steps',
         type=int,
         default=1000,
-        help='Steps per training session (default: 500)'
+        help='Steps per training session (default: 1000)'
     )
     parser.add_argument(
         '--val-steps',
@@ -87,13 +87,13 @@ def parse_args():
     parser.add_argument(
         '--num-train-sessions',
         type=int,
-        default=12,
+        default=1,
         help='Number of training sessions (default: 1)'
     )
     parser.add_argument(
         '--num-val-sessions',
         type=int,
-        default=3,
+        default=1,
         help='Number of validation sessions (default: 1)'
     )
 

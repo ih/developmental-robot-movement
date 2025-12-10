@@ -299,29 +299,99 @@ def build_canvas_from_frame(frame_idx):
 
     return training_canvas, None, start_idx, interleaved
 
-def infer_on_single_canvas(frame_idx):
-    """Run inference only on a single canvas built from selected frame and its history"""
+
+def build_counterfactual_canvas(frame_idx, counterfactual_action):
+    """
+    Build a canvas with a modified last action for counterfactual testing.
+
+    Args:
+        frame_idx: The frame index to build the canvas for
+        counterfactual_action: The action to substitute for the actual last action (0 or 1)
+
+    Returns:
+        Tuple of (true_canvas, counterfactual_canvas, error, start_idx, actual_last_action)
+    """
+    # Get the true canvas and interleaved history
+    true_canvas, error, start_idx, interleaved = build_canvas_from_frame(frame_idx)
+    if true_canvas is None:
+        return None, None, error, None, None
+
+    # Get actual last action (at index -2 in interleaved: [f0, a0, f1, a1, f2])
+    actual_last_action = interleaved[-2] if len(interleaved) >= 3 else {"action": 0}
+
+    # Create counterfactual interleaved by copying and modifying last action
+    counterfactual_interleaved = interleaved.copy()
+    counterfactual_interleaved[-2] = {"action": counterfactual_action}
+
+    # Build counterfactual canvas
+    from models.autoencoder_concat_predictor import build_canvas
+    counterfactual_canvas = build_canvas(
+        counterfactual_interleaved,
+        frame_size=config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+        sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+    )
+
+    return true_canvas, counterfactual_canvas, None, start_idx, actual_last_action
+
+
+def create_difference_heatmap(true_composite, cf_composite):
+    """
+    Create heatmap showing absolute pixel differences between two images.
+
+    Args:
+        true_composite: True inference composite (numpy array HxWx3)
+        cf_composite: Counterfactual inference composite (numpy array HxWx3)
+
+    Returns:
+        Matplotlib figure with difference heatmap
+    """
+    diff = np.abs(cf_composite.astype(float) - true_composite.astype(float))
+    diff_gray = np.mean(diff, axis=2)  # Average across RGB channels
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+    im = ax.imshow(diff_gray, cmap='hot', vmin=0, vmax=255)
+    ax.set_title("Prediction Difference Heatmap (Counterfactual - True)")
+    ax.axis("off")
+    plt.colorbar(im, ax=ax, label="Absolute Pixel Difference")
+    plt.tight_layout()
+    return fig
+
+
+def run_counterfactual_inference(frame_idx, counterfactual_action):
+    """
+    Run inference on true and counterfactual canvases and compare.
+
+    Args:
+        frame_idx: The frame index to test
+        counterfactual_action: The counterfactual action (0=stay, 1=move)
+
+    Returns:
+        Tuple of (status_msg, true_canvas_fig, cf_canvas_fig, true_inference_fig,
+                  cf_inference_fig, diff_heatmap_fig, stats_md)
+    """
     global world_model, session_state
 
     if world_model is None:
-        return "Please load a session first", "", None, None, None, None
+        return "Please load a session first", None, None, None, None, None, ""
 
     if not session_state.get("observations") or not session_state.get("actions"):
-        return "No session data available", "", None, None, None, None
+        return "No session data available", None, None, None, None, None, ""
 
-    # Build canvas
-    training_canvas, error, start_idx, interleaved = build_canvas_from_frame(frame_idx)
-    if training_canvas is None:
-        return error, "", None, None, None, None
+    # Build both canvases
+    true_canvas, cf_canvas, error, start_idx, actual_action = build_counterfactual_canvas(
+        frame_idx, counterfactual_action
+    )
+    if error:
+        return error, None, None, None, None, None, ""
 
     frame_idx = int(frame_idx)
 
-    # Store canvas for visualization
-    world_model.last_training_canvas = training_canvas
+    # Convert canvases to tensors
+    true_tensor = canvas_to_tensor(true_canvas).to(device)
+    cf_tensor = canvas_to_tensor(cf_canvas).to(device)
 
-    # Compute patch mask for last slot
-    canvas_tensor = canvas_to_tensor(training_canvas).to(device)
-    canvas_height, canvas_width = canvas_tensor.shape[-2:]
+    # Compute patch mask for last slot (same mask for both)
+    canvas_height, canvas_width = true_tensor.shape[-2:]
     num_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
 
     import config as cfg
@@ -334,105 +404,119 @@ def infer_on_single_canvas(frame_idx):
         mask_ratio_max=cfg.MASK_RATIO_MAX,
     ).to(device)
 
-    # Store the mask for visualization
-    world_model.last_training_mask = patch_mask
-
-    # Run inference (no training)
+    # Run inference on both canvases
     world_model.autoencoder.eval()
     with torch.no_grad():
-        pred_patches, _ = world_model.autoencoder.forward_with_patch_mask(canvas_tensor, patch_mask)
-        img_pred = world_model.autoencoder.unpatchify(pred_patches)
+        # True canvas inference
+        true_pred_patches, _ = world_model.autoencoder.forward_with_patch_mask(true_tensor, patch_mask)
+        true_img_pred = world_model.autoencoder.unpatchify(true_pred_patches)
 
-        # Compute loss using shared helper function from model module
-        target_patches = world_model.autoencoder.patchify(canvas_tensor)  # [1, num_patches, patch_dim]
+        # Counterfactual canvas inference
+        cf_pred_patches, _ = world_model.autoencoder.forward_with_patch_mask(cf_tensor, patch_mask)
+        cf_img_pred = world_model.autoencoder.unpatchify(cf_pred_patches)
 
-        # Select masked patches
-        masked_pred = pred_patches[patch_mask]
-        masked_target = target_patches[patch_mask]
+        # Compute losses for both
+        true_target_patches = world_model.autoencoder.patchify(true_tensor)
+        cf_target_patches = world_model.autoencoder.patchify(cf_tensor)
 
-        # Compute loss with same function as training
-        import config as cfg
-        loss_dict = compute_hybrid_loss_on_masked_patches(
-            masked_pred,
-            masked_target,
+        true_masked_pred = true_pred_patches[patch_mask]
+        true_masked_target = true_target_patches[patch_mask]
+        cf_masked_pred = cf_pred_patches[patch_mask]
+        cf_masked_target = cf_target_patches[patch_mask]
+
+        true_loss_dict = compute_hybrid_loss_on_masked_patches(
+            true_masked_pred, true_masked_target,
+            focal_alpha=cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
+            focal_beta=cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA
+        )
+        cf_loss_dict = compute_hybrid_loss_on_masked_patches(
+            cf_masked_pred, cf_masked_target,
             focal_alpha=cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
             focal_beta=cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA
         )
 
-        # Convert tensor losses to scalars
-        loss_dict = {
-            'loss_hybrid': loss_dict['loss_hybrid'].item() if torch.is_tensor(loss_dict['loss_hybrid']) else loss_dict['loss_hybrid'],
-            'loss_plain': loss_dict['loss_plain'].item() if torch.is_tensor(loss_dict['loss_plain']) else loss_dict['loss_plain'],
-            'loss_focal': loss_dict['loss_focal'].item() if torch.is_tensor(loss_dict['loss_focal']) else loss_dict['loss_focal'],
-            'loss_standard': loss_dict['loss_standard'].item() if torch.is_tensor(loss_dict['loss_standard']) else loss_dict['loss_standard'],
-            'focal_alpha': cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
-            'focal_beta': cfg.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA,
-            'focal_weight_mean': loss_dict['focal_weight_mean'],
-            'focal_weight_max': loss_dict['focal_weight_max'],
-        }
+        true_loss = true_loss_dict['loss_hybrid'].item() if torch.is_tensor(true_loss_dict['loss_hybrid']) else true_loss_dict['loss_hybrid']
+        cf_loss = cf_loss_dict['loss_hybrid'].item() if torch.is_tensor(cf_loss_dict['loss_hybrid']) else cf_loss_dict['loss_hybrid']
+
+    # Generate composite images for both
+    world_model.last_training_canvas = true_canvas
+    world_model.last_training_mask = patch_mask
+    true_composite = world_model.get_canvas_inpainting_composite(true_canvas, patch_mask)
+
+    world_model.last_training_canvas = cf_canvas
+    cf_composite = world_model.get_canvas_inpainting_composite(cf_canvas, patch_mask)
+
+    # Compute pixel difference statistics
+    diff = np.abs(cf_composite.astype(float) - true_composite.astype(float))
+    mean_diff = np.mean(diff)
+    max_diff = np.max(diff)
+    diff_gray = np.mean(diff, axis=2)
+    nonzero_pixels = np.sum(diff_gray > 5)  # Count pixels with > 5 difference
+
+    # Determine actual action value
+    actual_action_val = actual_action.get("action", 0) if isinstance(actual_action, dict) else actual_action
+    action_names = {0: "Stay (RED)", 1: "Move Right (GREEN)"}
 
     # Generate visualizations
-    status_msg = f"**Inference on canvas from frames {start_idx+1}-{frame_idx+1}**\n\n"
-    status_msg += f"(No training performed - weights unchanged)\n\n"
-    status_msg += f"Hybrid loss: {format_loss(loss_dict['loss_hybrid'])}\n"
-    status_msg += f"Standard loss: {format_loss(loss_dict['loss_standard'])}"
+    # 1. True canvas figure
+    fig_true_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
+    ax.imshow(true_canvas)
+    ax.set_title(f"True Canvas (Actual Last Action: {action_names.get(actual_action_val, 'Unknown')})")
+    ax.axis("off")
+    plt.tight_layout()
 
-    # Inference info (matches training display format)
-    inference_info = f"**Reconstruction Loss (Hybrid):** {format_loss(loss_dict['loss_hybrid'])} *[α={loss_dict['focal_alpha']:.2f}]*\n\n"
-    inference_info += f"**Standard Loss (unweighted):** {format_loss(loss_dict['loss_standard'])}\n\n"
-    inference_info += f"*Note: Using same loss calculation as training (hybrid: α * plain_mse + (1-α) * focal_mse with β={loss_dict['focal_beta']:.1f})*\n\n"
-    inference_info += f"*Model weights are unchanged (inference only)*"
+    # 2. Counterfactual canvas figure
+    fig_cf_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
+    ax.imshow(cf_canvas)
+    ax.set_title(f"Counterfactual Canvas (Last Action: {action_names.get(counterfactual_action, 'Unknown')})")
+    ax.axis("off")
+    plt.tight_layout()
 
-    # Training canvas visualizations
-    fig_inference_canvas = None
-    fig_inference_canvas_masked = None
-    fig_inference_inpainting_full = None
-    fig_inference_inpainting_composite = None
+    # 3. True inference composite
+    fig_true_inference, ax = plt.subplots(1, 1, figsize=(12, 4))
+    ax.imshow(true_composite)
+    ax.set_title(f"True Inference Composite (Loss: {format_loss(true_loss)})")
+    ax.axis("off")
+    plt.tight_layout()
 
-    if world_model.last_training_canvas is not None:
-        # 1. Original canvas
-        fig_inference_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
-        ax.imshow(world_model.last_training_canvas)
-        ax.set_title(f"Inference Canvas (Frames {start_idx+1}-{frame_idx+1})")
-        ax.axis("off")
-        plt.tight_layout()
+    # 4. Counterfactual inference composite
+    fig_cf_inference, ax = plt.subplots(1, 1, figsize=(12, 4))
+    ax.imshow(cf_composite)
+    ax.set_title(f"Counterfactual Inference Composite (Loss: {format_loss(cf_loss)})")
+    ax.axis("off")
+    plt.tight_layout()
 
-        # Generate additional visualizations if mask is available
-        if world_model.last_training_mask is not None:
-            # 2. Canvas with mask overlay
-            canvas_with_mask = world_model.get_canvas_with_mask_overlay(
-                world_model.last_training_canvas,
-                world_model.last_training_mask
-            )
-            fig_inference_canvas_masked, ax = plt.subplots(1, 1, figsize=(12, 4))
-            ax.imshow(canvas_with_mask)
-            ax.set_title("Inference Canvas with Mask (Red = Masked Patches)")
-            ax.axis("off")
-            plt.tight_layout()
+    # 5. Difference heatmap
+    fig_diff_heatmap = create_difference_heatmap(true_composite, cf_composite)
 
-            # 3. Full model output
-            inpainting_full = world_model.get_canvas_inpainting_full_output(
-                world_model.last_training_canvas,
-                world_model.last_training_mask
-            )
-            fig_inference_inpainting_full, ax = plt.subplots(1, 1, figsize=(12, 4))
-            ax.imshow(inpainting_full)
-            ax.set_title("Inference - Full Model Output")
-            ax.axis("off")
-            plt.tight_layout()
+    # 6. Statistics markdown
+    stats_md = f"""
+### Counterfactual Analysis Statistics
 
-            # 4. Composite
-            inpainting_composite = world_model.get_canvas_inpainting_composite(
-                world_model.last_training_canvas,
-                world_model.last_training_mask
-            )
-            fig_inference_inpainting_composite, ax = plt.subplots(1, 1, figsize=(12, 4))
-            ax.imshow(inpainting_composite)
-            ax.set_title("Inference - Composite")
-            ax.axis("off")
-            plt.tight_layout()
+| Metric | Value |
+|--------|-------|
+| **Actual Last Action** | {action_names.get(actual_action_val, 'Unknown')} |
+| **Counterfactual Action** | {action_names.get(counterfactual_action, 'Unknown')} |
+| **True Canvas Loss** | {format_loss(true_loss)} |
+| **Counterfactual Canvas Loss** | {format_loss(cf_loss)} |
+| **Mean Pixel Difference** | {mean_diff:.2f} |
+| **Max Pixel Difference** | {max_diff:.2f} |
+| **Changed Pixels (>5)** | {nonzero_pixels:,} |
 
-    return status_msg, inference_info, fig_inference_canvas, fig_inference_canvas_masked, fig_inference_inpainting_full, fig_inference_inpainting_composite
+*Note: If the model has learned the action-state relationship, changing the action
+should result in different predictions for the masked region (last frame).*
+"""
+
+    # Status message
+    same_action = actual_action_val == counterfactual_action
+    status_msg = f"**Counterfactual inference on frame {frame_idx + 1}**\n\n"
+    if same_action:
+        status_msg += f"Note: Actual action ({action_names.get(actual_action_val, 'Unknown')}) matches counterfactual - predictions should be identical."
+    else:
+        status_msg += f"Comparing: Actual={action_names.get(actual_action_val, 'Unknown')} vs Counterfactual={action_names.get(counterfactual_action, 'Unknown')}"
+
+    return status_msg, fig_true_canvas, fig_cf_canvas, fig_true_inference, fig_cf_inference, fig_diff_heatmap, stats_md
+
 
 def evaluate_full_session():
     """Evaluate model loss on all observations in the session"""
@@ -2463,22 +2547,36 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     gr.Markdown("---")
 
-    # Single Canvas Inference
-    gr.Markdown("## Inference on Single Canvas")
-    gr.Markdown("Run inference (no training) on a canvas built from the selected frame and its history to see what the model predicts.")
+    # Counterfactual Testing
+    gr.Markdown("## Counterfactual Testing")
+    gr.Markdown("Test what the model predicts if the last action before the selected frame was different.")
 
     with gr.Row():
-        single_canvas_infer_btn = gr.Button("🔍 Run Inference on Selected Frame", variant="secondary")
+        counterfactual_action_radio = gr.Radio(
+            choices=[(f"Stay (action=0)", 0), (f"Move Right (action=1)", 1)],
+            value=1,
+            label="Counterfactual Last Action",
+            info="What action should we pretend was taken?"
+        )
+        run_counterfactual_btn = gr.Button("🔀 Run Counterfactual Inference", variant="secondary")
 
-    single_canvas_infer_status = gr.Markdown("")
+    counterfactual_status = gr.Markdown("")
 
-    # Single Canvas Inference Visualizations (collapsible)
-    with gr.Accordion("Single Canvas Inference Results", open=False):
-        single_canvas_inference_info = gr.Markdown("")
-        single_canvas_inference_canvas = gr.Plot(label="1. Inference Canvas")
-        single_canvas_inference_masked = gr.Plot(label="2. Canvas with Mask Overlay")
-        single_canvas_inference_full = gr.Plot(label="3. Full Inpainting Output")
-        single_canvas_inference_composite = gr.Plot(label="4. Composite Reconstruction")
+    with gr.Accordion("Counterfactual Results", open=True):
+        # Row 1: True vs Counterfactual canvases side-by-side
+        with gr.Row():
+            counterfactual_true_canvas = gr.Plot(label="True Canvas (Actual Action)")
+            counterfactual_cf_canvas = gr.Plot(label="Counterfactual Canvas (Modified Action)")
+
+        # Row 2: Inference composites side-by-side
+        with gr.Row():
+            counterfactual_true_inference = gr.Plot(label="True Inference (Composite)")
+            counterfactual_cf_inference = gr.Plot(label="Counterfactual Inference (Composite)")
+
+        # Row 3: Difference heatmap and statistics
+        with gr.Row():
+            counterfactual_diff_heatmap = gr.Plot(label="Prediction Difference Heatmap")
+            counterfactual_stats = gr.Markdown("")
 
     gr.Markdown("---")
 
@@ -2794,16 +2892,18 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         outputs=[frame_image, frame_info, frame_slider]
     )
 
-    single_canvas_infer_btn.click(
-        fn=infer_on_single_canvas,
-        inputs=[frame_slider],
+    # Counterfactual testing
+    run_counterfactual_btn.click(
+        fn=run_counterfactual_inference,
+        inputs=[frame_slider, counterfactual_action_radio],
         outputs=[
-            single_canvas_infer_status,
-            single_canvas_inference_info,
-            single_canvas_inference_canvas,
-            single_canvas_inference_masked,
-            single_canvas_inference_full,
-            single_canvas_inference_composite,
+            counterfactual_status,
+            counterfactual_true_canvas,
+            counterfactual_cf_canvas,
+            counterfactual_true_inference,
+            counterfactual_cf_inference,
+            counterfactual_diff_heatmap,
+            counterfactual_stats,
         ]
     )
 
