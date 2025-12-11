@@ -105,6 +105,15 @@ def parse_args():
         help='Random seed for reproducibility (optional)'
     )
 
+    # Periodic reinitialization
+    parser.add_argument(
+        '--reinit-interval',
+        type=int,
+        default=None,
+        metavar='N',
+        help='Reinitialize dot position every N steps (disabled by default)'
+    )
+
     args = parser.parse_args()
 
     # Validate arguments
@@ -135,6 +144,9 @@ def parse_args():
     if args.num_val_sessions < 0:
         parser.error('--num-val-sessions must be non-negative')
 
+    if args.reinit_interval is not None and args.reinit_interval < 1:
+        parser.error('--reinit-interval must be at least 1')
+
     return args
 
 
@@ -148,7 +160,8 @@ def record_session(
     max_duration: int,
     session_seed: int,
     action_seed: int,
-    desc: str
+    desc: str,
+    reinit_interval: int = None
 ) -> Dict:
     """
     Record a single session.
@@ -164,6 +177,7 @@ def record_session(
         session_seed: Seed for robot/environment
         action_seed: Seed for action selector
         desc: Description for progress bar
+        reinit_interval: Reinitialize dot position every N steps (or None to disable)
 
     Returns:
         Dictionary with session statistics
@@ -195,6 +209,10 @@ def record_session(
     # Execute steps
     start_time = time.time()
     for step in tqdm(range(num_steps), desc=desc):
+        # Periodic reinitialization (before getting observation)
+        if reinit_interval is not None and step > 0 and step % reinit_interval == 0:
+            recording_robot.robot.reset()
+
         # Get observation
         obs = recording_robot.get_observation()
 
@@ -321,6 +339,7 @@ def main():
     print(f"  Y-position: {y_mode}")
     print(f"  X-position: Training={train_x_mode}, Validation={val_x_mode}")
     print(f"  Action duration: {args.min_duration}-{args.max_duration} steps")
+    print(f"  Reinit interval: {f'every {args.reinit_interval} steps' if args.reinit_interval is not None else 'disabled'}")
     print(f"  Training: {args.num_train_sessions} sessions × {args.train_steps} steps = {args.num_train_sessions * args.train_steps} total steps")
     print(f"  Validation: {args.num_val_sessions} sessions × {args.val_steps} steps = {args.num_val_sessions * args.val_steps} total steps")
     print(f"  Random seed: {args.seed if args.seed is not None else 'None (random)'}")
@@ -360,7 +379,8 @@ def main():
                 max_duration=args.max_duration,
                 session_seed=session_seed,
                 action_seed=action_seed,
-                desc=desc
+                desc=desc,
+                reinit_interval=args.reinit_interval
             )
 
             train_stats.append(stats)
@@ -396,7 +416,8 @@ def main():
                 max_duration=args.max_duration,
                 session_seed=session_seed,
                 action_seed=action_seed,
-                desc=desc
+                desc=desc,
+                reinit_interval=args.reinit_interval
             )
 
             val_stats.append(stats)

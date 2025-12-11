@@ -223,12 +223,14 @@ def load_session(session_choice):
 
     info += "\n\n**World model initialized and ready to run**"
 
-    return info, first_frame, frame_info, 0, max_frames
+    return info, first_frame, frame_info
 
 def update_frame(frame_idx):
     """Update frame display"""
     if not session_state.get("observations"):
         return None, ""
+
+    frame_idx = int(frame_idx)  # Convert to int (Gradio sliders pass floats)
 
     observations = session_state["observations"]
     if frame_idx >= len(observations):
@@ -2539,9 +2541,6 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     # Frame Navigation
     with gr.Row():
-        frame_slider = gr.Slider(minimum=0, maximum=100, value=0, step=1, label="Frame", interactive=True)
-
-    with gr.Row():
         frame_number_input = gr.Number(value=0, label="Jump to Frame", precision=0)
         jump_btn = gr.Button("Jump", size="sm")
 
@@ -2853,7 +2852,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     load_session_btn.click(
         fn=load_session,
         inputs=[session_dropdown],
-        outputs=[session_info, frame_image, frame_info, frame_slider, frame_slider]
+        outputs=[session_info, frame_image, frame_info]
     )
 
     # Checkpoint management event handlers
@@ -2875,27 +2874,21 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         outputs=[load_checkpoint_status]
     )
 
-    frame_slider.change(
-        fn=update_frame,
-        inputs=[frame_slider],
-        outputs=[frame_image, frame_info]
-    )
-
     def jump_to_frame(frame_num):
         frame_num = int(frame_num)
         img, info = update_frame(frame_num)
-        return img, info, frame_num
+        return img, info
 
     jump_btn.click(
         fn=jump_to_frame,
         inputs=[frame_number_input],
-        outputs=[frame_image, frame_info, frame_slider]
+        outputs=[frame_image, frame_info]
     )
 
     # Counterfactual testing
     run_counterfactual_btn.click(
         fn=run_counterfactual_inference,
-        inputs=[frame_slider, counterfactual_action_radio],
+        inputs=[frame_number_input, counterfactual_action_radio],
         outputs=[
             counterfactual_status,
             counterfactual_true_canvas,
@@ -2922,7 +2915,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     single_canvas_train_btn.click(
         fn=train_on_single_canvas,
-        inputs=[frame_slider, single_canvas_training_steps],
+        inputs=[frame_number_input, single_canvas_training_steps],
         outputs=[
             single_canvas_status,
             single_canvas_training_info,
@@ -2951,7 +2944,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     # Batch training handler (takes current slider value as input)
     run_batch_btn.click(
         fn=run_world_model_batch,
-        inputs=[total_samples_input, batch_size_input, frame_slider, update_interval_input,
+        inputs=[total_samples_input, batch_size_input, frame_number_input, update_interval_input,
                 window_size_input, num_random_obs_input, num_best_models_input],
         outputs=[
             batch_training_status,
@@ -2967,7 +2960,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     generate_attn_btn.click(
         fn=generate_attention_visualization,
         inputs=[
-            frame_slider,
+            frame_number_input,
             attn_selection_mode,
             attn_brightness_threshold,
             attn_manual_patches,
