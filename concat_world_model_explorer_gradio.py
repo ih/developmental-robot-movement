@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import gradio as gr
 from datetime import datetime
 from pathlib import Path
+import wandb
 
 import config
 import world_model_utils
@@ -1116,7 +1117,8 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
         return False, error_msg, auto_saved_checkpoints
 
 def run_world_model_batch(total_samples, batch_size, current_observation_idx, update_interval=100,
-                          window_size=10, num_random_obs=5, num_best_models_to_keep=3):
+                          window_size=10, num_random_obs=5, num_best_models_to_keep=3,
+                          enable_wandb=False, wandb_run_name=""):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -1128,6 +1130,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         window_size: Number of recent checkpoints for rolling window plot (default: 10)
         num_random_obs: Number of random observations to visualize (default: 5)
         num_best_models_to_keep: Number of best model checkpoints to keep (default: 3)
+        enable_wandb: Whether to log metrics to Weights & Biases (default: False)
+        wandb_run_name: Optional custom name for wandb run (default: "")
 
     Yields:
         Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
@@ -1262,6 +1266,37 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     # Track total training time
     training_start_time = time.time()
 
+    # Initialize wandb if enabled
+    if enable_wandb:
+        try:
+            wandb.init(
+                project="developmental-robot-movement",
+                name=wandb_run_name if wandb_run_name else None,  # auto-generate if empty
+                config={
+                    "total_samples": total_samples,
+                    "batch_size": batch_size,
+                    "base_lr": base_lr,
+                    "scaled_lr": scaled_lr,
+                    "warmup_steps": scaled_warmup_steps,
+                    "total_gradient_updates": num_gradient_updates,
+                    "update_interval": update_interval,
+                    "session_name": session_state.get("session_name", "unknown"),
+                    "frame_size": config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+                    "separator_width": config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+                    "canvas_history_size": config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+                    "patch_size": config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
+                    "weight_decay": config.AutoencoderConcatPredictorWorldModelConfig.WEIGHT_DECAY,
+                    "lr_min_ratio": config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO,
+                    "focal_beta": config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA,
+                    "focal_loss_alpha": config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
+                }
+            )
+            print(f"[WANDB] Initialized run: {wandb.run.name}")
+        except Exception as e:
+            print(f"[WANDB WARNING] Failed to initialize wandb: {str(e)}")
+            print("[WANDB WARNING] Continuing training without wandb logging")
+            enable_wandb = False  # Disable wandb for rest of training
+
     # Training loop
     world_model.autoencoder.train()
 
@@ -1301,11 +1336,22 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         next_canvas = None
 
                 # Train on current batch
-                loss, _ = world_model.autoencoder.train_on_canvas(
+                loss, grad_diagnostics = world_model.autoencoder.train_on_canvas(
                     canvas_tensor, patch_mask, world_model.ae_optimizer
                 )
                 world_model.ae_scheduler.step()
                 samples_seen += canvas_tensor.shape[0]
+
+                # Log per-batch metrics to wandb
+                if enable_wandb:
+                    try:
+                        wandb.log({
+                            "train/loss_hybrid": loss,
+                            "train/samples_seen": samples_seen,
+                            "train/learning_rate": world_model.ae_optimizer.param_groups[0]['lr'],
+                        }, step=samples_seen)
+                    except Exception as e:
+                        print(f"[WANDB WARNING] Failed to log per-batch metrics: {str(e)}")
 
                 if batch_count <= 5 or batch_count % 10 == 0:
                     print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{total_samples}, loss={loss:.6f}")
@@ -1328,6 +1374,28 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         if success:
                             print(f"[AUTO-SAVE] {save_msg}")
 
+                    # Log gradient diagnostics and additional metrics to wandb
+                    if enable_wandb and grad_diagnostics:
+                        try:
+                            wandb.log({
+                                "gradients/head_weight_norm": grad_diagnostics.get('head_weight_norm'),
+                                "gradients/head_bias_norm": grad_diagnostics.get('head_bias_norm'),
+                                "gradients/mask_token_norm": grad_diagnostics.get('mask_token_norm'),
+                                "gradients/qkv_weight_norm": grad_diagnostics.get('qkv_weight_norm'),
+                                "loss/plain": grad_diagnostics.get('loss_plain'),
+                                "loss/focal": grad_diagnostics.get('loss_focal'),
+                                "loss/standard": grad_diagnostics.get('loss_standard'),
+                                "loss/nonblack": grad_diagnostics.get('loss_nonblack'),
+                                "loss/black_baseline": grad_diagnostics.get('black_baseline'),
+                                "loss/frac_nonblack": grad_diagnostics.get('frac_nonblack'),
+                                "focal/weight_mean": grad_diagnostics.get('focal_weight_mean'),
+                                "focal/weight_max": grad_diagnostics.get('focal_weight_max'),
+                                "train/best_loss": best_loss,
+                                "train/elapsed_time": elapsed_time,
+                            }, step=samples_seen)
+                        except Exception as e:
+                            print(f"[WANDB WARNING] Failed to log gradient diagnostics: {str(e)}")
+
                     # Status message
                     current_lr = world_model.ae_optimizer.param_groups[0]['lr']
                     status_msg = f"📊 **Training Progress**\n\n"
@@ -1338,11 +1406,22 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
-                    yield generate_batch_training_update(
+                    update_result = generate_batch_training_update(
                         samples_seen, total_samples, cumulative_metrics,
                         status_msg, None, None, current_observation_idx,
                         window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
                     )
+
+                    # Log observation samples visualization to wandb
+                    if enable_wandb and len(update_result) > 6 and update_result[6] is not None:
+                        try:
+                            wandb.log({
+                                "visualizations/observation_samples": wandb.Image(update_result[6]),
+                            }, step=samples_seen)
+                        except Exception as e:
+                            print(f"[WANDB WARNING] Failed to log observation samples: {str(e)}")
+
+                    yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
 
             print(f"[DEBUG] Exited training loop: batches_processed={batch_count}, samples_seen={samples_seen}, total_samples={total_samples}")
@@ -1358,11 +1437,22 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     break
 
                 # Train on batch
-                loss, _ = world_model.autoencoder.train_on_canvas(
+                loss, grad_diagnostics = world_model.autoencoder.train_on_canvas(
                     canvas_tensor, patch_mask, world_model.ae_optimizer
                 )
                 world_model.ae_scheduler.step()
                 samples_seen += canvas_tensor.shape[0]
+
+                # Log per-batch metrics to wandb
+                if enable_wandb:
+                    try:
+                        wandb.log({
+                            "train/loss_hybrid": loss,
+                            "train/samples_seen": samples_seen,
+                            "train/learning_rate": world_model.ae_optimizer.param_groups[0]['lr'],
+                        }, step=samples_seen)
+                    except Exception as e:
+                        print(f"[WANDB WARNING] Failed to log per-batch metrics: {str(e)}")
 
                 # Check for NaN loss
                 if torch.isnan(torch.tensor(loss)) or torch.isinf(torch.tensor(loss)):
@@ -1394,6 +1484,28 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         if success:
                             print(f"[AUTO-SAVE] {save_msg}")
 
+                    # Log gradient diagnostics and additional metrics to wandb
+                    if enable_wandb and grad_diagnostics:
+                        try:
+                            wandb.log({
+                                "gradients/head_weight_norm": grad_diagnostics.get('head_weight_norm'),
+                                "gradients/head_bias_norm": grad_diagnostics.get('head_bias_norm'),
+                                "gradients/mask_token_norm": grad_diagnostics.get('mask_token_norm'),
+                                "gradients/qkv_weight_norm": grad_diagnostics.get('qkv_weight_norm'),
+                                "loss/plain": grad_diagnostics.get('loss_plain'),
+                                "loss/focal": grad_diagnostics.get('loss_focal'),
+                                "loss/standard": grad_diagnostics.get('loss_standard'),
+                                "loss/nonblack": grad_diagnostics.get('loss_nonblack'),
+                                "loss/black_baseline": grad_diagnostics.get('black_baseline'),
+                                "loss/frac_nonblack": grad_diagnostics.get('frac_nonblack'),
+                                "focal/weight_mean": grad_diagnostics.get('focal_weight_mean'),
+                                "focal/weight_max": grad_diagnostics.get('focal_weight_max'),
+                                "train/best_loss": best_loss,
+                                "train/elapsed_time": elapsed_time,
+                            }, step=samples_seen)
+                        except Exception as e:
+                            print(f"[WANDB WARNING] Failed to log gradient diagnostics: {str(e)}")
+
                     # Status message
                     current_lr = world_model.ae_optimizer.param_groups[0]['lr']
                     status_msg = f"📊 **Training Progress**\n\n"
@@ -1404,11 +1516,22 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
-                    yield generate_batch_training_update(
+                    update_result = generate_batch_training_update(
                         samples_seen, total_samples, cumulative_metrics,
                         status_msg, None, None, current_observation_idx,
                         window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
                     )
+
+                    # Log observation samples visualization to wandb
+                    if enable_wandb and len(update_result) > 6 and update_result[6] is not None:
+                        try:
+                            wandb.log({
+                                "visualizations/observation_samples": wandb.Image(update_result[6]),
+                            }, step=samples_seen)
+                        except Exception as e:
+                            print(f"[WANDB WARNING] Failed to log observation samples: {str(e)}")
+
+                    yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
 
             print(f"[DEBUG] Exited training loop (fallback): batches_processed={batch_count}, samples_seen={samples_seen}, total_samples={total_samples}")
@@ -1433,6 +1556,38 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         final_lr = world_model.ae_optimizer.param_groups[0]['lr']
         status_msg += f"\n\n📊 **Final Learning Rate**: {final_lr:.6e}"
 
+        # Log full-session evaluation metrics to wandb
+        if enable_wandb and stats:
+            try:
+                wandb.log({
+                    "eval/loss_hybrid_mean": stats['hybrid']['mean'],
+                    "eval/loss_hybrid_median": stats['hybrid']['median'],
+                    "eval/loss_hybrid_std": stats['hybrid']['std'],
+                    "eval/loss_hybrid_min": stats['hybrid']['min'],
+                    "eval/loss_hybrid_max": stats['hybrid']['max'],
+                    "eval/loss_hybrid_p25": stats['hybrid']['p25'],
+                    "eval/loss_hybrid_p75": stats['hybrid']['p75'],
+                    "eval/loss_hybrid_p90": stats['hybrid']['p90'],
+                    "eval/loss_hybrid_p95": stats['hybrid']['p95'],
+                    "eval/loss_hybrid_p99": stats['hybrid']['p99'],
+                    "eval/loss_standard_mean": stats['standard']['mean'],
+                    "eval/loss_standard_median": stats['standard']['median'],
+                    "eval/loss_standard_std": stats['standard']['std'],
+                    "eval/final_lr": final_lr,
+                }, step=samples_seen)
+
+                # Log evaluation visualizations
+                if fig_loss is not None:
+                    wandb.log({
+                        "visualizations/eval_loss_over_time": wandb.Image(fig_loss),
+                    }, step=samples_seen)
+                if fig_dist is not None:
+                    wandb.log({
+                        "visualizations/eval_loss_distribution": wandb.Image(fig_dist),
+                    }, step=samples_seen)
+            except Exception as e:
+                print(f"[WANDB WARNING] Failed to log evaluation metrics: {str(e)}")
+
         # Calculate total elapsed time
         total_elapsed_time = time.time() - training_start_time
 
@@ -1444,9 +1599,26 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         )
         print(f"[DEBUG] Training generator complete")
 
+        # Finish wandb run on successful completion
+        if enable_wandb:
+            try:
+                wandb.finish()
+                print("[WANDB] Run finished successfully")
+            except Exception as e:
+                print(f"[WANDB WARNING] Error finishing wandb run: {str(e)}")
+
     except Exception as e:
         import traceback
         error_msg = f"Error during training: {str(e)}\n\n{traceback.format_exc()}"
+
+        # Finish wandb run on error
+        if enable_wandb:
+            try:
+                wandb.finish(exit_code=1)
+                print("[WANDB] Run finished with error")
+            except Exception as wandb_err:
+                print(f"[WANDB WARNING] Error finishing wandb run: {str(wandb_err)}")
+
         yield error_msg, None, None, None, None, "", None
 
 def parse_manual_patch_indices(manual_patches_str):
@@ -2418,6 +2590,19 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Maximum number of best model checkpoints to keep (auto-deletes worse models)"
         )
 
+    # Weights & Biases logging controls
+    with gr.Row():
+        enable_wandb_input = gr.Checkbox(
+            label="Enable Weights & Biases Logging",
+            value=False,
+            info="Log metrics and visualizations to wandb during training"
+        )
+        wandb_run_name_input = gr.Textbox(
+            label="W&B Run Name (optional)",
+            placeholder="Auto-generated if empty",
+            info="Custom name for this wandb run"
+        )
+
     # Training info display (dynamically updated)
     training_info_display = gr.Markdown("")
 
@@ -2688,7 +2873,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     run_batch_btn.click(
         fn=run_world_model_batch,
         inputs=[total_samples_input, batch_size_input, frame_number_input, update_interval_input,
-                window_size_input, num_random_obs_input, num_best_models_input],
+                window_size_input, num_random_obs_input, num_best_models_input,
+                enable_wandb_input, wandb_run_name_input],
         outputs=[
             batch_training_status,
             loss_vs_samples_plot,
