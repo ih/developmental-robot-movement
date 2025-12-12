@@ -1,62 +1,66 @@
 """
 Filter Validation Set to Remove Training Overlap
 
-Removes samples from validation session that have (x, y) positions
-that were seen in the training session, ensuring true OOD validation.
+Removes samples from validation session that have (frame_hash, last_action)
+pairs that were seen in the training session, ensuring true OOD validation.
 """
 
 import argparse
 import os
+import hashlib
 from datetime import datetime
-from typing import Set, Tuple, List
+from typing import Set, Tuple, List, Optional
 import numpy as np
 from tqdm import tqdm
 
 from recording_reader import RecordingReader
 from recording_writer import RecordingWriter
-from toroidal_dot_env import ToroidalDotEnvironment
 import config
 
 
-def extract_samples_from_session(
-    session_path: str,
-    initial_x: int,
-    initial_y: int
-) -> List[Tuple[Tuple[int, int], int]]:
+def compute_frame_hash(frame_path: str, session_dir: str) -> str:
+    """Compute MD5 hash of frame image bytes.
+
+    Args:
+        frame_path: Relative path to frame within session
+        session_dir: Path to session directory
+
+    Returns:
+        MD5 hash as hexadecimal string
     """
-    Extract all (position, last_action) samples from a recorded session.
+    full_path = os.path.join(session_dir, frame_path)
+    with open(full_path, 'rb') as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+
+def extract_samples_from_session(session_path: str) -> List[Tuple[str, Optional[int]]]:
+    """
+    Extract all (frame_hash, last_action) samples from a recorded session.
 
     Args:
         session_path: Path to recorded session
-        initial_x: Initial x position
-        initial_y: Initial y position
 
     Returns:
-        List of ((x, y), last_action) tuples for each observation.
+        List of (frame_md5_hash, last_action) tuples for each observation.
         First observation has last_action=None.
     """
     reader = RecordingReader(session_path)
 
-    # Create environment with same initial position
-    env = ToroidalDotEnvironment(
-        initial_x=initial_x,
-        initial_y=initial_y
-    )
-
     samples = []
     last_action = None
 
-    # Track (position, last_action) for each observation
+    # Track (frame_hash, last_action) for each observation
     # Session structure: obs0, action0, obs1, action1, obs2, ...
     for event in reader.events:
         if event['type'] == 'observation':
-            # Record current position with the action that led to it
-            position = env.get_position()
-            samples.append((position, last_action))
+            # Hash the frame content
+            frame_path = event['data']['frame_path']
+            frame_hash = compute_frame_hash(frame_path, session_path)
+            # Record frame hash with the action that led to it
+            samples.append((frame_hash, last_action))
         elif event['type'] == 'action':
-            # Execute action and remember it
+            # Remember the action
             action_value = event['data']['action']
-            env.step(action_value)
             last_action = action_value
 
     return samples
@@ -65,59 +69,43 @@ def extract_samples_from_session(
 def filter_validation_session(
     train_session_path: str,
     val_session_path: str,
-    train_initial_x: int,
-    train_initial_y: int,
-    val_initial_x: int,
-    val_initial_y: int,
     output_dir: str = None
 ) -> None:
     """
-    Create filtered validation session removing positions seen in training.
+    Create filtered validation session removing frames seen in training.
 
     Args:
         train_session_path: Path to training session
         val_session_path: Path to validation session
-        train_initial_x: Training initial x position
-        train_initial_y: Training initial y position
-        val_initial_x: Validation initial x position
-        val_initial_y: Validation initial y position
         output_dir: Directory for filtered session (default: same as val session)
     """
     print("=" * 70)
     print("Validation Set Overlap Filter")
     print("=" * 70)
 
-    # Extract (position, last_action) samples from both sessions
+    # Extract (frame_hash, last_action) samples from both sessions
     print(f"\n[1/4] Extracting samples from training session...")
-    train_samples = extract_samples_from_session(
-        train_session_path,
-        train_initial_x,
-        train_initial_y
-    )
+    train_samples = extract_samples_from_session(train_session_path)
     # Exclude first sample (has no previous action) from training set
     train_samples_filtered = [s for s in train_samples if s[1] is not None]
     train_sample_set = set(train_samples_filtered)
     print(f"  Training session: {len(train_samples)} total observations")
     print(f"  Training samples (with last_action): {len(train_samples_filtered)}")
-    print(f"  Unique (position, last_action) pairs: {len(train_sample_set)}")
+    print(f"  Unique (frame_hash, last_action) pairs: {len(train_sample_set)}")
 
     print(f"\n[2/4] Extracting samples from validation session...")
-    val_samples = extract_samples_from_session(
-        val_session_path,
-        val_initial_x,
-        val_initial_y
-    )
+    val_samples = extract_samples_from_session(val_session_path)
     # Exclude first sample (has no previous action) from validation set
     val_samples_filtered = [s for s in val_samples if s[1] is not None]
     val_sample_set = set(val_samples_filtered)
     print(f"  Validation session: {len(val_samples)} total observations")
     print(f"  Validation samples (with last_action): {len(val_samples_filtered)}")
-    print(f"  Unique (position, last_action) pairs: {len(val_sample_set)}")
+    print(f"  Unique (frame_hash, last_action) pairs: {len(val_sample_set)}")
 
     # Find overlap
     print(f"\n[3/4] Analyzing overlap...")
     overlap = train_sample_set & val_sample_set
-    print(f"  Overlapping (position, last_action) pairs: {len(overlap)}")
+    print(f"  Overlapping (frame_hash, last_action) pairs: {len(overlap)}")
     if len(val_sample_set) > 0:
         print(f"  Overlap percentage: {100 * len(overlap) / len(val_sample_set):.1f}%")
     else:
@@ -194,16 +182,14 @@ def filter_validation_session(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Filter validation session to remove training overlap",
+        description="Filter validation session to remove training overlap based on frame content",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Filter specific sessions
   python filter_validation_overlap.py \\
     --train-session saved/sessions/toroidal_dot/session_train \\
-    --val-session saved/sessions/toroidal_dot/session_val \\
-    --train-x 0 --train-y 112 \\
-    --val-x 1 --val-y 112
+    --val-session saved/sessions/toroidal_dot/session_val
 
   # Auto-detect latest random_duration sessions
   python filter_validation_overlap.py --auto-detect
@@ -219,26 +205,6 @@ Examples:
         '--val-session',
         type=str,
         help='Path to validation session directory'
-    )
-    parser.add_argument(
-        '--train-x',
-        type=int,
-        help='Training session initial x position'
-    )
-    parser.add_argument(
-        '--train-y',
-        type=int,
-        help='Training session initial y position'
-    )
-    parser.add_argument(
-        '--val-x',
-        type=int,
-        help='Validation session initial x position'
-    )
-    parser.add_argument(
-        '--val-y',
-        type=int,
-        help='Validation session initial y position'
     )
     parser.add_argument(
         '--output-dir',
@@ -273,72 +239,29 @@ Examples:
         train_session = train_sessions[-1]
         val_session = val_sessions[-1]
 
-        # Parse initial positions from session names
-        # Format: session_random_duration_fixed_yXXX_trainxX_train_...
         train_name = os.path.basename(train_session)
         val_name = os.path.basename(val_session)
 
-        # Extract y position
-        import re
-        train_y_match = re.search(r'fixed_y(\d+)', train_name)
-        val_y_match = re.search(r'fixed_y(\d+)', val_name)
-
-        if not train_y_match or not val_y_match:
-            print("Error: Could not parse y positions from session names")
-            return
-
-        train_y = int(train_y_match.group(1))
-        val_y = int(val_y_match.group(1))
-
-        # Extract x position
-        train_x_match = re.search(r'trainx(\d+)', train_name)
-        val_x_match = re.search(r'valx(\d+)', val_name)
-
-        if not train_x_match or not val_x_match:
-            print("Error: Could not parse x positions from session names")
-            return
-
-        train_x = int(train_x_match.group(1))
-        val_x = int(val_x_match.group(1))
-
         print(f"Auto-detected sessions:")
         print(f"  Training: {train_name}")
-        print(f"    Position: x={train_x}, y={train_y}")
         print(f"  Validation: {val_name}")
-        print(f"    Position: x={val_x}, y={val_y}")
         print()
 
         filter_validation_session(
             train_session,
             val_session,
-            train_x,
-            train_y,
-            val_x,
-            val_y,
             args.output_dir
         )
     else:
-        # Manual mode - require all arguments
-        if not all([
-            args.train_session,
-            args.val_session,
-            args.train_x is not None,
-            args.train_y is not None,
-            args.val_x is not None,
-            args.val_y is not None
-        ]):
+        # Manual mode - require session paths
+        if not all([args.train_session, args.val_session]):
             parser.error(
-                "All of --train-session, --val-session, --train-x, --train-y, "
-                "--val-x, --val-y are required unless using --auto-detect"
+                "Both --train-session and --val-session are required unless using --auto-detect"
             )
 
         filter_validation_session(
             args.train_session,
             args.val_session,
-            args.train_x,
-            args.train_y,
-            args.val_x,
-            args.val_y,
             args.output_dir
         )
 

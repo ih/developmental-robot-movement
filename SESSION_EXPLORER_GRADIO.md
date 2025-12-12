@@ -260,7 +260,7 @@ The model learns to inpaint the masked frame based on history and action separat
 
 The Gradio app is structured with clear function definitions:
 - `load_session()`: Session loading logic
-- `run_world_model()`: World model execution with progress tracking
+- `run_world_model_batch()`: Batch training with periodic progress updates and final evaluation
 - `update_attention_viz()`: Attention visualization generation
 
 To add new features:

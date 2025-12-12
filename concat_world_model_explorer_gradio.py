@@ -2,7 +2,7 @@
 Concat World Model Explorer Gradio App
 
 A web-based UI for running AutoencoderConcatPredictorWorldModel on recorded robot sessions.
-Allows running the world model for N iterations and visualizing training and prediction results.
+Allows batch training with periodic progress updates and final full-session evaluation.
 """
 
 import os
@@ -59,7 +59,6 @@ print(f"Using device: {device}")
 # Global state
 session_state = {}
 world_model = None
-replay_robot = None
 current_checkpoint_name = None
 
 def format_loss(loss_value):
@@ -1054,264 +1053,6 @@ def train_on_single_canvas(frame_idx, num_training_steps):
 
     return status_msg, training_info, grad_diag_info, fig_loss_history, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite
 
-def run_world_model(num_iterations):
-    """Run the world model for N iterations with live metrics tracking and periodic UI updates"""
-    global world_model, replay_robot
-
-    if world_model is None:
-        yield "Please load a session first", "", "", None, None, None, None, None, None, None, None, "", "--"
-        return
-
-    if num_iterations <= 0:
-        yield "Number of iterations must be greater than 0", "", "", None, None, None, None, None, None, None, None, "", "--"
-        return
-
-    # Initialize or retrieve metrics history
-    if not hasattr(world_model, '_metrics_history'):
-        world_model._metrics_history = {
-            'iteration': [],
-            'training_loss': [],
-            'prediction_error': [],
-            'iteration_time': [],
-        }
-
-    # Helper function to generate all visualizations
-    def generate_visualizations(loop_count, completed=False):
-        """Generate all plots and metrics for current state"""
-
-        # Get final state from world model's stored state
-        last_prediction_np = world_model.last_prediction
-        current_frame_np = None
-        prediction_error = None
-
-        # Get current frame from history
-        if len(world_model.interleaved_history) > 0:
-            for idx in range(len(world_model.interleaved_history) - 1, -1, -1):
-                if idx % 2 == 0:  # Even indices are frames
-                    current_frame_np = world_model.interleaved_history[idx]
-                    break
-
-        if current_frame_np is not None and last_prediction_np is not None:
-            import world_model_utils
-            pred_tensor = world_model_utils.to_model_tensor(last_prediction_np, device)
-            curr_tensor = world_model_utils.to_model_tensor(current_frame_np, device)
-            prediction_error = torch.nn.functional.mse_loss(pred_tensor, curr_tensor).item()
-
-        # Create current metrics display
-        current_metrics = ""
-        if len(world_model._metrics_history['iteration']) > 0:
-            current_metrics = f"**Latest Iteration Metrics:**\n\n"
-            current_metrics += f"- Training Loss: {format_loss(world_model.last_training_loss)}\n"
-            current_metrics += f"- Prediction Error: {format_loss(prediction_error)}\n"
-            current_metrics += f"- Iteration Time: {world_model._metrics_history['iteration_time'][-1]:.2f}s\n"
-
-        # Create metrics history plots (3 plots in a row)
-        fig_metrics = None
-        if len(world_model._metrics_history['iteration']) > 0:
-            fig_metrics, axes = plt.subplots(1, 3, figsize=(15, 4))
-
-            # Training Loss over iterations
-            valid_train_loss = [(i, loss) for i, loss in zip(world_model._metrics_history['iteration'],
-                                                              world_model._metrics_history['training_loss']) if loss is not None]
-            if valid_train_loss:
-                iters, losses = zip(*valid_train_loss)
-                axes[0].plot(iters, losses, 'b-o', linewidth=2, markersize=4)
-                axes[0].set_xlabel('Iteration')
-                axes[0].set_ylabel('Training Loss')
-                axes[0].set_title('Training Loss Over Time')
-                axes[0].grid(True, alpha=0.3)
-
-            # Prediction Error over iterations
-            valid_pred_error = [(i, err) for i, err in zip(world_model._metrics_history['iteration'],
-                                                            world_model._metrics_history['prediction_error']) if err is not None]
-            if valid_pred_error:
-                iters, errors = zip(*valid_pred_error)
-                axes[1].plot(iters, errors, 'r-o', linewidth=2, markersize=4)
-                axes[1].set_xlabel('Iteration')
-                axes[1].set_ylabel('Prediction Error (MSE)')
-                axes[1].set_title('Prediction Error Over Time')
-                axes[1].grid(True, alpha=0.3)
-
-            # Iteration Time over iterations
-            axes[2].plot(world_model._metrics_history['iteration'],
-                           world_model._metrics_history['iteration_time'], 'purple', linewidth=2, marker='o', markersize=4)
-            axes[2].set_xlabel('Iteration')
-            axes[2].set_ylabel('Time (seconds)')
-            axes[2].set_title('Iteration Time Over Time')
-            axes[2].grid(True, alpha=0.3)
-
-            plt.tight_layout()
-
-        # Create status message
-        total_iters = len(world_model._metrics_history['iteration'])
-        if completed:
-            status_msg = f"**Completed {num_iterations} iterations** (Total: {total_iters} iterations)"
-        else:
-            status_msg = f"**Running... {total_iters}/{num_iterations} iterations complete**"
-
-        if loop_count > 0:
-            status_msg += f"\n\n*Session looped {loop_count} time{'s' if loop_count > 1 else ''}*"
-
-        # Current frame and prediction
-        fig_frames = None
-        if current_frame_np is not None:
-            if last_prediction_np is not None:
-                fig_frames, axes = plt.subplots(1, 2, figsize=(10, 5))
-                axes[0].imshow(current_frame_np)
-                axes[0].set_title("Current Frame")
-                axes[0].axis("off")
-                axes[1].imshow(last_prediction_np)
-                axes[1].set_title(f"Last Predicted Frame\nError: {format_loss(prediction_error)}")
-                axes[1].axis("off")
-                plt.tight_layout()
-            else:
-                fig_frames, ax = plt.subplots(1, 1, figsize=(5, 5))
-                ax.imshow(current_frame_np)
-                ax.set_title("Current Frame (no prediction)")
-                ax.axis("off")
-                plt.tight_layout()
-
-        # Training canvas visualizations
-        fig_training_canvas = None
-        fig_training_canvas_masked = None
-        fig_training_inpainting_full = None
-        fig_training_inpainting_composite = None
-        training_info = ""
-
-        if world_model.last_training_canvas is not None:
-            # 1. Original training canvas
-            fig_training_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
-            ax.imshow(world_model.last_training_canvas)
-            ax.set_title(f"Training Canvas (Original)")
-            ax.axis("off")
-            plt.tight_layout()
-
-            training_info = f"**Training Loss (Focal):** {format_loss(world_model.last_training_loss)}"
-
-            # Add standard loss if available from diagnostics
-            if world_model.last_grad_diagnostics and 'loss_standard' in world_model.last_grad_diagnostics:
-                std_loss = world_model.last_grad_diagnostics['loss_standard']
-                training_info += f"\n\n**Standard Loss (unweighted):** {format_loss(std_loss)}"
-
-            # Generate additional visualizations if mask is available
-            if world_model.last_training_mask is not None:
-                # 2. Canvas with mask overlay (shows which patches are masked)
-                canvas_with_mask = world_model.get_canvas_with_mask_overlay(
-                    world_model.last_training_canvas,
-                    world_model.last_training_mask
-                )
-                fig_training_canvas_masked, ax = plt.subplots(1, 1, figsize=(12, 4))
-                ax.imshow(canvas_with_mask)
-                ax.set_title("Training Canvas with Mask (Red = Masked Patches)")
-                ax.axis("off")
-                plt.tight_layout()
-
-                # 3. Full model output (what model reconstructs for everything)
-                inpainting_full = world_model.get_canvas_inpainting_full_output(
-                    world_model.last_training_canvas,
-                    world_model.last_training_mask
-                )
-                fig_training_inpainting_full, ax = plt.subplots(1, 1, figsize=(12, 4))
-                ax.imshow(inpainting_full)
-                ax.set_title("Training Inpainting - Full Model Output (All Patches)")
-                ax.axis("off")
-                plt.tight_layout()
-
-                # 4. Composite (original + inpainted masked regions only)
-                inpainting_composite = world_model.get_canvas_inpainting_composite(
-                    world_model.last_training_canvas,
-                    world_model.last_training_mask
-                )
-                fig_training_inpainting_composite, ax = plt.subplots(1, 1, figsize=(12, 4))
-                ax.imshow(inpainting_composite)
-                ax.set_title("Training Inpainting - Composite (Original + Inpainted Masked Regions)")
-                ax.axis("off")
-                plt.tight_layout()
-
-        # Gradient diagnostics
-        grad_diag_info = format_grad_diagnostics(world_model.last_grad_diagnostics)
-
-        # Prediction canvas and predicted frame
-        fig_prediction_canvas = None
-        fig_predicted_frame = None
-
-        if world_model.last_prediction_canvas is not None:
-            fig_prediction_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
-            ax.imshow(world_model.last_prediction_canvas)
-            ax.set_title("Prediction Canvas (with blank slot)")
-            ax.axis("off")
-            plt.tight_layout()
-
-        if last_prediction_np is not None:
-            fig_predicted_frame, ax = plt.subplots(1, 1, figsize=(5, 5))
-            ax.imshow(last_prediction_np)
-            ax.set_title("Predicted Next Frame")
-            ax.axis("off")
-            plt.tight_layout()
-
-        return status_msg, current_metrics, fig_metrics, fig_frames, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite, fig_prediction_canvas, fig_predicted_frame, training_info, grad_diag_info, format_loss(prediction_error)
-
-    try:
-        import time
-        loop_count = 0
-        from config import AutoencoderConcatPredictorWorldModelConfig as Config
-        UPDATE_INTERVAL = Config.GRADIO_UPDATE_INTERVAL  # Update UI every N iterations
-
-        # Run world model with metric tracking and periodic UI updates
-        for i in range(num_iterations):
-            start_time = time.time()
-
-            # Run one iteration, catching StopIteration to loop the session
-            iteration_successful = False
-            while not iteration_successful:
-                try:
-                    world_model.run(max_iterations=1)
-                    iteration_successful = True
-                except StopIteration:
-                    # Session ended, reset reader to loop back to beginning
-                    loop_count += 1
-                    print(f"Session ended at iteration {i+1}/{num_iterations}, looping back to beginning (loop #{loop_count})...")
-                    replay_robot.reader.reset()
-                    world_model.interleaved_history = []
-                    world_model.last_prediction = None
-                    world_model.last_prediction_canvas = None
-
-            iteration_time = time.time() - start_time
-
-            # Get current metrics from world model's stored state
-            last_prediction_np = world_model.last_prediction
-            prediction_error = None
-
-            # Get current frame from history if available
-            if len(world_model.interleaved_history) > 0 and last_prediction_np is not None:
-                for idx in range(len(world_model.interleaved_history) - 1, -1, -1):
-                    if idx % 2 == 0:  # Even indices are frames
-                        import world_model_utils
-                        current_frame_np = world_model.interleaved_history[idx]
-                        pred_tensor = world_model_utils.to_model_tensor(last_prediction_np, device)
-                        curr_tensor = world_model_utils.to_model_tensor(current_frame_np, device)
-                        prediction_error = torch.nn.functional.mse_loss(pred_tensor, curr_tensor).item()
-                        break
-
-            # Record metrics
-            iter_num = len(world_model._metrics_history['iteration']) + 1
-            world_model._metrics_history['iteration'].append(iter_num)
-            world_model._metrics_history['training_loss'].append(world_model.last_training_loss if world_model.last_training_loss else None)
-            world_model._metrics_history['prediction_error'].append(prediction_error)
-            world_model._metrics_history['iteration_time'].append(iteration_time)
-
-            # Periodically yield updates to refresh the UI
-            if (i + 1) % UPDATE_INTERVAL == 0 or (i + 1) == num_iterations:
-                yield generate_visualizations(loop_count, completed=(i + 1) == num_iterations)
-
-        # Final update
-        yield generate_visualizations(loop_count, completed=True)
-
-    except Exception as e:
-        import traceback
-        error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
-        yield error_msg, "", "", None, None, None, None, None, None, None, None, "", "", "--"
-
 def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep):
     """
     Save a best model checkpoint and manage the list to keep only N best models.
@@ -1569,36 +1310,37 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 if batch_count <= 5 or batch_count % 10 == 0:
                     print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{total_samples}, loss={loss:.6f}")
 
-                # Periodic evaluation checkpoint
+                # Periodic progress update (no evaluation)
                 if samples_seen - last_eval_samples >= UPDATE_INTERVAL:
-                    # PAUSE training, run evaluation
-                    status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
-
-                    # Update metrics
-                    cumulative_metrics['samples_seen'].append(samples_seen)
-                    current_loss = stats['hybrid']['mean']
-                    cumulative_metrics['loss_at_sample'].append(current_loss)
                     last_eval_samples = samples_seen
+                    elapsed_time = time.time() - training_start_time
 
-                    # Save best model automatically if loss improved
-                    if current_loss < best_loss:
-                        best_loss = current_loss
+                    # Track training loss for progress plots
+                    cumulative_metrics['samples_seen'].append(samples_seen)
+                    cumulative_metrics['loss_at_sample'].append(loss)
+
+                    # Save best model if loss improved
+                    if loss < best_loss:
+                        best_loss = loss
                         success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
-                            current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep
+                            loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep
                         )
                         if success:
-                            status_msg += f"\n\n{save_msg}"
+                            print(f"[AUTO-SAVE] {save_msg}")
 
-                    # Add current learning rate to status
+                    # Status message
                     current_lr = world_model.ae_optimizer.param_groups[0]['lr']
-                    status_msg += f"\n\n📊 **Current Learning Rate**: {current_lr:.6e}"
+                    status_msg = f"📊 **Training Progress**\n\n"
+                    status_msg += f"- Samples: {samples_seen:,} / {total_samples:,}\n"
+                    status_msg += f"- Current batch loss: {loss:.6f}\n"
+                    status_msg += f"- Best loss: {best_loss:.6f}\n"
+                    status_msg += f"- Learning rate: {current_lr:.6e}\n"
 
-                    # Yield update (includes visualization for currently selected observation)
+                    # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
-                    elapsed_time = time.time() - training_start_time
                     yield generate_batch_training_update(
                         samples_seen, total_samples, cumulative_metrics,
-                        status_msg, fig_loss, fig_dist, current_observation_idx,
+                        status_msg, None, None, current_observation_idx,
                         window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
                     )
                     print(f"[DEBUG] Resumed after yield, continuing training...")
@@ -1634,36 +1376,37 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 if batch_count <= 5 or batch_count % 10 == 0:
                     print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{total_samples}, loss={loss:.6f}")
 
-                # Periodic evaluation checkpoint
+                # Periodic progress update (no evaluation)
                 if samples_seen - last_eval_samples >= UPDATE_INTERVAL:
-                    # PAUSE training, run evaluation
-                    status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
-
-                    # Update metrics
-                    cumulative_metrics['samples_seen'].append(samples_seen)
-                    current_loss = stats['hybrid']['mean']
-                    cumulative_metrics['loss_at_sample'].append(current_loss)
                     last_eval_samples = samples_seen
+                    elapsed_time = time.time() - training_start_time
 
-                    # Save best model automatically if loss improved
-                    if current_loss < best_loss:
-                        best_loss = current_loss
+                    # Track training loss for progress plots
+                    cumulative_metrics['samples_seen'].append(samples_seen)
+                    cumulative_metrics['loss_at_sample'].append(loss)
+
+                    # Save best model if loss improved
+                    if loss < best_loss:
+                        best_loss = loss
                         success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
-                            current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep
+                            loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep
                         )
                         if success:
-                            status_msg += f"\n\n{save_msg}"
+                            print(f"[AUTO-SAVE] {save_msg}")
 
-                    # Add current learning rate to status
+                    # Status message
                     current_lr = world_model.ae_optimizer.param_groups[0]['lr']
-                    status_msg += f"\n\n📊 **Current Learning Rate**: {current_lr:.6e}"
+                    status_msg = f"📊 **Training Progress**\n\n"
+                    status_msg += f"- Samples: {samples_seen:,} / {total_samples:,}\n"
+                    status_msg += f"- Current batch loss: {loss:.6f}\n"
+                    status_msg += f"- Best loss: {best_loss:.6f}\n"
+                    status_msg += f"- Learning rate: {current_lr:.6e}\n"
 
-                    # Yield update
+                    # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
-                    elapsed_time = time.time() - training_start_time
                     yield generate_batch_training_update(
                         samples_seen, total_samples, cumulative_metrics,
-                        status_msg, fig_loss, fig_dist, current_observation_idx,
+                        status_msg, None, None, current_observation_idx,
                         window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
                     )
                     print(f"[DEBUG] Resumed after yield, continuing training...")
