@@ -1,0 +1,565 @@
+"""
+Concat World Model Explorer Gradio App
+
+A web-based UI for running AutoencoderConcatPredictorWorldModel on recorded robot sessions.
+Allows batch training with periodic progress updates and final full-session evaluation.
+"""
+
+import gradio as gr
+
+# Import all modules from the modular package
+from . import (
+    state,
+    session_manager,
+    canvas_ops,
+    inference,
+    evaluation,
+    training,
+    visualization,
+    checkpoint_manager,
+    attention,
+)
+
+
+# Build Gradio interface
+with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# Concat World Model Explorer")
+    gr.Markdown("Run AutoencoderConcatPredictorWorldModel on recorded robot sessions.")
+
+    # Session Selection
+    with gr.Row():
+        session_dropdown = gr.Dropdown(label="Session", choices=[], interactive=True)
+        refresh_btn = gr.Button("🔄 Refresh", size="sm")
+        load_session_btn = gr.Button("Load Session", variant="primary")
+
+    session_info = gr.Markdown("No session loaded.")
+
+    gr.Markdown("---")
+
+    # Model Checkpoint Management
+    gr.Markdown("## Model Checkpoint Management")
+    gr.Markdown("Save and load trained model weights.")
+
+    checkpoint_status = gr.Markdown("**Current checkpoint:** None (using fresh model)")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### Save Model Weights")
+            save_checkpoint_name = gr.Textbox(
+                label="Checkpoint Name",
+                placeholder="e.g., my_model_checkpoint",
+                info="Extension .pth will be added automatically"
+            )
+            save_checkpoint_btn = gr.Button("💾 Save Weights", variant="primary")
+            save_checkpoint_status = gr.Markdown("")
+
+        with gr.Column(scale=1):
+            gr.Markdown("### Load Model Weights")
+            checkpoint_dropdown = gr.Dropdown(
+                label="Select Checkpoint",
+                choices=[],
+                interactive=True
+            )
+            with gr.Row():
+                refresh_checkpoints_btn = gr.Button("🔄 Refresh", size="sm")
+                load_checkpoint_btn = gr.Button("📂 Load Weights", variant="primary", scale=2)
+            load_checkpoint_status = gr.Markdown("")
+
+    gr.Markdown("---")
+
+    # Frame Viewer
+    gr.Markdown("## Current Frame")
+    with gr.Row():
+        with gr.Column(scale=2):
+            frame_image = gr.Image(label="Current Frame", type="pil", interactive=False)
+        with gr.Column(scale=1):
+            frame_info = gr.Markdown("Load a session to view frames.")
+
+    # Frame Navigation
+    with gr.Row():
+        frame_number_input = gr.Number(value=0, label="Jump to Frame", precision=0)
+        jump_btn = gr.Button("Jump", size="sm")
+
+    gr.Markdown("---")
+
+    # Counterfactual Testing
+    gr.Markdown("## Counterfactual Testing")
+    gr.Markdown("Test what the model predicts if the last action before the selected frame was different.")
+
+    with gr.Row():
+        # TODO: Make this dynamic based on the session's action space
+        # Currently hardcoded for toroidal dot environment
+        counterfactual_action_radio = gr.Radio(
+            choices=[(f"Stay (action=0)", 0), (f"Move Right (action=1)", 1)],
+            value=1,
+            label="Counterfactual Last Action",
+            info="What action should we pretend was taken?"
+        )
+        run_counterfactual_btn = gr.Button("🔀 Run Counterfactual Inference", variant="secondary")
+
+    counterfactual_status = gr.Markdown("")
+
+    with gr.Accordion("Counterfactual Results", open=True):
+        # Row 1: True vs Counterfactual canvases side-by-side
+        with gr.Row():
+            counterfactual_true_canvas = gr.Plot(label="True Canvas (Actual Action)")
+            counterfactual_cf_canvas = gr.Plot(label="Counterfactual Canvas (Modified Action)")
+
+        # Row 2: Inference composites side-by-side
+        with gr.Row():
+            counterfactual_true_inference = gr.Plot(label="True Inference (Composite)")
+            counterfactual_cf_inference = gr.Plot(label="Counterfactual Inference (Composite)")
+
+        # Row 3: Difference heatmap and statistics
+        with gr.Row():
+            counterfactual_diff_heatmap = gr.Plot(label="Prediction Difference Heatmap")
+            counterfactual_stats = gr.Markdown("")
+
+    gr.Markdown("---")
+
+    # Full Session Evaluation
+    gr.Markdown("## Full Session Evaluation")
+    gr.Markdown("Evaluate model performance across all observations in the session to get objective metrics for model comparison.")
+
+    with gr.Row():
+        evaluate_session_btn = gr.Button("📊 Evaluate Model on Full Session", variant="primary")
+
+    eval_status = gr.Markdown("")
+
+    # Full Session Evaluation Results (collapsible)
+    with gr.Accordion("Full Session Evaluation Results", open=False):
+        eval_statistics = gr.Markdown("")
+        eval_loss_over_time = gr.Plot(label="Loss Over Observations")
+        eval_distribution = gr.Plot(label="Loss Distribution")
+
+    gr.Markdown("---")
+
+    # Single Canvas Training
+    gr.Markdown("## Train on Single Canvas")
+    gr.Markdown("Train the autoencoder on a canvas built from the selected frame and its history.")
+
+    with gr.Row():
+        single_canvas_training_steps = gr.Number(value=10, label="Training Steps", precision=0, minimum=1)
+        single_canvas_train_btn = gr.Button("Train on Selected Frame", variant="primary")
+
+    single_canvas_status = gr.Markdown("")
+
+    # Single Canvas Training Visualizations (collapsible)
+    with gr.Accordion("Single Canvas Training Results", open=False):
+        single_canvas_training_info = gr.Markdown("")
+        single_canvas_grad_diag = gr.Markdown("")
+        single_canvas_loss_history = gr.Plot(label="Training Loss History")
+        single_canvas_training_canvas = gr.Plot(label="1. Training Canvas")
+        single_canvas_training_masked = gr.Plot(label="2. Canvas with Mask Overlay")
+        single_canvas_inpainting_full = gr.Plot(label="3. Full Inpainting Output")
+        single_canvas_inpainting_composite = gr.Plot(label="4. Composite Reconstruction")
+
+    gr.Markdown("---")
+
+    # ========== BATCH TRAINING SECTION ==========
+    gr.Markdown("---")
+    gr.Markdown("## Run World Model (Batch Training)")
+    gr.Markdown("Train the model on batches of observations with periodic full-session evaluation.")
+
+    with gr.Row():
+        total_samples_input = gr.Number(
+            value=10000000,
+            label="Total Samples",
+            precision=0,
+            minimum=1,
+            interactive=True,
+            info="Number of training samples (loops through session if needed)"
+        )
+        batch_size_input = gr.Number(
+            value=64,
+            label="Batch Size",
+            precision=0,
+            minimum=1,
+            interactive=True,
+            info="Samples per batch"
+        )
+        update_interval_input = gr.Number(
+            value=2000,
+            label="Update Interval",
+            precision=0,
+            minimum=10,
+            interactive=True,
+            info="Evaluate every N samples (lower = more frequent updates)"
+        )
+        window_size_input = gr.Number(
+            value=500,
+            label="Rolling Window Size",
+            precision=0,
+            minimum=1,
+            interactive=True,
+            info="Number of recent checkpoints to show in rolling window graph"
+        )
+        num_random_obs_input = gr.Number(
+            value=2,
+            label="Random Observations to Visualize",
+            precision=0,
+            minimum=1,
+            maximum=20,
+            interactive=True,
+            info="Number of random observations to sample and visualize on each update"
+        )
+        num_best_models_input = gr.Number(
+            value=3,
+            label="Best Models to Keep",
+            precision=0,
+            minimum=1,
+            maximum=10,
+            interactive=True,
+            info="Maximum number of best model checkpoints to keep (auto-deletes worse models)"
+        )
+
+    # Weights & Biases logging controls
+    with gr.Row():
+        enable_wandb_input = gr.Checkbox(
+            label="Enable Weights & Biases Logging",
+            value=False,
+            info="Log metrics and visualizations to wandb during training"
+        )
+        wandb_run_name_input = gr.Textbox(
+            label="W&B Run Name (optional)",
+            placeholder="Auto-generated if empty",
+            info="Custom name for this wandb run"
+        )
+
+    # Training info display (dynamically updated)
+    training_info_display = gr.Markdown("")
+
+    with gr.Row():
+        run_batch_btn = gr.Button("🚀 Run Batch Training", variant="primary")
+
+    batch_training_status = gr.Markdown("")
+
+    gr.Markdown("---")
+
+    # Training Progress
+    gr.Markdown("## Training Progress")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            loss_vs_samples_plot = gr.Plot(label="Loss vs Samples Seen (Full History)")
+        with gr.Column(scale=1):
+            loss_vs_recent_plot = gr.Plot(label="Loss vs Recent Checkpoints (Rolling Window)")
+
+    gr.Markdown("---")
+
+    # Training Observation Samples
+    gr.Markdown("---")
+
+    gr.Markdown("## Training Observation Samples")
+    gr.Markdown("Random observations + current frame, re-sampled on each training update.")
+
+    observation_samples_status = gr.Markdown("")
+    observation_samples_plot = gr.Plot(label="Observation Samples (Original + Composite Grid)")
+
+    gr.Markdown("---")
+
+    # Latest Evaluation Results
+    gr.Markdown("## Latest Evaluation Results")
+    gr.Markdown("Most recent full-session evaluation from training.")
+
+    latest_eval_loss_plot = gr.Plot(label="Loss Over Session")
+    latest_eval_dist_plot = gr.Plot(label="Loss Distribution")
+
+    gr.Markdown("---")
+
+    # Attention Visualization
+    gr.Markdown("## Decoder Attention Visualization")
+    gr.Markdown("Visualize decoder attention FROM selected patches TO all other patches.")
+    gr.Markdown("*Note: Uses the currently selected frame to build a canvas and run inference to get attention.*")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### Controls")
+
+            # Patch selection mode
+            attn_selection_mode = gr.Radio(
+                choices=["Automatic Dot Detection", "Manual Selection"],
+                value="Automatic Dot Detection",
+                label="Patch Selection Mode"
+            )
+
+            # Brightness threshold for automatic detection
+            attn_brightness_threshold = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                value=0.5,
+                step=0.05,
+                label="Brightness Threshold (for automatic detection)",
+                info="Minimum avg brightness (0-1) to detect dot patches"
+            )
+
+            # Manual patch selection
+            attn_manual_patches = gr.Textbox(
+                label="Manual Patch Indices (for manual selection)",
+                placeholder="e.g., 0,5,10 or 0-10",
+                info="Comma-separated indices or ranges (e.g., 0,5,10-15)"
+            )
+
+            # Visualization type
+            attn_viz_type = gr.Radio(
+                choices=["Patch-to-Patch Lines", "Heatmap Matrix", "Heatmap Overlay on Frame"],
+                value="Patch-to-Patch Lines",
+                label="Visualization Type"
+            )
+
+            # Aggregation method
+            attn_aggregation = gr.Radio(
+                choices=["mean", "max", "sum"],
+                value="mean",
+                label="Head Aggregation Method"
+            )
+
+            # Selected patch aggregation method
+            attn_selected_aggregation = gr.Radio(
+                choices=["mean", "max", "sum"],
+                value="mean",
+                label="Selected Patch Aggregation Method",
+                info="How to aggregate attention from multiple selected patches"
+            )
+
+            # Quantile slider
+            attn_quantile = gr.Slider(
+                minimum=0.0,
+                maximum=100.0,
+                value=95.0,
+                step=1.0,
+                label="Attention Quantile (%)",
+                info="Show top N% of connections (e.g., 95 = show strongest 5%)"
+            )
+
+            # Layer toggles
+            gr.Markdown("**Select Layers to Display:**")
+            attn_layer0 = gr.Checkbox(label="Layer 0", value=True)
+            attn_layer1 = gr.Checkbox(label="Layer 1", value=True)
+            attn_layer2 = gr.Checkbox(label="Layer 2", value=True)
+            attn_layer3 = gr.Checkbox(label="Layer 3", value=True)
+            attn_layer4 = gr.Checkbox(label="Layer 4", value=True)
+
+            # Head toggles
+            gr.Markdown("**Select Attention Heads to Display:**")
+            attn_head0 = gr.Checkbox(label="Head 0", value=True)
+            attn_head1 = gr.Checkbox(label="Head 1", value=True)
+            attn_head2 = gr.Checkbox(label="Head 2", value=True)
+            attn_head3 = gr.Checkbox(label="Head 3", value=True)
+
+            # Generate button
+            generate_attn_btn = gr.Button("Generate Attention Visualization", variant="primary")
+
+        with gr.Column(scale=2):
+            gr.Markdown("### Visualization")
+            attn_status = gr.Markdown("")
+            attn_plot = gr.Plot(label="Attention Visualization")
+            attn_stats = gr.Markdown("")
+
+    gr.Markdown("---")
+
+    # Batch Size Comparison Testing
+    gr.Markdown("## Batch Size Comparison")
+    gr.Markdown(
+        "Compare training efficiency across different batch sizes. "
+        "Each test trains over the same total number of samples for fair comparison."
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            batch_sizes_input = gr.Textbox(
+                value="1,2,4,8,16",
+                label="Batch Sizes to Test",
+                info="Comma-separated (e.g., 1,2,4,8,16)"
+            )
+            comparison_total_samples_input = gr.Number(
+                value=1000,
+                label="Total Samples Per Test",
+                precision=0,
+                minimum=100,
+                info="Same for all batch sizes (fair comparison)"
+            )
+            run_comparison_btn = gr.Button("🔬 Run Batch Comparison", variant="primary")
+
+        with gr.Column(scale=1):
+            comparison_status = gr.Markdown("")
+
+    with gr.Accordion("Batch Comparison Results", open=False):
+        comparison_summary = gr.Markdown("")
+        comparison_time_plot = gr.Plot(label="Total Training Time by Batch Size")
+        comparison_quality_plot = gr.Plot(label="Final Loss by Batch Size")
+        comparison_convergence_plot = gr.Plot(label="Loss Convergence (All Batch Sizes)")
+        comparison_table = gr.Dataframe(label="Detailed Results")
+
+    gr.Markdown("---")
+
+    # Event handlers
+    refresh_btn.click(
+        fn=session_manager.refresh_sessions,
+        inputs=[],
+        outputs=[session_dropdown]
+    )
+
+    load_session_btn.click(
+        fn=session_manager.load_session,
+        inputs=[session_dropdown],
+        outputs=[session_info, frame_image, frame_info]
+    )
+
+    # Checkpoint management event handlers
+    save_checkpoint_btn.click(
+        fn=checkpoint_manager.save_model_weights,
+        inputs=[save_checkpoint_name],
+        outputs=[save_checkpoint_status, checkpoint_dropdown]
+    )
+
+    refresh_checkpoints_btn.click(
+        fn=checkpoint_manager.refresh_checkpoints,
+        inputs=[],
+        outputs=[checkpoint_dropdown]
+    )
+
+    load_checkpoint_btn.click(
+        fn=checkpoint_manager.load_model_weights,
+        inputs=[checkpoint_dropdown],
+        outputs=[load_checkpoint_status]
+    )
+
+    def jump_to_frame(frame_num):
+        frame_num = int(frame_num)
+        img, info = session_manager.update_frame(frame_num)
+        return img, info
+
+    jump_btn.click(
+        fn=jump_to_frame,
+        inputs=[frame_number_input],
+        outputs=[frame_image, frame_info]
+    )
+
+    # Counterfactual testing
+    run_counterfactual_btn.click(
+        fn=inference.run_counterfactual_inference,
+        inputs=[frame_number_input, counterfactual_action_radio],
+        outputs=[
+            counterfactual_status,
+            counterfactual_true_canvas,
+            counterfactual_cf_canvas,
+            counterfactual_true_inference,
+            counterfactual_cf_inference,
+            counterfactual_diff_heatmap,
+            counterfactual_stats,
+        ]
+    )
+
+    # Note: evaluate_full_session now returns 5 values, but we only use 4 in the UI
+    # The 5th value (stats dict) is used internally by run_world_model_batch
+    evaluate_session_btn.click(
+        fn=lambda: evaluation.evaluate_full_session()[:4],  # Take only first 4 return values
+        inputs=[],
+        outputs=[
+            eval_status,
+            eval_loss_over_time,
+            eval_distribution,
+            eval_statistics,
+        ]
+    )
+
+    single_canvas_train_btn.click(
+        fn=training.train_on_single_canvas,
+        inputs=[frame_number_input, single_canvas_training_steps],
+        outputs=[
+            single_canvas_status,
+            single_canvas_training_info,
+            single_canvas_grad_diag,
+            single_canvas_loss_history,
+            single_canvas_training_canvas,
+            single_canvas_training_masked,
+            single_canvas_inpainting_full,
+            single_canvas_inpainting_composite,
+        ]
+    )
+
+    # Dynamic training info update handlers
+    total_samples_input.change(
+        fn=visualization.calculate_training_info,
+        inputs=[total_samples_input, batch_size_input],
+        outputs=[training_info_display]
+    )
+
+    batch_size_input.change(
+        fn=visualization.calculate_training_info,
+        inputs=[total_samples_input, batch_size_input],
+        outputs=[training_info_display]
+    )
+
+    # Batch training handler (takes current slider value as input)
+    run_batch_btn.click(
+        fn=training.run_world_model_batch,
+        inputs=[total_samples_input, batch_size_input, frame_number_input, update_interval_input,
+                window_size_input, num_random_obs_input, num_best_models_input,
+                enable_wandb_input, wandb_run_name_input],
+        outputs=[
+            batch_training_status,
+            loss_vs_samples_plot,
+            loss_vs_recent_plot,
+            latest_eval_loss_plot,
+            latest_eval_dist_plot,
+            observation_samples_status,
+            observation_samples_plot,
+        ]
+    )
+
+    generate_attn_btn.click(
+        fn=attention.generate_attention_visualization,
+        inputs=[
+            frame_number_input,
+            attn_selection_mode,
+            attn_brightness_threshold,
+            attn_manual_patches,
+            attn_quantile,
+            attn_layer0,
+            attn_layer1,
+            attn_layer2,
+            attn_layer3,
+            attn_layer4,
+            attn_head0,
+            attn_head1,
+            attn_head2,
+            attn_head3,
+            attn_aggregation,
+            attn_selected_aggregation,
+            attn_viz_type,
+        ],
+        outputs=[
+            attn_status,
+            attn_plot,
+            attn_stats,
+        ]
+    )
+
+    run_comparison_btn.click(
+        fn=training.run_batch_comparison,
+        inputs=[batch_sizes_input, comparison_total_samples_input],
+        outputs=[
+            comparison_status,
+            comparison_summary,
+            comparison_time_plot,
+            comparison_quality_plot,
+            comparison_convergence_plot,
+            comparison_table,
+        ]
+    )
+
+    # Initialize session dropdown and checkpoint dropdown on load
+    def initialize_ui():
+        sessions = session_manager.refresh_sessions()
+        checkpoints = checkpoint_manager.refresh_checkpoints()
+        # Initialize training info with default values
+        training_info = visualization.calculate_training_info(10000000, 64)
+        return sessions, checkpoints, training_info
+
+    demo.load(
+        fn=initialize_ui,
+        inputs=[],
+        outputs=[session_dropdown, checkpoint_dropdown, training_info_display]
+    )

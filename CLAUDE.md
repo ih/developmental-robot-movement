@@ -11,7 +11,7 @@ This repository contains research code for developmental robot movement with a c
 3. **Toroidal Dot Environment** (`toroidal_dot_env.py`, `toroidal_dot_interface.py`) - Simulated environment with white dot on black background for testing and debugging
 4. **Autoencoder Concat Predictor World Model** (`autoencoder_concat_predictor_world_model.py`) - Canvas-based world model using targeted masked autoencoder with frame concatenation
 5. **Action Selectors** (`toroidal_action_selectors.py`, `recorded_policy.py`) - Pluggable action selection strategies
-6. **Concat World Model Explorer** (`concat_world_model_explorer_gradio.py`) - Interactive web-based interface for exploring and visualizing the concat world model
+6. **Concat World Model Explorer** (`concat_world_model_explorer/`) - Modular web-based interface for exploring and visualizing the concat world model
 
 ## Architecture
 
@@ -63,7 +63,19 @@ This repository contains research code for developmental robot movement with a c
 ## Key Components
 
 ### Concat World Model Explorer
-- **concat_world_model_explorer_gradio.py**: Web-based Gradio interface for running AutoencoderConcatPredictorWorldModel on recorded toroidal dot sessions
+- **concat_world_model_explorer/**: Modular web-based Gradio interface for running AutoencoderConcatPredictorWorldModel on recorded toroidal dot sessions
+  - Refactored from monolithic script into organized package structure
+  - `app.py`: Main Gradio application with UI layout and event handlers
+  - `state.py`: Centralized application state management
+  - `session_manager.py`: Session loading and frame navigation
+  - `canvas_ops.py`: Canvas building and preprocessing operations
+  - `inference.py`: Single-frame inference without training
+  - `evaluation.py`: Full-session evaluation with comprehensive statistics
+  - `training.py`: Batch training with 4-phase performance optimizations
+  - `checkpoint_manager.py`: Model checkpoint save/load with metadata
+  - `attention.py`: Decoder attention visualization with multiple modes
+  - `visualization.py`: Plotting and display utilities
+  - `utils.py`: Shared helper functions
 - **Canvas-based approach**: Uses targeted masked autoencoder with full masking (MASK_RATIO = 1.0) for next-frame inpainting
 - **Session replay**: Load and replay recorded sessions with authentic single-step world model training
 - **Live progress tracking**: Real-time display of prediction error and iteration timing during execution
@@ -145,7 +157,7 @@ python jetbot_remote_client.py
 
 ### Concat World Model Explorer
 ```bash
-python concat_world_model_explorer_gradio.py
+python -m concat_world_model_explorer
 ```
 - **Canvas-based world model**: Interactive web UI for exploring AutoencoderConcatPredictorWorldModel on toroidal dot sessions
 - **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/`
@@ -204,7 +216,18 @@ Required Python packages:
 
 ### Core World Model
 - `autoencoder_concat_predictor_world_model.py`: Canvas-based world model using targeted masked autoencoder with frame concatenation
-- `concat_world_model_explorer_gradio.py`: Web-based Gradio interface for AutoencoderConcatPredictorWorldModel exploration
+- `concat_world_model_explorer/`: Modular web-based Gradio interface for AutoencoderConcatPredictorWorldModel exploration
+  - `app.py`: Main Gradio application and UI layout
+  - `state.py`: Application state management
+  - `session_manager.py`: Session loading and frame handling
+  - `canvas_ops.py`: Canvas building and preprocessing
+  - `inference.py`: Single-frame inference operations
+  - `evaluation.py`: Full-session evaluation and statistics
+  - `training.py`: Batch training with performance optimizations
+  - `checkpoint_manager.py`: Model checkpoint save/load operations
+  - `attention.py`: Decoder attention visualization
+  - `visualization.py`: Plotting and display utilities
+  - `utils.py`: Shared helper functions
 - `config.py`: Shared configuration, image transforms, robot-specific directories, and world model parameters
 - `world_model_utils.py`: Utility functions for training and tensor operations
 

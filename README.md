@@ -11,7 +11,7 @@ This repository contains research code for a canvas-based world model that learn
 2. **JetBot Implementation** (`jetbot_interface.py`, `jetbot_remote_client.py`) - Physical robot interface
 3. **Toroidal Dot Environment** (`toroidal_dot_env.py`, `toroidal_dot_interface.py`) - Simulated environment for testing
 4. **Autoencoder Concat Predictor World Model** (`autoencoder_concat_predictor_world_model.py`) - Canvas-based world model
-5. **Concat World Model Explorer** (`concat_world_model_explorer_gradio.py`) - Interactive web-based interface for exploring sessions
+5. **Concat World Model Explorer** (`concat_world_model_explorer/`) - Interactive web-based interface for exploring sessions
 
 ## Architecture
 
@@ -67,10 +67,10 @@ The concat world model uses a unique approach to visual prediction:
 ### Concat World Model Explorer (Main Tool)
 
 ```bash
-python concat_world_model_explorer_gradio.py
+python -m concat_world_model_explorer
 ```
 
-**The primary way to interact with the concat world model.** This web-based interface provides:
+**The primary way to interact with the concat world model.** This modular web-based interface provides:
 
 - **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/`
 - **Frame navigation**: Browse session frames with slider and text input
@@ -169,7 +169,18 @@ Required Python packages:
 
 ### Core World Model
 - `autoencoder_concat_predictor_world_model.py`: Canvas-based world model implementation
-- `concat_world_model_explorer_gradio.py`: Web-based Gradio interface for exploration
+- `concat_world_model_explorer/`: Modular web-based Gradio interface for exploration
+  - `app.py`: Main Gradio application and UI layout
+  - `state.py`: Application state management
+  - `session_manager.py`: Session loading and frame handling
+  - `canvas_ops.py`: Canvas building and preprocessing
+  - `inference.py`: Single-frame inference operations
+  - `evaluation.py`: Full-session evaluation and statistics
+  - `training.py`: Batch training with performance optimizations
+  - `checkpoint_manager.py`: Model checkpoint save/load operations
+  - `attention.py`: Decoder attention visualization
+  - `visualization.py`: Plotting and display utilities
+  - `utils.py`: Shared helper functions
 - `config.py`: Configuration for world model, robots, and recording
 - `world_model_utils.py`: Utility functions for training and tensor operations
 
