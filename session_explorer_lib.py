@@ -87,13 +87,14 @@ def list_session_dirs_from_base(base_dir):
     return entries
 
 
-def list_session_dirs(jetbot_sessions_dir=None, toroidal_dot_sessions_dir=None, sessions_root_dir=None):
+def list_session_dirs(jetbot_sessions_dir=None, toroidal_dot_sessions_dir=None, so101_sessions_dir=None, sessions_root_dir=None):
     """
     Return sorted session directory paths from all robot-specific directories.
 
     Args:
         jetbot_sessions_dir: Path to JetBot sessions directory (uses config default if None)
         toroidal_dot_sessions_dir: Path to toroidal dot sessions directory (uses config default if None)
+        so101_sessions_dir: Path to SO-101 sessions directory (uses config default if None)
         sessions_root_dir: Optional legacy root directory for backward compatibility
 
     Returns:
@@ -104,6 +105,8 @@ def list_session_dirs(jetbot_sessions_dir=None, toroidal_dot_sessions_dir=None, 
         jetbot_sessions_dir = config.JETBOT_RECORDING_DIR
     if toroidal_dot_sessions_dir is None:
         toroidal_dot_sessions_dir = config.TOROIDAL_DOT_RECORDING_DIR
+    if so101_sessions_dir is None:
+        so101_sessions_dir = config.SO101_RECORDING_DIR
 
     all_sessions = []
 
@@ -112,6 +115,9 @@ def list_session_dirs(jetbot_sessions_dir=None, toroidal_dot_sessions_dir=None, 
 
     # Scan toroidal dot sessions
     all_sessions.extend(list_session_dirs_from_base(toroidal_dot_sessions_dir))
+
+    # Scan SO-101 sessions
+    all_sessions.extend(list_session_dirs_from_base(so101_sessions_dir))
 
     # Also scan legacy root directory for backward compatibility
     if sessions_root_dir and os.path.exists(sessions_root_dir):
@@ -147,12 +153,14 @@ def get_session_robot_type(session_path):
         session_path: Full path to session directory
 
     Returns:
-        Robot type string ('jetbot', 'toroidal_dot', or 'unknown')
+        Robot type string ('jetbot', 'toroidal_dot', 'so101_follower', or 'unknown')
     """
     if "jetbot" in session_path.lower():
         return "jetbot"
     elif "toroidal" in session_path.lower():
         return "toroidal_dot"
+    elif "so101" in session_path.lower():
+        return "so101_follower"
     return "unknown"
 
 

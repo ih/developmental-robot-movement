@@ -9,9 +9,10 @@ This repository contains research code for developmental robot movement with a c
 1. **RobotInterface** (`robot_interface.py`) - Abstract base class defining robot interaction contract
 2. **JetBot Implementation** (`jetbot_interface.py`, `jetbot_remote_client.py`) - Concrete JetBot robot interface
 3. **Toroidal Dot Environment** (`toroidal_dot_env.py`, `toroidal_dot_interface.py`) - Simulated environment with white dot on black background for testing and debugging
-4. **Autoencoder Concat Predictor World Model** (`autoencoder_concat_predictor_world_model.py`) - Canvas-based world model using targeted masked autoencoder with frame concatenation
-5. **Action Selectors** (`toroidal_action_selectors.py`, `recorded_policy.py`) - Pluggable action selection strategies
-6. **Concat World Model Explorer** (`concat_world_model_explorer/`) - Modular web-based interface for exploring and visualizing the concat world model
+4. **SO-101 Robot Arm Integration** (`lerobot_policy_simple_joint/`, `convert_lerobot_to_explorer.py`) - LeRobot custom policy and dataset converter for SO-101 follower arm
+5. **Autoencoder Concat Predictor World Model** (`autoencoder_concat_predictor_world_model.py`) - Canvas-based world model using targeted masked autoencoder with frame concatenation
+6. **Action Selectors** (`toroidal_action_selectors.py`, `recorded_policy.py`) - Pluggable action selection strategies
+7. **Concat World Model Explorer** (`concat_world_model_explorer/`) - Modular web-based interface for exploring and visualizing the concat world model
 
 ## Architecture
 
@@ -35,6 +36,17 @@ This repository contains research code for developmental robot movement with a c
 - **Fast iteration**: No hardware needed, perfect for debugging and testing world model
 - **Configurable parameters**: Dot radius, movement speed, image size via ToroidalDotConfig
 - **Default parameters**: DOT_RADIUS=5, DOT_MOVE_PIXELS=27, IMG_SIZE=224, DOT_ACTION_DELAY=0.0
+
+### SO-101 Robot Arm Integration
+- **LeRobot custom policy**: `lerobot_policy_simple_joint` package for single-joint control with 3 discrete actions
+- **Action space**: Action 0 (stay), Action 1 (move positive for duration), Action 2 (move negative for duration)
+- **Duration-based movement**: Configurable `move_duration` (default 0.5s) and `move_speed` (default 0.2 rad/s)
+- **Configurable joint**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
+- **Policy modes**: Random exploration, fixed action sequences, or deterministic (always stay)
+- **Dataset converter**: `convert_lerobot_to_explorer.py` converts LeRobot v3.0 datasets to concat_world_model_explorer format
+- **Dual-camera support**: Stacks base_0_rgb (224×224) and left_wrist_0_rgb (224×224) vertically for 448×224 combined frames
+- **Velocity-based discretization**: Converts continuous joint actions to discrete actions based on velocity direction
+- **Compatible with concat_world_model_explorer**: Converted sessions can be loaded and visualized in the world model explorer
 
 ### Autoencoder Concat Predictor World Model
 - **Canvas-based approach**: Concatenates history frames horizontally with action-colored separators between them
@@ -139,9 +151,12 @@ This repository contains research code for developmental robot movement with a c
 - **Robot-specific directories**:
   - `JETBOT_CHECKPOINT_DIR = saved/checkpoints/jetbot/` - JetBot model checkpoints
   - `TOROIDAL_DOT_CHECKPOINT_DIR = saved/checkpoints/toroidal_dot/` - Toroidal dot model checkpoints
+  - `SO101_CHECKPOINT_DIR = saved/checkpoints/so101/` - SO-101 model checkpoints
   - `JETBOT_RECORDING_DIR = saved/sessions/jetbot/` - JetBot session recordings
   - `TOROIDAL_DOT_RECORDING_DIR = saved/sessions/toroidal_dot/` - Toroidal dot session recordings
+  - `SO101_RECORDING_DIR = saved/sessions/so101/` - SO-101 session recordings
 - **ToroidalDotConfig class**: Configuration for simulated environment (IMG_SIZE, DOT_RADIUS, DOT_MOVE_PIXELS, ACTION_CHANNELS_DOT, ACTION_RANGES_DOT)
+- **SO101Config class**: Configuration for SO-101 follower arm (JOINT_NAMES, DEFAULT_MOVE_DURATION, DEFAULT_MOVE_SPEED, ACTION_SPACE, FRAME_SIZE with dual-camera stacking)
 - **Recording configuration**: `RECORDING_MODE` boolean controls recording vs online mode, `RECORDING_MAX_DISK_GB` limits total disk usage
 - **IP addresses**: JetBot connection IPs specified in integration example (modify as needed)
 
@@ -155,12 +170,47 @@ python jetbot_remote_client.py
 - Requires JetBot running RPyC server
 - Press 'q' or Ctrl+C to stop
 
+### SO-101 Robot Arm with LeRobot
+
+#### Install the Policy Package
+```bash
+cd lerobot_policy_simple_joint
+pip install -e .
+```
+
+#### Record with lerobot-record
+```bash
+lerobot-record \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyUSB0 \
+    --robot.id=my_so101 \
+    --robot.cameras="{ base_0_rgb: {type: opencv, index_or_path: 0, width: 1920, height: 1080, fps: 30}, left_wrist_0_rgb: {type: opencv, index_or_path: 1, width: 1920, height: 1080, fps: 30}}" \
+    --policy.type=simple_joint \
+    --policy.joint_name=shoulder_pan.pos \
+    --policy.move_duration=0.5 \
+    --policy.move_speed=0.2 \
+    --policy.use_random_policy=true \
+    --dataset.repo_id=${HF_USER}/so101-single-joint \
+    --dataset.num_episodes=10 \
+    --dataset.single_task="Single joint movement"
+```
+
+#### Convert LeRobot Dataset to Explorer Format
+```bash
+python convert_lerobot_to_explorer.py \
+    --lerobot-path ~/.cache/huggingface/lerobot/${HF_USER}/so101-single-joint \
+    --output-dir saved/sessions/so101 \
+    --cameras base_0_rgb left_wrist_0_rgb \
+    --stack-cameras vertical \
+    --joint-name shoulder_pan.pos
+```
+
 ### Concat World Model Explorer
 ```bash
 python -m concat_world_model_explorer
 ```
-- **Canvas-based world model**: Interactive web UI for exploring AutoencoderConcatPredictorWorldModel on toroidal dot sessions
-- **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/`
+- **Canvas-based world model**: Interactive web UI for exploring AutoencoderConcatPredictorWorldModel on recorded sessions
+- **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/` or `saved/sessions/so101/`
 - **Frame navigation**: Browse session frames with slider and text input
 - **World model execution**: Run world model for specified number of iterations with single-step training per iteration
 - **Full masking approach**: Uses MASK_RATIO = 1.0 for complete next-frame inpainting
@@ -237,6 +287,13 @@ Required Python packages:
 - `jetbot_remote_client.py`: Low-level JetBot RPyC client with live feed capability
 - `toroidal_dot_env.py`: Simulated 224x224 toroidal environment with white dot
 - `toroidal_dot_interface.py`: ToroidalDotRobot implementation of RobotInterface
+- `lerobot_policy_simple_joint/`: LeRobot custom policy package for SO-101 single-joint control
+  - `lerobot_policy_simple_joint/__init__.py`: Package exports and version
+  - `lerobot_policy_simple_joint/configuration_simple_joint.py`: SimpleJointConfig class with configurable joint and movement parameters
+  - `lerobot_policy_simple_joint/modeling_simple_joint.py`: SimpleJointPolicy class implementing 3 discrete actions with duration-based movement
+  - `pyproject.toml`: Package metadata and dependencies
+  - `README.md`: Usage documentation for the policy
+- `convert_lerobot_to_explorer.py`: Converter script for LeRobot v3.0 datasets to concat_world_model_explorer format with dual-camera stacking
 
 ### Models
 - `models/__init__.py`: Module exports for clean imports

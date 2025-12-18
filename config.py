@@ -20,6 +20,10 @@ TOROIDAL_DOT_RECORDING_DIR = f"{AUX_DIR}/sessions/toroidal_dot"
 # Robot-specific checkpoint directories
 JETBOT_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints/jetbot"
 TOROIDAL_DOT_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints/toroidal_dot"
+SO101_CHECKPOINT_DIR = f"{AUX_DIR}/checkpoints/so101"
+
+# SO-101 robot-specific recording directory
+SO101_RECORDING_DIR = f"{AUX_DIR}/sessions/so101"
 
 # Recording configuration
 RECORDING_SHARD_SIZE = 1000           # Steps per recording shard
@@ -63,4 +67,39 @@ class AutoencoderConcatPredictorWorldModelConfig:
     # Gradio UI parameters
     GRADIO_UPDATE_INTERVAL = 1      # Update visualization every N iterations during training
 
+
+# SO-101 Robot Arm Configuration
+class SO101Config:
+    """Configuration for SO-101 follower arm with single-joint control."""
+
+    # Joint names (standard SO-101 6-DOF arm)
+    JOINT_NAMES = [
+        "shoulder_pan.pos",
+        "shoulder_lift.pos",
+        "elbow_flex.pos",
+        "wrist_flex.pos",
+        "wrist_roll.pos",
+        "gripper.pos"
+    ]
+
+    # Default movement parameters
+    DEFAULT_MOVE_DURATION = 0.5      # Duration of move actions in seconds
+    DEFAULT_MOVE_SPEED = 0.2         # Movement speed in rad/s
+
+    # Discrete action space (3 actions per controlled joint)
+    ACTION_SPACE = [
+        {"action": 0, "duration": 0.0},         # Stay (no movement)
+        {"action": 1, "duration": 0.5},         # Move positive for duration
+        {"action": 2, "duration": 0.5},         # Move negative for duration
+    ]
+
+    # Frame settings for dual-camera stacked view
+    # base_0_rgb (224x224) stacked on top of left_wrist_0_rgb (224x224) = 448x224
+    FRAME_SIZE = (448, 224)          # (H, W) - vertically stacked cameras
+    CAMERAS = ["base_0_rgb", "left_wrist_0_rgb"]
+
+    # Canvas dimensions with stacked frames
+    # 3 frames (each 448x224) + 2 separators (16px) = 448 x 720
+    CANVAS_HEIGHT = 448
+    CANVAS_WIDTH = 720               # 224*3 + 16*2
 

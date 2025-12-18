@@ -403,7 +403,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     load_session_btn.click(
         fn=session_manager.load_session,
         inputs=[session_dropdown],
-        outputs=[session_info, frame_image, frame_info]
+        outputs=[session_info, frame_image, frame_info, checkpoint_dropdown]
     )
 
     # Checkpoint management event handlers
