@@ -7,7 +7,7 @@ with 3 discrete actions: stay, move positive, move negative.
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from lerobot.common.policies.pretrained import PreTrainedConfig
+from lerobot.configs.policies import PreTrainedConfig
 
 
 @PreTrainedConfig.register_subclass("simple_joint")
@@ -48,6 +48,22 @@ class SimpleJointConfig(PreTrainedConfig):
     # Required PreTrainedConfig fields (fixed for this simple policy)
     n_obs_steps: int = 1
     n_action_steps: int = 1
+
+    # Required abstract property implementations
+    @property
+    def observation_delta_indices(self) -> None:
+        """This policy does not use delta observations."""
+        return None
+
+    @property
+    def action_delta_indices(self) -> None:
+        """This policy does not use delta actions."""
+        return None
+
+    @property
+    def reward_delta_indices(self) -> None:
+        """This policy does not use reward deltas."""
+        return None
 
     # SO-101 joint names for reference and validation
     SO101_JOINTS: List[str] = field(default_factory=lambda: [

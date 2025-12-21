@@ -12,7 +12,7 @@ from typing import Dict, Optional
 import torch
 from torch import Tensor, nn
 
-from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.pretrained import PreTrainedPolicy
 
 from .configuration_simple_joint import SimpleJointConfig
 
@@ -81,19 +81,23 @@ class SimpleJointPolicy(PreTrainedPolicy):
             self._rng = torch.Generator()
             self._rng.manual_seed(self.config.random_seed)
 
-    @torch.no_grad()
-    def select_action(self, batch: Dict[str, Tensor]) -> Tensor:
-        """Select an action based on current observations.
+    def _compute_action(self, batch: Dict[str, Tensor]) -> Tensor:
+        """Compute action based on current observations.
+
+        Internal method used by both select_action and predict_action_chunk.
+
+        The SO101 follower expects absolute position targets, so this method:
+        1. Reads current joint positions from observation.state
+        2. Applies velocity-based delta to the controlled joint
+        3. Returns absolute position targets for all joints
 
         Args:
-            batch: Dictionary with 'observation.state' tensor of shape [B, state_dim]
-                   where state_dim is 6 for SO-101 (6 joint positions)
+            batch: Dictionary with 'observation.state' tensor
 
         Returns:
-            Action tensor of shape [B, action_dim] representing joint velocities
-            For SO-101: 6-dimensional velocity commands
+            Action tensor of shape [B, action_dim] - absolute position targets
         """
-        # Get current state
+        # Get current state (joint positions)
         state = batch.get("observation.state")
         if state is None:
             raise ValueError("observation.state not found in batch")
@@ -116,20 +120,59 @@ class SimpleJointPolicy(PreTrainedPolicy):
             self._current_action = self._get_discrete_action(batch_size, device).item()
             self._action_start_time = current_time
 
-        # Convert discrete action to velocity command
-        # Start with zero velocities for all joints
-        action = torch.zeros(batch_size, num_joints, device=device, dtype=state.dtype)
+        # Start with current positions as the target (hold all joints in place)
+        action = state.clone()
 
-        # Apply velocity to controlled joint based on discrete action
+        # Apply position delta to controlled joint based on discrete action
+        # Note: SO101 uses normalized range -100 to 100, so move_speed is in normalized units/second
+        # Delta = speed × time_step (approximate with small fixed step)
+        dt = 0.033  # ~30 FPS
+        delta = self.config.move_speed * dt
+
         if self._current_action == 1:
             # Move positive direction
-            action[:, self.config.joint_index] = self.config.move_speed
+            action[:, self.config.joint_index] += delta
         elif self._current_action == 2:
             # Move negative direction
-            action[:, self.config.joint_index] = -self.config.move_speed
-        # Action 0: stay (velocity already 0)
+            action[:, self.config.joint_index] -= delta
+        # Action 0: stay (position unchanged)
+
+        # Clamp to valid range to avoid motor errors
+        action[:, self.config.joint_index] = action[:, self.config.joint_index].clamp(-100, 100)
 
         return action
+
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: Dict[str, Tensor], **kwargs) -> Tensor:
+        """Predict an action chunk for the given observation.
+
+        For this simple policy without action chunking, returns a single action
+        as a chunk of size 1.
+
+        Args:
+            batch: Dictionary with observation tensors
+            **kwargs: Additional arguments (ignored)
+
+        Returns:
+            Action tensor of shape [B, 1, action_dim]
+        """
+        action = self._compute_action(batch)
+        # Add chunk dimension (size 1 since no action chunking)
+        return action.unsqueeze(1)
+
+    @torch.no_grad()
+    def select_action(self, batch: Dict[str, Tensor]) -> Tensor:
+        """Select an action based on current observations.
+
+        Args:
+            batch: Dictionary with 'observation.state' tensor of shape [B, state_dim]
+                   where state_dim is 6 for SO-101 (6 joint positions)
+
+        Returns:
+            Action tensor of shape [B, action_dim] representing joint velocities
+            For SO-101: 6-dimensional velocity commands
+        """
+        return self._compute_action(batch)
 
     def _get_discrete_action(self, batch_size: int, device: torch.device) -> Tensor:
         """Get discrete action (0, 1, or 2).

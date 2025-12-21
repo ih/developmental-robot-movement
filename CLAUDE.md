@@ -179,6 +179,28 @@ pip install -e .
 ```
 
 #### Record with lerobot-record
+
+**Recommended**: Use `run_lerobot_record.py` wrapper for action sequences (auto-calculates episode time):
+```bash
+python run_lerobot_record.py \
+    --robot.type=so101_follower \
+    --robot.port=COM8 \
+    --robot.id=my_so101_follower \
+    --robot.cameras="{ base_0_rgb: {type: opencv, index_or_path: 0, width: 1280, height: 720, fps: 30}, left_wrist_0_rgb: {type: opencv, index_or_path: 1, width: 1280, height: 720, fps: 30}}" \
+    --policy.type=simple_joint \
+    --policy.joint_name=wrist_roll.pos \
+    --policy.move_duration=0.5 \
+    --policy.move_speed=50 \
+    --policy.action_sequence="[1, 0, 2, 0, 1]" \
+    --dataset.repo_id=${HF_USER}/so101-test \
+    --dataset.num_episodes=1 \
+    --dataset.single_task="Single joint movement"
+```
+- Automatically calculates `episode_time_s` = (num_actions × move_duration) + 5s buffer
+- 5s buffer accounts for camera warmup, calibration, and startup overhead
+- Start action_sequence with 1 or 2 (move) instead of 0 (stay) for immediate visible movement
+
+**Alternative**: Direct lerobot-record command (manual episode time):
 ```bash
 lerobot-record \
     --robot.type=so101_follower \
@@ -293,6 +315,7 @@ Required Python packages:
   - `lerobot_policy_simple_joint/modeling_simple_joint.py`: SimpleJointPolicy class implementing 3 discrete actions with duration-based movement
   - `pyproject.toml`: Package metadata and dependencies
   - `README.md`: Usage documentation for the policy
+- `run_lerobot_record.py`: Wrapper script for lerobot-record with auto-calculated episode timing (5s buffer for camera warmup and calibration)
 - `convert_lerobot_to_explorer.py`: Converter script for LeRobot v3.0 datasets to concat_world_model_explorer format with dual-camera stacking
 
 ### Models
