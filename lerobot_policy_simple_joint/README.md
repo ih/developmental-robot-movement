@@ -7,8 +7,8 @@ A simple non-learned policy for controlling a single joint of the SO-101 robot a
 | Action | Description |
 |--------|-------------|
 | 0 | Stay (no movement) |
-| 1 | Move in positive direction for `move_duration` seconds |
-| 2 | Move in negative direction for `move_duration` seconds |
+| 1 | Move in positive direction by `position_delta` |
+| 2 | Move in negative direction by `position_delta` |
 
 ## Installation
 
@@ -29,8 +29,8 @@ lerobot-record \
     --robot.cameras="{ base_0_rgb: {type: opencv, index_or_path: 0, width: 1920, height: 1080, fps: 30}, left_wrist_0_rgb: {type: opencv, index_or_path: 1, width: 1920, height: 1080, fps: 30}}" \
     --policy.type=simple_joint \
     --policy.joint_name=shoulder_pan.pos \
-    --policy.move_duration=0.5 \
-    --policy.move_speed=0.2 \
+    --policy.action_duration=0.5 \
+    --policy.position_delta=10 \
     --policy.use_random_policy=true \
     --dataset.repo_id=${HF_USER}/so101-single-joint \
     --dataset.num_episodes=10 \
@@ -47,22 +47,31 @@ lerobot-record \
     --robot.cameras="{ base_0_rgb: {type: opencv, index_or_path: 0, width: 1920, height: 1080, fps: 30}}" \
     --policy.type=simple_joint \
     --policy.joint_name=shoulder_pan.pos \
-    --policy.move_duration=0.5 \
+    --policy.action_duration=0.5 \
+    --policy.position_delta=10 \
     --policy.action_sequence="[1, 1, 0, 2, 2, 0]" \
     --dataset.repo_id=${HF_USER}/so101-sequence \
     --dataset.num_episodes=5 \
     --dataset.single_task="Single joint sequence movement"
 ```
 
+**Note on Sequence Behavior:**
+- The policy will execute the action sequence exactly once
+- After completing the sequence, it will output action 0 (stay) for the remainder of the episode
+- The sequence does NOT wrap or repeat
+- This is ideal for recording specific movement patterns without unintended repetition
+
+For infinite random actions, use `use_random_policy=true` instead.
+
 ## Configuration Options
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `joint_name` | `"shoulder_pan.pos"` | Joint to control. Options: `shoulder_pan.pos`, `shoulder_lift.pos`, `elbow_flex.pos`, `wrist_flex.pos`, `wrist_roll.pos`, `gripper.pos` |
-| `move_duration` | `0.5` | Duration of movement in seconds |
-| `move_speed` | `0.2` | Movement speed in radians/second |
-| `use_random_policy` | `false` | If true, randomly select actions |
-| `action_sequence` | `null` | Optional list of actions to cycle through (e.g., `[1, 0, 2, 0]`) |
+| `action_duration` | `0.5` | How long each discrete action lasts before selecting the next action (seconds) |
+| `position_delta` | `0.1` | How far to move the joint when action 1 or 2 is selected (radians) |
+| `use_random_policy` | `false` | If true, randomly select actions indefinitely |
+| `action_sequence` | `null` | Optional list of actions to execute once (e.g., `[1, 0, 2, 0]`). No wrapping. |
 | `random_seed` | `null` | Seed for reproducible random actions |
 
 ## Converting to concat_world_model_explorer Format

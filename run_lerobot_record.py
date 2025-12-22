@@ -127,11 +127,11 @@ def check_and_clean_dataset_cache():
 
 
 def calculate_and_inject_episode_time():
-    """Calculate episode time from action_sequence and move_duration, inject into args."""
+    """Calculate episode time from action_sequence and action_duration, inject into args."""
     import ast
 
     action_sequence_str = parse_arg("policy.action_sequence")
-    move_duration_str = parse_arg("policy.move_duration")
+    action_duration_str = parse_arg("policy.action_duration")
 
     if not action_sequence_str:
         return  # No action sequence, use default episode time
@@ -144,25 +144,25 @@ def calculate_and_inject_episode_time():
     except (ValueError, SyntaxError):
         return
 
-    # Parse move duration (default 0.5)
-    move_duration = 0.5
-    if move_duration_str:
+    # Parse action duration (default 0.5)
+    action_duration = 0.5
+    if action_duration_str:
         try:
-            move_duration = float(move_duration_str)
+            action_duration = float(action_duration_str)
         except ValueError:
             pass
 
-    # Calculate episode time: number of actions × duration per action
-    # Add buffer for camera warmup, calibration, and startup/shutdown
-    episode_time = len(action_sequence) * move_duration + 5.0
+    # Calculate episode time: (sequence length × action duration) + buffer for completion
+    # Buffer accounts for camera warmup, calibration, and final action completion
+    episode_time = len(action_sequence) * action_duration + 5.0
 
     # Check if episode_time_s is already specified
     if parse_arg("dataset.episode_time_s") is None:
         # Inject the calculated episode time
         sys.argv.append(f"--dataset.episode_time_s={episode_time}")
         print(f"Auto-calculated episode time: {episode_time:.1f}s "
-              f"({len(action_sequence)} actions × {move_duration}s + 5s buffer)")
-        print(f"  Tip: Start action_sequence with 1 or 2 (move) instead of 0 (stay) for immediate movement")
+              f"({len(action_sequence)} actions × {action_duration}s + 5s buffer)")
+        print(f"  Note: Sequence will execute once and stop at action 0 (no wrapping)")
 
 
 def return_arm_to_start(robot_port: str, starting_positions: dict):

@@ -39,10 +39,10 @@ This repository contains research code for developmental robot movement with a c
 
 ### SO-101 Robot Arm Integration
 - **LeRobot custom policy**: `lerobot_policy_simple_joint` package for single-joint control with 3 discrete actions
-- **Action space**: Action 0 (stay), Action 1 (move positive for duration), Action 2 (move negative for duration)
-- **Duration-based movement**: Configurable `move_duration` (default 0.5s) and `move_speed` (default 0.2 rad/s)
+- **Action space**: Action 0 (stay), Action 1 (move positive by position_delta), Action 2 (move negative by position_delta)
+- **Action parameters**: `action_duration` controls how long each discrete action lasts (default 0.5s), `position_delta` controls movement magnitude (default 0.1 radians)
 - **Configurable joint**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
-- **Policy modes**: Random exploration, fixed action sequences, or deterministic (always stay)
+- **Policy modes**: Random exploration (infinite), fixed action sequences (execute once, no wrapping), or deterministic (always stay)
 - **Dataset converter**: `convert_lerobot_to_explorer.py` converts LeRobot v3.0 datasets to concat_world_model_explorer format
 - **Dual-camera support**: Stacks base_0_rgb (224×224) and left_wrist_0_rgb (224×224) vertically for 448×224 combined frames
 - **Velocity-based discretization**: Converts continuous joint actions to discrete actions based on velocity direction
@@ -189,15 +189,17 @@ python run_lerobot_record.py \
     --robot.cameras="{ base_0_rgb: {type: opencv, index_or_path: 0, width: 1280, height: 720, fps: 30}, left_wrist_0_rgb: {type: opencv, index_or_path: 1, width: 1280, height: 720, fps: 30}}" \
     --policy.type=simple_joint \
     --policy.joint_name=wrist_roll.pos \
-    --policy.move_duration=0.5 \
-    --policy.move_speed=50 \
+    --policy.action_duration=0.5 \
+    --policy.position_delta=10 \
     --policy.action_sequence="[1, 0, 2, 0, 1]" \
     --dataset.repo_id=${HF_USER}/so101-test \
     --dataset.num_episodes=1 \
     --dataset.single_task="Single joint movement"
 ```
-- Automatically calculates `episode_time_s` = (num_actions × move_duration) + 5s buffer
-- 5s buffer accounts for camera warmup, calibration, and startup overhead
+- Automatically calculates `episode_time_s` = (num_actions × action_duration) + 5s buffer
+- Buffer accounts for camera warmup, calibration, and final action completion
+- Action sequence executes once and stops (no wrapping)
+- Policy outputs action 0 (stay) after sequence completes
 - Start action_sequence with 1 or 2 (move) instead of 0 (stay) for immediate visible movement
 
 **Alternative**: Direct lerobot-record command (manual episode time):
@@ -209,8 +211,8 @@ lerobot-record \
     --robot.cameras="{ base_0_rgb: {type: opencv, index_or_path: 0, width: 1920, height: 1080, fps: 30}, left_wrist_0_rgb: {type: opencv, index_or_path: 1, width: 1920, height: 1080, fps: 30}}" \
     --policy.type=simple_joint \
     --policy.joint_name=shoulder_pan.pos \
-    --policy.move_duration=0.5 \
-    --policy.move_speed=0.2 \
+    --policy.action_duration=0.5 \
+    --policy.position_delta=0.1 \
     --policy.use_random_policy=true \
     --dataset.repo_id=${HF_USER}/so101-single-joint \
     --dataset.num_episodes=10 \

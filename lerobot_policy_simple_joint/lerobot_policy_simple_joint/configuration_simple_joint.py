@@ -17,17 +17,25 @@ class SimpleJointConfig(PreTrainedConfig):
 
     This policy controls a single joint with 3 discrete actions:
     - Action 0: No movement (stay)
-    - Action 1: Move in positive direction for move_duration seconds
-    - Action 2: Move in negative direction for move_duration seconds
+    - Action 1: Move in positive direction by position_delta
+    - Action 2: Move in negative direction by position_delta
 
     All other joints maintain their current positions from observation.state.
 
+    Policy modes:
+    - Default (no flags set): Always outputs action 0
+    - Random (use_random_policy=True): Randomly selects actions indefinitely
+    - Sequence (action_sequence provided): Executes sequence once, then outputs action 0
+
+    Note: Sequence mode does NOT wrap - after completing the sequence, the policy
+    will continue outputting action 0 (stay) for the remainder of the episode.
+
     Args:
         joint_name: Name of the joint to control (default: "shoulder_pan.pos")
-        move_duration: Duration of movement in seconds (default: 0.5)
-        move_speed: Movement speed in radians/second (default: 0.2)
-        use_random_policy: If True, select actions randomly (default: False)
-        action_sequence: Optional fixed sequence of actions to cycle through
+        action_duration: How long each discrete action lasts before selecting next action (default: 0.5s)
+        position_delta: How far to move the joint when action 1 or 2 is selected (default: 0.1 radians)
+        use_random_policy: If True, select actions randomly indefinitely (default: False)
+        action_sequence: Optional fixed sequence of actions to execute once (default: None)
         random_seed: Seed for random action selection
         n_obs_steps: Number of observation steps (always 1 for this policy)
         n_action_steps: Number of action steps (always 1 for this policy)
@@ -37,8 +45,8 @@ class SimpleJointConfig(PreTrainedConfig):
     joint_name: str = "shoulder_pan.pos"
 
     # Movement parameters
-    move_duration: float = 0.5  # Duration of movement in seconds
-    move_speed: float = 0.2     # Movement speed in radians/second
+    action_duration: float = 0.5  # How long each discrete action lasts (seconds)
+    position_delta: float = 0.1   # How far to move when action 1 or 2 is selected (radians)
 
     # Policy mode
     use_random_policy: bool = False
@@ -93,10 +101,10 @@ class SimpleJointConfig(PreTrainedConfig):
         self.joint_index = self.SO101_JOINTS.index(self.joint_name)
 
         # Validate movement parameters
-        if self.move_duration <= 0:
-            raise ValueError("move_duration must be positive")
-        if self.move_speed <= 0:
-            raise ValueError("move_speed must be positive")
+        if self.action_duration <= 0:
+            raise ValueError("action_duration must be positive")
+        if self.position_delta <= 0:
+            raise ValueError("position_delta must be positive")
 
         # Validate action sequence if provided
         if self.action_sequence is not None:

@@ -2,8 +2,8 @@
 
 A simple non-learned policy that controls a single joint with 3 discrete actions:
 - Action 0: Stay (no movement)
-- Action 1: Move positive direction for configured duration
-- Action 2: Move negative direction for configured duration
+- Action 1: Move positive direction by position_delta
+- Action 2: Move negative direction by position_delta
 """
 
 import time
@@ -22,15 +22,16 @@ class SimpleJointPolicy(PreTrainedPolicy):
 
     This policy:
     - Observes the current joint states
-    - Outputs velocity commands for the controlled joint
-    - Actions 1 and 2 move the joint for a configured duration
-    - Action 0 commands zero velocity (stay)
-    - All other joints maintain zero velocity
+    - Outputs absolute position targets for the controlled joint
+    - Actions 1 and 2 move the joint by position_delta in +/- direction
+    - Action 0 maintains current position (stay)
+    - All other joints maintain their current positions
+    - Each discrete action lasts for action_duration before selecting next action
 
     The policy can operate in three modes:
     1. Default: Always outputs action 0 (stay)
-    2. Random: Randomly selects from actions 0, 1, 2
-    3. Sequence: Cycles through a predefined action sequence
+    2. Random: Randomly selects from actions 0, 1, 2 (infinite)
+    3. Sequence: Executes action sequence once, then stays at action 0 (no wrapping)
     """
 
     config_class = SimpleJointConfig
@@ -62,6 +63,7 @@ class SimpleJointPolicy(PreTrainedPolicy):
         self._action_start_time: Optional[float] = None
         self._last_state: Optional[Tensor] = None
         self._target_position: Optional[float] = None
+        self._sequence_completed = False  # Track if action sequence has completed
 
         # Create a dummy parameter so PyTorch recognizes this as a module
         # This is needed for device placement
@@ -77,6 +79,7 @@ class SimpleJointPolicy(PreTrainedPolicy):
         self._action_start_time = None
         self._last_state = None
         self._target_position = None
+        self._sequence_completed = False  # Reset sequence completion for new episode
 
         # Reset random generator if seed was provided
         if self.config.random_seed is not None:
@@ -115,7 +118,7 @@ class SimpleJointPolicy(PreTrainedPolicy):
 
         if self._action_start_time is not None:
             elapsed = current_time - self._action_start_time
-            if elapsed >= self.config.move_duration:
+            if elapsed >= self.config.action_duration:
                 # Action duration completed, select new action
                 self._current_action = self._get_discrete_action(batch_size, device).item()
                 self._action_start_time = current_time
@@ -130,15 +133,13 @@ class SimpleJointPolicy(PreTrainedPolicy):
         # This allows smooth motion instead of choppy per-frame increments
         if action_changed:
             current_pos = state[0, self.config.joint_index].item()
-            # Total movement distance = speed * duration (both in normalized units)
-            delta = self.config.move_speed * self.config.move_duration
 
             if self._current_action == 1:
-                # Move positive direction
-                self._target_position = current_pos + delta
+                # Move positive direction by position_delta
+                self._target_position = current_pos + self.config.position_delta
             elif self._current_action == 2:
-                # Move negative direction
-                self._target_position = current_pos - delta
+                # Move negative direction by position_delta
+                self._target_position = current_pos - self.config.position_delta
             else:
                 # Action 0: stay at current position
                 self._target_position = current_pos
@@ -199,9 +200,19 @@ class SimpleJointPolicy(PreTrainedPolicy):
             Tensor of discrete actions, shape [B]
         """
         if self.config.action_sequence is not None:
-            # Use predefined sequence
+            # Use predefined sequence (no wrapping - stay at action 0 after completion)
+            if self._sequence_completed:
+                # Sequence has completed, return action 0 (stay)
+                return torch.zeros(batch_size, dtype=torch.long, device=device)
+
+            # Get current action from sequence
             action = self.config.action_sequence[self._sequence_index]
-            self._sequence_index = (self._sequence_index + 1) % len(self.config.action_sequence)
+            self._sequence_index += 1
+
+            # Check if we've reached the end of the sequence
+            if self._sequence_index >= len(self.config.action_sequence):
+                self._sequence_completed = True
+
             return torch.full((batch_size,), action, dtype=torch.long, device=device)
 
         elif self.config.use_random_policy:
