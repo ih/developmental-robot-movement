@@ -101,6 +101,7 @@ def parse_arg(name: str) -> str | None:
 def check_and_clean_dataset_cache():
     """Check if dataset cache exists and prompt user to remove it."""
     import shutil
+    import time
     from pathlib import Path
 
     repo_id = parse_arg("dataset.repo_id")
@@ -117,6 +118,15 @@ def check_and_clean_dataset_cache():
             response = input("Remove existing cache? [y/n]: ").strip().lower()
             if response in ("y", "yes"):
                 shutil.rmtree(cache_path)
+                # Wait for Windows filesystem to complete deletion (up to 5 seconds)
+                for _ in range(50):
+                    if not cache_path.exists():
+                        break
+                    time.sleep(0.1)
+                if cache_path.exists():
+                    print(f"ERROR: Failed to remove cache at {cache_path}")
+                    print("Please close any programs using this directory and try again.")
+                    sys.exit(1)
                 print(f"Removed: {cache_path}\n")
                 break
             elif response in ("n", "no"):
@@ -179,11 +189,12 @@ def setup_discrete_action_logging() -> str | None:
     if not repo_id:
         return None
 
-    # Create log directory inside dataset's meta/ directory
+    # Return log directory path inside dataset's meta/ directory
     # This ensures logs are uploaded with the dataset
+    # Note: Directory is NOT created here - the policy creates it lazily
+    # to avoid creating the cache directory before LeRobot does
     cache_base = Path.home() / ".cache" / "huggingface" / "lerobot"
     log_dir = cache_base / repo_id / "meta" / "discrete_action_logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Discrete action logs will be saved to: {log_dir}")
     return str(log_dir)

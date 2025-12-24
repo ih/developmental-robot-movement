@@ -8,6 +8,7 @@ A simple non-learned policy that controls a single joint with 3 discrete actions
 
 import json
 import time
+from pathlib import Path
 from typing import Dict, Optional
 
 import torch
@@ -95,6 +96,11 @@ class SimpleJointPolicy(PreTrainedPolicy):
         """
         if not self.config.discrete_action_log_path:
             return
+
+        # Create log directory lazily (first time writing)
+        # This avoids creating the cache directory before LeRobot does
+        log_path = Path(self.config.discrete_action_log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(self.config.discrete_action_log_path, "w") as f:
             f.write(json.dumps({
