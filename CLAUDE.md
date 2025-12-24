@@ -43,9 +43,16 @@ This repository contains research code for developmental robot movement with a c
 - **Action parameters**: `action_duration` controls how long each discrete action lasts (default 0.5s), `position_delta` controls movement magnitude (default 0.1 radians)
 - **Configurable joint**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
 - **Policy modes**: Random exploration (infinite), fixed action sequences (execute once, no wrapping), or deterministic (always stay)
+- **Discrete action logging**: Automatically records exact discrete actions during `lerobot-record` sessions to JSONL logs in `meta/discrete_action_logs/` directory (included in Hub uploads)
+  - Log header contains all recording parameters (joint_name, action_duration, position_delta, etc.)
+  - Each log entry contains timestamp and discrete action chosen
+  - Enables 100% accurate action reconstruction without velocity-based approximation
 - **Dataset converter**: `convert_lerobot_to_explorer.py` converts LeRobot v3.0 datasets to concat_world_model_explorer format
+  - **Hub download support**: Converter can download datasets directly via HuggingFace repo_id (e.g., `username/dataset-name`)
+  - **Automatic parameter extraction**: Reads action_duration and position_delta from log header when available
+  - **Timestamp-based matching**: Uses precise frame-to-action matching via log timestamps
+  - **Backward compatible**: Falls back to velocity-based discretization for datasets without logs
 - **Dual-camera support**: Stacks base_0_rgb (224×224) and left_wrist_0_rgb (224×224) vertically for 448×224 combined frames
-- **Velocity-based discretization**: Converts continuous joint actions to discrete actions based on velocity direction
 - **Compatible with concat_world_model_explorer**: Converted sessions can be loaded and visualized in the world model explorer
 
 ### Autoencoder Concat Predictor World Model
@@ -220,14 +227,32 @@ lerobot-record \
 ```
 
 #### Convert LeRobot Dataset to Explorer Format
+
+**Recommended** (downloads from Hub, reads parameters from log):
+```bash
+python convert_lerobot_to_explorer.py \
+    --lerobot-path ${HF_USER}/so101-single-joint \
+    --output-dir saved/sessions/so101 \
+    --cameras base_0_rgb left_wrist_0_rgb \
+    --stack-cameras vertical
+```
+- Converter automatically downloads dataset from HuggingFace Hub
+- Reads `action_duration` and `position_delta` from discrete action log header
+- No need to manually specify recording parameters
+- Uses timestamp-based matching for frame-to-action pairing
+
+**Alternative** (local dataset with manual parameters):
 ```bash
 python convert_lerobot_to_explorer.py \
     --lerobot-path ~/.cache/huggingface/lerobot/${HF_USER}/so101-single-joint \
     --output-dir saved/sessions/so101 \
     --cameras base_0_rgb left_wrist_0_rgb \
     --stack-cameras vertical \
-    --joint-name shoulder_pan.pos
+    --joint-name shoulder_pan.pos \
+    --action-duration 0.5
 ```
+- Specify local path to dataset instead of Hub repo_id
+- Manually provide `--action-duration` and `--position-delta` if logs are unavailable
 
 ### Concat World Model Explorer
 ```bash

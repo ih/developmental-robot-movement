@@ -12,7 +12,7 @@ Usage:
         --robot.type=so101_follower \\
         --policy.type=simple_joint \\
         --policy.joint_name=shoulder_pan.pos \\
-        --policy.move_duration=0.5 \\
+        --policy.action_duration=0.5 \\
         --policy.use_random_policy=true \\
         ...
 """

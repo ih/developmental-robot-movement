@@ -165,6 +165,58 @@ def calculate_and_inject_episode_time():
         print(f"  Note: Sequence will execute once and stop at action 0 (no wrapping)")
 
 
+def setup_discrete_action_logging() -> str | None:
+    """Set up discrete action log directory INSIDE the dataset's meta/ directory.
+
+    This ensures logs are included when dataset is pushed to HuggingFace Hub.
+
+    Returns:
+        Path to the log directory, or None if no repo_id specified
+    """
+    from pathlib import Path
+
+    repo_id = parse_arg("dataset.repo_id")
+    if not repo_id:
+        return None
+
+    # Create log directory inside dataset's meta/ directory
+    # This ensures logs are uploaded with the dataset
+    cache_base = Path.home() / ".cache" / "huggingface" / "lerobot"
+    log_dir = cache_base / repo_id / "meta" / "discrete_action_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Discrete action logs will be saved to: {log_dir}")
+    return str(log_dir)
+
+
+def patch_policy_reset_for_logging(log_dir: str):
+    """Patch SimpleJointPolicy.reset() to create per-episode log files.
+
+    Args:
+        log_dir: Directory where episode log files should be created
+    """
+    from pathlib import Path
+
+    # Episode counter - mutable container for closure
+    _episode_counter = [0]
+
+    _original_reset = SimpleJointPolicy.reset
+
+    def patched_reset(self):
+        _original_reset(self)
+
+        # Set up log file for this episode
+        if log_dir:
+            log_path = Path(log_dir) / f"episode_{_episode_counter[0]:06d}.jsonl"
+            self.config.discrete_action_log_path = str(log_path)
+            _episode_counter[0] += 1
+
+            # Write header immediately
+            self._write_log_header()
+
+    SimpleJointPolicy.reset = patched_reset
+
+
 def return_arm_to_start(robot_port: str, starting_positions: dict):
     """Move the arm back to its starting position.
 
@@ -230,6 +282,11 @@ def capture_starting_position(robot_port: str) -> dict:
 if __name__ == "__main__":
     check_and_clean_dataset_cache()
     calculate_and_inject_episode_time()
+
+    # Set up discrete action logging
+    log_dir = setup_discrete_action_logging()
+    if log_dir:
+        patch_policy_reset_for_logging(log_dir)
 
     # Get robot port for position capture/restore
     robot_port = parse_arg("robot.port")

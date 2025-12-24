@@ -83,8 +83,8 @@ class SO101Config:
     ]
 
     # Default movement parameters
-    DEFAULT_MOVE_DURATION = 0.5      # Duration of move actions in seconds
-    DEFAULT_MOVE_SPEED = 0.2         # Movement speed in rad/s
+    DEFAULT_ACTION_DURATION = 0.5    # Duration of move actions in seconds
+    DEFAULT_POSITION_DELTA = 0.1     # Position change per discrete action in radians
 
     # Discrete action space (3 actions per controlled joint)
     ACTION_SPACE = [

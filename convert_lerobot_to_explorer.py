@@ -12,10 +12,12 @@ Usage:
         --lerobot-path /path/to/lerobot/dataset \\
         --output-dir saved/sessions/so101 \\
         --cameras base_0_rgb left_wrist_0_rgb \\
-        --stack-cameras vertical \\
-        --joint-name shoulder_pan.pos \\
-        --move-duration 0.5 \\
-        --velocity-threshold 0.05
+        --stack-cameras vertical
+
+    # Can also specify HuggingFace repo_id to download from Hub:
+    python convert_lerobot_to_explorer.py \\
+        --lerobot-path username/dataset-name \\
+        --output-dir saved/sessions/so101
 """
 
 import argparse
@@ -59,6 +61,112 @@ SO101_JOINTS = [
 ]
 
 
+def resolve_dataset_path(lerobot_path_or_repo: str) -> Path:
+    """Resolve dataset path, downloading from Hub if needed.
+
+    Args:
+        lerobot_path_or_repo: Either a local path or a HuggingFace repo_id
+
+    Returns:
+        Local path to the dataset
+    """
+    # Check if it's a local path
+    local_path = Path(lerobot_path_or_repo)
+    if local_path.exists():
+        return local_path
+
+    # Assume it's a Hub repo_id, download to cache
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        print("Error: huggingface_hub is required to download from Hub.")
+        print("Install it with: pip install huggingface_hub")
+        sys.exit(1)
+
+    print(f"Downloading dataset from Hub: {lerobot_path_or_repo}")
+    cache_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / lerobot_path_or_repo
+
+    snapshot_download(
+        repo_id=lerobot_path_or_repo,
+        repo_type="dataset",
+        local_dir=str(cache_dir)
+    )
+    return cache_dir
+
+
+@dataclass
+class DiscreteActionLog:
+    """Parsed discrete action log with header and decisions."""
+    header: dict
+    decisions: list
+
+    @property
+    def action_duration(self) -> float:
+        return self.header.get("action_duration", 0.5)
+
+    @property
+    def position_delta(self) -> float:
+        return self.header.get("position_delta", 0.1)
+
+    @property
+    def joint_name(self) -> str:
+        return self.header.get("joint_name", "shoulder_pan.pos")
+
+
+def load_discrete_action_log(log_path: Path) -> Optional[DiscreteActionLog]:
+    """Load discrete action log from JSONL file.
+
+    First line is header with recording parameters.
+    Subsequent lines are action decisions.
+
+    Returns:
+        DiscreteActionLog with header and decisions, or None if file not found
+    """
+    if not log_path.exists():
+        return None
+
+    header = None
+    decisions = []
+
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("type") == "header":
+                header = entry
+            elif entry.get("type") == "action":
+                decisions.append(entry)
+
+    if header is None:
+        return None
+
+    return DiscreteActionLog(header=header, decisions=decisions)
+
+
+def get_discrete_action_for_timestamp(
+    log: DiscreteActionLog,
+    frame_timestamp: float
+) -> int:
+    """Find the discrete action active at a given timestamp.
+
+    Args:
+        log: The discrete action log
+        frame_timestamp: Timestamp of the frame
+
+    Returns:
+        The discrete action (0, 1, or 2) that was active at frame_timestamp
+    """
+    active_action = 0  # Default to stay if no decision yet
+    for decision in log.decisions:
+        if decision["timestamp"] <= frame_timestamp:
+            active_action = decision["discrete_action"]
+        else:
+            break  # Decisions are chronological
+    return active_action
+
+
 @dataclass
 class ConversionConfig:
     """Configuration for dataset conversion."""
@@ -68,8 +176,8 @@ class ConversionConfig:
     stack_cameras: str  # "vertical", "horizontal", or "single"
     joint_name: str
     joint_index: int
-    move_duration: float
-    velocity_threshold: float
+    action_duration: float  # Duration of move actions in seconds
+    velocity_threshold: float  # For fallback discretization
     frame_size: Tuple[int, int]  # (H, W) for single camera
     shard_size: int
     session_prefix: str
@@ -462,6 +570,23 @@ def convert_episode(
         print(f"  Skipping episode {episode_idx}: no video data")
         return False
 
+    # Try to load discrete action log from meta/discrete_action_logs/
+    dataset_path = Path(config.lerobot_path)
+    log_dir = dataset_path / "meta" / "discrete_action_logs"
+    action_log = None
+
+    if log_dir.exists():
+        log_files = sorted(log_dir.glob("episode_*.jsonl"))
+        if episode_idx < len(log_files):
+            action_log = load_discrete_action_log(log_files[episode_idx])
+            if action_log:
+                print(f"  Using discrete action log: {len(action_log.decisions)} decisions")
+                print(f"    Recording params: duration={action_log.action_duration}s, "
+                      f"delta={action_log.position_delta}, joint={action_log.joint_name}")
+
+    # Determine action_duration to use (from log or config)
+    action_duration = action_log.action_duration if action_log else config.action_duration
+
     # Generate session name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_name = f"{config.session_prefix}_ep{episode_idx:04d}_{timestamp}"
@@ -476,8 +601,8 @@ def convert_episode(
     # Define action space
     action_space = [
         {"action": 0, "duration": 0.0},
-        {"action": 1, "duration": config.move_duration},
-        {"action": 2, "duration": config.move_duration},
+        {"action": 1, "duration": action_duration},
+        {"action": 2, "duration": action_duration},
     ]
 
     writer.set_metadata(
@@ -487,9 +612,11 @@ def convert_episode(
             "source": "lerobot_v3",
             "source_path": str(config.lerobot_path),
             "episode_index": episode_idx,
-            "joint_name": config.joint_name,
+            "joint_name": action_log.joint_name if action_log else config.joint_name,
             "joint_index": config.joint_index,
-            "move_duration": config.move_duration,
+            "action_duration": action_duration,
+            "position_delta": action_log.position_delta if action_log else None,
+            "used_discrete_action_log": action_log is not None,
             "cameras": config.cameras,
             "stack_mode": config.stack_cameras,
         }
@@ -534,38 +661,44 @@ def convert_episode(
         # Add observation
         writer.add_observation(combined_frame, timestamp_val)
 
-        # Get state and action
+        # Get state and action for discretization (only needed if no log)
         state = row.get("observation.state")
         action_continuous = row.get("action")
 
         if state is not None and action_continuous is not None:
-            # Convert to numpy arrays if needed
-            if hasattr(state, 'tolist'):
-                state = np.array(state)
-            elif isinstance(state, list):
-                state = np.array(state)
+            # Determine discrete action - use log if available, otherwise discretize
+            if action_log:
+                # Use timestamp-based lookup from the discrete action log
+                discrete_action = get_discrete_action_for_timestamp(action_log, timestamp_val)
+            else:
+                # Fall back to velocity-based discretization
+                # Convert to numpy arrays if needed
+                if hasattr(state, 'tolist'):
+                    state = np.array(state)
+                elif isinstance(state, list):
+                    state = np.array(state)
 
-            if hasattr(action_continuous, 'tolist'):
-                action_continuous = np.array(action_continuous)
-            elif isinstance(action_continuous, list):
-                action_continuous = np.array(action_continuous)
+                if hasattr(action_continuous, 'tolist'):
+                    action_continuous = np.array(action_continuous)
+                elif isinstance(action_continuous, list):
+                    action_continuous = np.array(action_continuous)
 
-            # Get joint positions
-            current_pos = state[config.joint_index]
-            target_pos = action_continuous[config.joint_index]
+                # Get joint positions
+                current_pos = state[config.joint_index]
+                target_pos = action_continuous[config.joint_index]
 
-            # Discretize action
-            discrete_action = discretize_action(
-                current_pos,
-                target_pos,
-                dt,
-                config.velocity_threshold
-            )
+                # Discretize action based on velocity
+                discrete_action = discretize_action(
+                    current_pos,
+                    target_pos,
+                    dt,
+                    config.velocity_threshold
+                )
 
             # Add action event
             action_dict = {
                 "action": discrete_action,
-                "duration": config.move_duration if discrete_action != 0 else 0.0
+                "duration": action_duration if discrete_action != 0 else 0.0
             }
             writer.add_action(action_dict, timestamp_val + dt * 0.5)
 
@@ -607,7 +740,7 @@ def main():
         "--lerobot-path",
         type=str,
         required=True,
-        help="Path to LeRobot v3.0 dataset"
+        help="Path to LeRobot v3.0 dataset OR HuggingFace repo_id (e.g., 'username/dataset-name')"
     )
     parser.add_argument(
         "--output-dir",
@@ -636,10 +769,10 @@ def main():
         help="Joint name for action discretization"
     )
     parser.add_argument(
-        "--move-duration",
+        "--action-duration",
         type=float,
         default=0.5,
-        help="Duration of move actions in seconds"
+        help="Duration of move actions in seconds (used if no discrete action log available)"
     )
     parser.add_argument(
         "--velocity-threshold",
@@ -669,6 +802,9 @@ def main():
 
     args = parser.parse_args()
 
+    # Resolve dataset path (download from Hub if needed)
+    dataset_path = resolve_dataset_path(args.lerobot_path)
+
     # Validate joint name
     if args.joint_name not in SO101_JOINTS:
         print(f"Error: Unknown joint '{args.joint_name}'")
@@ -678,13 +814,13 @@ def main():
     joint_index = SO101_JOINTS.index(args.joint_name)
 
     config = ConversionConfig(
-        lerobot_path=args.lerobot_path,
+        lerobot_path=str(dataset_path),
         output_dir=args.output_dir,
         cameras=args.cameras,
         stack_cameras=args.stack_cameras,
         joint_name=args.joint_name,
         joint_index=joint_index,
-        move_duration=args.move_duration,
+        action_duration=args.action_duration,
         velocity_threshold=args.velocity_threshold,
         frame_size=tuple(args.frame_size),
         shard_size=args.shard_size,

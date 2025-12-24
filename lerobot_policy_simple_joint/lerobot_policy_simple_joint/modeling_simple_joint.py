@@ -6,6 +6,7 @@ A simple non-learned policy that controls a single joint with 3 discrete actions
 - Action 2: Move negative direction by position_delta
 """
 
+import json
 import time
 from typing import Dict, Optional
 
@@ -86,6 +87,43 @@ class SimpleJointPolicy(PreTrainedPolicy):
             self._rng = torch.Generator()
             self._rng.manual_seed(self.config.random_seed)
 
+    def _write_log_header(self):
+        """Write metadata header to log file with recording parameters.
+
+        Called when a new episode starts to write the header with all
+        recording configuration parameters.
+        """
+        if not self.config.discrete_action_log_path:
+            return
+
+        with open(self.config.discrete_action_log_path, "w") as f:
+            f.write(json.dumps({
+                "type": "header",
+                "joint_name": self.config.joint_name,
+                "action_duration": self.config.action_duration,
+                "position_delta": self.config.position_delta,
+                "use_random_policy": self.config.use_random_policy,
+                "action_sequence": self.config.action_sequence,
+                "random_seed": self.config.random_seed
+            }) + "\n")
+
+    def _log_discrete_action(self, timestamp: float, discrete_action: int):
+        """Log a discrete action decision to the log file.
+
+        Args:
+            timestamp: When the action decision was made
+            discrete_action: The discrete action chosen (0, 1, or 2)
+        """
+        if not self.config.discrete_action_log_path:
+            return
+
+        with open(self.config.discrete_action_log_path, "a") as f:
+            f.write(json.dumps({
+                "type": "action",
+                "timestamp": timestamp,
+                "discrete_action": discrete_action
+            }) + "\n")
+
     def _compute_action(self, batch: Dict[str, Tensor]) -> Tensor:
         """Compute action based on current observations.
 
@@ -132,6 +170,9 @@ class SimpleJointPolicy(PreTrainedPolicy):
         # Compute target position when action changes
         # This allows smooth motion instead of choppy per-frame increments
         if action_changed:
+            # Log the discrete action decision
+            self._log_discrete_action(current_time, self._current_action)
+
             current_pos = state[0, self.config.joint_index].item()
 
             if self._current_action == 1:

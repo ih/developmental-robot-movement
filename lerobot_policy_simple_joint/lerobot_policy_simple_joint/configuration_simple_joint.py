@@ -53,6 +53,10 @@ class SimpleJointConfig(PreTrainedConfig):
     action_sequence: Optional[List[int]] = None
     random_seed: Optional[int] = None
 
+    # Discrete action logging (for recording sessions)
+    discrete_action_log_dir: Optional[str] = None   # Directory for discrete action logs
+    discrete_action_log_path: Optional[str] = None  # Current episode's log path (set by reset())
+
     # Required PreTrainedConfig fields (fixed for this simple policy)
     n_obs_steps: int = 1
     n_action_steps: int = 1
