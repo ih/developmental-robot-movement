@@ -290,6 +290,16 @@ def capture_starting_position(robot_port: str) -> dict:
     return {}
 
 
+def print_command_line():
+    """Print the full lerobot-record command for debugging."""
+    # Build command: replace script name with lerobot-record, join all args
+    args = ["lerobot-record"] + sys.argv[1:]
+    command = " ".join(args)
+    print("\n=== Executing lerobot-record ===")
+    print(command)
+    print("================================\n")
+
+
 if __name__ == "__main__":
     check_and_clean_dataset_cache()
     calculate_and_inject_episode_time()
@@ -306,6 +316,9 @@ if __name__ == "__main__":
     starting_positions = {}
     if robot_port:
         starting_positions = capture_starting_position(robot_port)
+
+    # Print full command for debugging
+    print_command_line()
 
     # Run the recording
     try:
