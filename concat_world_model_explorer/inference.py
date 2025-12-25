@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 import config
 from . import state
-from .utils import format_loss
+from .utils import format_loss, compute_canvas_figsize
 from .canvas_ops import build_counterfactual_canvas, create_difference_heatmap
 from models.autoencoder_concat_predictor import (
     canvas_to_tensor,
@@ -30,12 +30,14 @@ def get_action_description(action):
     """
     if isinstance(action, dict):
         if 'action' in action:
-            # Toroidal dot style
+            # Discrete action style (toroidal dot, SO-101)
             action_val = action['action']
             if action_val == 0:
                 return "Stay (RED)"
             elif action_val == 1:
-                return "Move Right (GREEN)"
+                return "Move Positive (GREEN)"
+            elif action_val == 2:
+                return "Move Negative (BLUE)"
         elif 'motor_right' in action:
             # JetBot style
             motor_right = action['motor_right']
@@ -46,6 +48,29 @@ def get_action_description(action):
 
     # Fallback to session_explorer_lib's describe_action
     return describe_action(action)
+
+
+def get_counterfactual_action_choices():
+    """
+    Generate radio choices for counterfactual action based on session's action space.
+
+    Returns:
+        List of (label, value) tuples for Gradio Radio component
+    """
+    action_space = state.session_state.get("action_space", [])
+    if len(action_space) >= 3:
+        # SO-101 style: 3 actions
+        return [
+            ("Stay (action=0, RED)", 0),
+            ("Move Positive (action=1, GREEN)", 1),
+            ("Move Negative (action=2, BLUE)", 2),
+        ]
+    else:
+        # Toroidal dot style: 2 actions
+        return [
+            ("Stay (action=0, RED)", 0),
+            ("Move Right (action=1, GREEN)", 1),
+        ]
 
 
 def run_counterfactual_inference(frame_idx, counterfactual_action):
@@ -145,30 +170,34 @@ def run_counterfactual_inference(frame_idx, counterfactual_action):
     actual_action_desc = get_action_description(actual_action)
     cf_action_desc = get_action_description({"action": counterfactual_action})
 
+    # Compute dynamic figsize based on canvas dimensions
+    canvas_h, canvas_w = true_canvas.shape[:2]
+    figsize = compute_canvas_figsize(canvas_h, canvas_w)
+
     # Generate visualizations
     # 1. True canvas figure
-    fig_true_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
+    fig_true_canvas, ax = plt.subplots(1, 1, figsize=figsize)
     ax.imshow(true_canvas)
     ax.set_title(f"True Canvas (Actual Last Action: {actual_action_desc})")
     ax.axis("off")
     plt.tight_layout()
 
     # 2. Counterfactual canvas figure
-    fig_cf_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
+    fig_cf_canvas, ax = plt.subplots(1, 1, figsize=figsize)
     ax.imshow(cf_canvas)
     ax.set_title(f"Counterfactual Canvas (Last Action: {cf_action_desc})")
     ax.axis("off")
     plt.tight_layout()
 
     # 3. True inference composite
-    fig_true_inference, ax = plt.subplots(1, 1, figsize=(12, 4))
+    fig_true_inference, ax = plt.subplots(1, 1, figsize=figsize)
     ax.imshow(true_composite)
     ax.set_title(f"True Inference Composite (Loss: {format_loss(true_loss)})")
     ax.axis("off")
     plt.tight_layout()
 
     # 4. Counterfactual inference composite
-    fig_cf_inference, ax = plt.subplots(1, 1, figsize=(12, 4))
+    fig_cf_inference, ax = plt.subplots(1, 1, figsize=figsize)
     ax.imshow(cf_composite)
     ax.set_title(f"Counterfactual Inference Composite (Loss: {format_loss(cf_loss)})")
     ax.axis("off")

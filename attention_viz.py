@@ -19,6 +19,27 @@ import matplotlib.patches as mpatches
 from matplotlib.collections import LineCollection
 
 
+def compute_canvas_figsize(canvas_height: int, canvas_width: int, fig_width: float = 16.0) -> Tuple[float, float]:
+    """
+    Compute matplotlib figsize that preserves canvas aspect ratio.
+
+    Args:
+        canvas_height: Height of the canvas in pixels
+        canvas_width: Width of the canvas in pixels
+        fig_width: Desired figure width in inches (default 16 for attention viz)
+
+    Returns:
+        Tuple of (fig_width, fig_height) in inches
+    """
+    aspect_ratio = canvas_height / canvas_width
+    fig_height = fig_width * aspect_ratio
+
+    # Apply reasonable bounds (min 3 inches, max 12 inches for height)
+    fig_height = max(3.0, min(12.0, fig_height))
+
+    return (fig_width, fig_height)
+
+
 def compute_patch_centers(
     img_height: int,
     img_width: int,
@@ -202,8 +223,10 @@ def draw_attention_connections(
     # Identify masked and unmasked patches
     masked_indices, unmasked_indices = identify_masked_unmasked_patches(patch_mask)
 
-    # Create figure
-    fig, ax = plt.subplots(1, 1, figsize=(16, 6))
+    # Create figure with dynamic figsize based on canvas dimensions
+    canvas_h, canvas_w = canvas_img.shape[:2]
+    figsize = compute_canvas_figsize(canvas_h, canvas_w)
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
     ax.imshow(canvas_img)
     ax.axis('off')
 
@@ -603,8 +626,10 @@ def draw_attention_from_selected(
     if enabled_layers is None:
         enabled_layers = [True] * num_layers
 
-    # Create figure
-    fig, ax = plt.subplots(1, 1, figsize=(16, 6))
+    # Create figure with dynamic figsize based on canvas dimensions
+    canvas_h, canvas_w = canvas_img.shape[:2]
+    figsize = compute_canvas_figsize(canvas_h, canvas_w)
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
     ax.imshow(canvas_img)
     ax.axis('off')
 
@@ -802,8 +827,9 @@ def create_attention_heatmap_overlay(
     # Ensure heatmap matches image size exactly
     attention_heatmap = attention_heatmap[:img_height, :img_width]
 
-    # Create figure
-    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    # Create figure with dynamic figsize based on image dimensions
+    figsize = compute_canvas_figsize(img_height, img_width, fig_width=12.0)
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
     ax.imshow(frame_img)
 
     # Overlay heatmap

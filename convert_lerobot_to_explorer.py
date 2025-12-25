@@ -145,26 +145,44 @@ def load_discrete_action_log(log_path: Path) -> Optional[DiscreteActionLog]:
     return DiscreteActionLog(header=header, decisions=decisions)
 
 
-def get_discrete_action_for_timestamp(
+def get_decision_frame_indices(
     log: DiscreteActionLog,
-    frame_timestamp: float
-) -> int:
-    """Find the discrete action active at a given timestamp.
+    fps: float,
+    total_frames: int
+) -> List[Tuple[int, int]]:
+    """Map each action decision to a frame index.
+
+    Distributes decisions evenly across available frames since the action log
+    timestamps may not be synchronized with video timestamps.
 
     Args:
-        log: The discrete action log
-        frame_timestamp: Timestamp of the frame
+        log: The discrete action log with decisions
+        fps: Frame rate of the video
+        total_frames: Total number of frames in the episode
 
     Returns:
-        The discrete action (0, 1, or 2) that was active at frame_timestamp
+        List of (frame_index, discrete_action) tuples
     """
-    active_action = 0  # Default to stay if no decision yet
-    for decision in log.decisions:
-        if decision["timestamp"] <= frame_timestamp:
-            active_action = decision["discrete_action"]
-        else:
-            break  # Decisions are chronological
-    return active_action
+    if not log.decisions:
+        return []
+
+    num_decisions = len(log.decisions)
+
+    # Distribute decisions evenly across available frames
+    # Each decision needs a "before" frame and an "after" frame
+    # So we need at least num_decisions + 1 frames
+    if total_frames < num_decisions + 1:
+        # Not enough frames - only include as many decisions as we have frames for
+        num_decisions = total_frames - 1
+
+    decision_frames = []
+    for i, decision in enumerate(log.decisions[:num_decisions]):
+        # Evenly space the decisions across the video
+        # Decision i maps to frame i * (total_frames - 1) / num_decisions
+        frame_idx = int(i * (total_frames - 1) / num_decisions)
+        decision_frames.append((frame_idx, decision["discrete_action"]))
+
+    return decision_frames
 
 
 @dataclass
@@ -631,47 +649,97 @@ def convert_episode(
     if "frame_index" in episode_data.columns:
         video_offset = episode_data["frame_index"].iloc[0]
 
-    # Process each timestep
-    prev_state = None
-    for i, (_, row) in enumerate(episode_data.iterrows()):
-        frame_idx = i + video_offset
+    # Get total frames from first camera extractor
+    first_camera = config.cameras[0]
+    total_frames = extractors[first_camera].total_frames if first_camera in extractors else len(episode_data)
 
-        # Get timestamp
-        timestamp_val = row.get("timestamp", i * dt)
-        if hasattr(timestamp_val, 'item'):
-            timestamp_val = timestamp_val.item()
-
-        # Extract and combine frames from all cameras
+    def get_combined_frame(frame_idx: int) -> Optional[np.ndarray]:
+        """Extract and combine frames from all cameras for a given frame index."""
         camera_frames = []
         for camera in config.cameras:
             if camera not in extractors:
                 continue
             frame = extractors[camera].get_frame(frame_idx)
             if frame is not None:
-                # Resize to target size
                 resized = resize_frame(frame, config.frame_size)
                 camera_frames.append(resized)
-
         if not camera_frames:
-            continue
+            return None
+        return stack_frames(camera_frames, config.stack_cameras)
 
-        # Stack frames if multiple cameras
-        combined_frame = stack_frames(camera_frames, config.stack_cameras)
+    # Decision-boundary format: record observations only at action decision boundaries
+    if action_log and action_log.decisions:
+        # Map action decisions to frame indices
+        decision_frames = get_decision_frame_indices(action_log, reader.fps, total_frames)
 
-        # Add observation
-        writer.add_observation(combined_frame, timestamp_val)
+        # Trim trailing no-op actions (action=0) from the end
+        # Keep the frame indices for result observations before trimming
+        all_frame_indices = [f[0] for f in decision_frames]
+        original_count = len(decision_frames)
+        while decision_frames and decision_frames[-1][1] == 0:
+            decision_frames.pop()
 
-        # Get state and action for discretization (only needed if no log)
-        state = row.get("observation.state")
-        action_continuous = row.get("action")
+        if len(decision_frames) < original_count:
+            print(f"  Trimmed {original_count - len(decision_frames)} trailing no-op actions")
 
-        if state is not None and action_continuous is not None:
-            # Determine discrete action - use log if available, otherwise discretize
-            if action_log:
-                # Use timestamp-based lookup from the discrete action log
-                discrete_action = get_discrete_action_for_timestamp(action_log, timestamp_val)
+        if not decision_frames:
+            print(f"  Skipping episode {episode_idx}: all actions are no-ops")
+            for extractor in extractors.values():
+                extractor.close()
+            return False
+
+        print(f"  Converting {len(decision_frames)} decisions to decision-boundary format")
+
+        # Record initial observation (at first decision)
+        first_frame_idx = decision_frames[0][0] + video_offset
+        combined_frame = get_combined_frame(first_frame_idx)
+        if combined_frame is not None:
+            writer.add_observation(combined_frame, 0.0)
+
+        # For each action decision, record action then resulting observation
+        for i, (frame_idx, discrete_action) in enumerate(decision_frames):
+            # Record the action
+            action_dict = {
+                "action": discrete_action,
+                "duration": action_duration if discrete_action != 0 else 0.0
+            }
+            writer.add_action(action_dict, (i + 0.5) * action_duration)
+
+            # Record the resulting observation
+            # Use the original frame index list (before trimming) to get proper result frames
+            if i + 1 < len(all_frame_indices):
+                next_frame_idx = all_frame_indices[i + 1] + video_offset
             else:
-                # Fall back to velocity-based discretization
+                # After last action, use the last available frame
+                next_frame_idx = total_frames - 1 + video_offset
+
+            combined_frame = get_combined_frame(next_frame_idx)
+            if combined_frame is not None:
+                writer.add_observation(combined_frame, (i + 1) * action_duration)
+
+    else:
+        # Fallback: velocity-based discretization (frame-level format)
+        print(f"  No discrete action log, using velocity-based discretization")
+        for i, (_, row) in enumerate(episode_data.iterrows()):
+            frame_idx = i + video_offset
+
+            # Get timestamp
+            timestamp_val = row.get("timestamp", i * dt)
+            if hasattr(timestamp_val, 'item'):
+                timestamp_val = timestamp_val.item()
+
+            combined_frame = get_combined_frame(frame_idx)
+            if combined_frame is None:
+                continue
+
+            # Add observation
+            writer.add_observation(combined_frame, timestamp_val)
+
+            # Get state and action for discretization
+            state = row.get("observation.state")
+            action_continuous = row.get("action")
+
+            if state is not None and action_continuous is not None:
                 # Convert to numpy arrays if needed
                 if hasattr(state, 'tolist'):
                     state = np.array(state)
@@ -695,12 +763,12 @@ def convert_episode(
                     config.velocity_threshold
                 )
 
-            # Add action event
-            action_dict = {
-                "action": discrete_action,
-                "duration": action_duration if discrete_action != 0 else 0.0
-            }
-            writer.add_action(action_dict, timestamp_val + dt * 0.5)
+                # Add action event
+                action_dict = {
+                    "action": discrete_action,
+                    "duration": action_duration if discrete_action != 0 else 0.0
+                }
+                writer.add_action(action_dict, timestamp_val + dt * 0.5)
 
     # Finalize session
     writer.finalize()

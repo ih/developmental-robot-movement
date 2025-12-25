@@ -28,7 +28,7 @@ from models.canvas_dataset import create_canvas_dataloader
 from session_explorer_lib import load_frame_image
 
 from . import state
-from .utils import format_loss, format_grad_diagnostics
+from .utils import format_loss, format_grad_diagnostics, compute_canvas_figsize
 from .canvas_ops import build_canvas_from_frame
 from .evaluation import evaluate_full_session
 from .visualization import (
@@ -110,9 +110,14 @@ def train_on_single_canvas(frame_idx, num_training_steps):
     fig_training_inpainting_composite = None
 
     if state.world_model.last_training_canvas is not None:
+        # Compute dynamic figsize based on canvas dimensions
+        canvas = state.world_model.last_training_canvas
+        canvas_h, canvas_w = canvas.shape[:2]
+        figsize = compute_canvas_figsize(canvas_h, canvas_w)
+
         # 1. Original training canvas
-        fig_training_canvas, ax = plt.subplots(1, 1, figsize=(12, 4))
-        ax.imshow(state.world_model.last_training_canvas)
+        fig_training_canvas, ax = plt.subplots(1, 1, figsize=figsize)
+        ax.imshow(canvas)
         ax.set_title(f"Training Canvas (Frames {start_idx+1}-{frame_idx+1})")
         ax.axis("off")
         plt.tight_layout()
@@ -121,10 +126,10 @@ def train_on_single_canvas(frame_idx, num_training_steps):
         if state.world_model.last_training_mask is not None:
             # 2. Canvas with mask overlay
             canvas_with_mask = state.world_model.get_canvas_with_mask_overlay(
-                state.world_model.last_training_canvas,
+                canvas,
                 state.world_model.last_training_mask
             )
-            fig_training_canvas_masked, ax = plt.subplots(1, 1, figsize=(12, 4))
+            fig_training_canvas_masked, ax = plt.subplots(1, 1, figsize=figsize)
             ax.imshow(canvas_with_mask)
             ax.set_title("Training Canvas with Mask (Red = Masked Patches)")
             ax.axis("off")
@@ -132,10 +137,10 @@ def train_on_single_canvas(frame_idx, num_training_steps):
 
             # 3. Full model output
             inpainting_full = state.world_model.get_canvas_inpainting_full_output(
-                state.world_model.last_training_canvas,
+                canvas,
                 state.world_model.last_training_mask
             )
-            fig_training_inpainting_full, ax = plt.subplots(1, 1, figsize=(12, 4))
+            fig_training_inpainting_full, ax = plt.subplots(1, 1, figsize=figsize)
             ax.imshow(inpainting_full)
             ax.set_title("Training Inpainting - Full Model Output")
             ax.axis("off")
@@ -143,10 +148,10 @@ def train_on_single_canvas(frame_idx, num_training_steps):
 
             # 4. Composite
             inpainting_composite = state.world_model.get_canvas_inpainting_composite(
-                state.world_model.last_training_canvas,
+                canvas,
                 state.world_model.last_training_mask
             )
-            fig_training_inpainting_composite, ax = plt.subplots(1, 1, figsize=(12, 4))
+            fig_training_inpainting_composite, ax = plt.subplots(1, 1, figsize=figsize)
             ax.imshow(inpainting_composite)
             ax.set_title("Training Inpainting - Composite")
             ax.axis("off")

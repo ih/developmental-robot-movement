@@ -87,10 +87,13 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     gr.Markdown("Test what the model predicts if the last action before the selected frame was different.")
 
     with gr.Row():
-        # TODO: Make this dynamic based on the session's action space
-        # Currently hardcoded for toroidal dot environment
+        # Choices are updated dynamically when a session is loaded
         counterfactual_action_radio = gr.Radio(
-            choices=[(f"Stay (action=0)", 0), (f"Move Right (action=1)", 1)],
+            choices=[
+                ("Stay (action=0, RED)", 0),
+                ("Move Positive (action=1, GREEN)", 1),
+                ("Move Negative (action=2, BLUE)", 2),
+            ],
             value=1,
             label="Counterfactual Last Action",
             info="What action should we pretend was taken?"
@@ -403,7 +406,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     load_session_btn.click(
         fn=session_manager.load_session,
         inputs=[session_dropdown],
-        outputs=[session_info, frame_image, frame_info, checkpoint_dropdown]
+        outputs=[session_info, frame_image, frame_info, checkpoint_dropdown, counterfactual_action_radio]
     )
 
     # Checkpoint management event handlers

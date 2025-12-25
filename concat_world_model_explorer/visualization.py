@@ -10,6 +10,7 @@ import torch
 import config
 from . import state
 from .canvas_ops import build_canvas_from_frame
+from .utils import compute_canvas_figsize
 from models.autoencoder_concat_predictor import (
     canvas_to_tensor,
     compute_randomized_patch_mask_for_last_slot,
@@ -66,17 +67,30 @@ def generate_multiple_observation_canvases(observation_indices):
     if not valid_indices:
         return "No valid observation indices", None
 
+    # Build first canvas to get dimensions for figsize calculation
+    first_canvas, first_error, _, _ = build_canvas_from_frame(valid_indices[0])
+    if first_canvas is not None:
+        canvas_h, canvas_w = first_canvas.shape[:2]
+        # Compute per-row height based on canvas aspect ratio
+        single_figsize = compute_canvas_figsize(canvas_h, canvas_w, fig_width=16.0)
+        row_height = single_figsize[1]
+    else:
+        row_height = 4  # Fallback
+
     # Create grid: N rows × 2 columns (original + composite)
     n_obs = len(valid_indices)
-    fig, axes = plt.subplots(n_obs, 2, figsize=(16, 4 * n_obs))
+    fig, axes = plt.subplots(n_obs, 2, figsize=(16, row_height * n_obs))
 
     # Handle single observation case (axes won't be 2D)
     if n_obs == 1:
         axes = axes.reshape(1, -1)
 
     for i, obs_idx in enumerate(valid_indices):
-        # Build canvas
-        training_canvas, error, _, _ = build_canvas_from_frame(obs_idx)
+        # Build canvas (reuse first canvas if this is the first observation)
+        if i == 0 and first_canvas is not None:
+            training_canvas, error = first_canvas, first_error
+        else:
+            training_canvas, error, _, _ = build_canvas_from_frame(obs_idx)
         if training_canvas is None:
             # Show error in both subplots
             axes[i, 0].text(0.5, 0.5, f"Error: {error}", ha='center', va='center')

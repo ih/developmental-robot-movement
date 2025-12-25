@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 
 import config
 from . import state
+from .utils import compute_canvas_figsize
 from session_explorer_lib import load_frame_image
 from models.autoencoder_concat_predictor import build_canvas
 
@@ -119,7 +120,11 @@ def create_difference_heatmap(true_composite, cf_composite):
     diff = np.abs(cf_composite.astype(float) - true_composite.astype(float))
     diff_gray = np.mean(diff, axis=2)  # Average across RGB channels
 
-    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+    # Compute dynamic figsize based on composite dimensions
+    canvas_h, canvas_w = diff_gray.shape[:2]
+    figsize = compute_canvas_figsize(canvas_h, canvas_w)
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
     im = ax.imshow(diff_gray, cmap='hot', vmin=0, vmax=255)
     ax.set_title("Prediction Difference Heatmap (Counterfactual - True)")
     ax.axis("off")

@@ -46,8 +46,11 @@ def _separator_color_for_action(action: dict) -> Tuple[int,int,int]:
 
     Supports multiple action spaces:
      - JetBot motor actions: 'motor_right' value linearly interpolated RED (0.0) -> GREEN (0.12)
-     - Toroidal dot actions: 'action' = 0 -> RED, 'action' = 1 -> GREEN
-     - Unknown actions: BLUE
+     - Discrete actions (toroidal dot, SO-101):
+         action = 0 -> RED (stay/no movement)
+         action = 1 -> GREEN (move right / move positive)
+         action = 2 -> BLUE (move negative, SO-101 only)
+     - Unknown actions: YELLOW (warning color)
     """
     # JetBot motor action space
     if 'motor_right' in action:
@@ -60,12 +63,17 @@ def _separator_color_for_action(action: dict) -> Tuple[int,int,int]:
         b = 0
         return (r, g, b)
 
-    # Toroidal dot binary action space
-    if action.get('action', None) in (0, 1):
-        return (255, 0, 0) if action['action'] == 0 else (0, 255, 0)
+    # Discrete action space (toroidal dot: 2 actions, SO-101: 3 actions)
+    action_val = action.get('action', None)
+    if action_val == 0:
+        return (255, 0, 0)    # RED: stay / no movement
+    elif action_val == 1:
+        return (0, 255, 0)    # GREEN: move right / move positive
+    elif action_val == 2:
+        return (0, 0, 255)    # BLUE: move negative (SO-101)
 
     # Unknown action space
-    return (0, 0, 255)
+    return (255, 255, 0)  # YELLOW: warning
 
 def build_canvas(
     interleaved_history: List,

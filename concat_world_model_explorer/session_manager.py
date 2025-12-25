@@ -9,6 +9,7 @@ import gradio as gr
 import config
 from . import state
 from . import checkpoint_manager
+from .inference import get_counterfactual_action_choices
 from autoencoder_concat_predictor_world_model import AutoencoderConcatPredictorWorldModel
 from recording_reader import RecordingReader
 from replay_robot import ReplayRobot
@@ -35,7 +36,7 @@ def refresh_sessions():
 def load_session(session_choice):
     """Load a session from dropdown selection"""
     if not session_choice:
-        return "No session selected", None, "", gr.Dropdown()
+        return "No session selected", None, "", gr.Dropdown(), gr.Radio()
 
     # Extract session_dir from choice
     session_dir = session_choice.split(" - ")[-1]
@@ -78,7 +79,7 @@ def load_session(session_choice):
     # Build session info
     if not observations:
         info = f"**{state.session_state['session_name']}** has no observation frames."
-        return info, None, "", checkpoint_manager.refresh_checkpoints()
+        return info, None, "", checkpoint_manager.refresh_checkpoints(), gr.Radio()
 
     details = [
         f"**Session:** {state.session_state['session_name']}",
@@ -121,7 +122,9 @@ def load_session(session_choice):
 
     info += "\n\n**World model initialized and ready to run**"
 
-    return info, first_frame, frame_info, checkpoint_manager.refresh_checkpoints()
+    # Update counterfactual action radio based on session's action space
+    cf_choices = get_counterfactual_action_choices()
+    return info, first_frame, frame_info, checkpoint_manager.refresh_checkpoints(), gr.update(choices=cf_choices, value=1)
 
 
 def update_frame(frame_idx):

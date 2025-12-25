@@ -2,6 +2,29 @@
 Utility functions for formatting and display.
 """
 
+from typing import Tuple
+
+
+def compute_canvas_figsize(canvas_height: int, canvas_width: int, fig_width: float = 12.0) -> Tuple[float, float]:
+    """
+    Compute matplotlib figsize that preserves canvas aspect ratio.
+
+    Args:
+        canvas_height: Height of the canvas in pixels
+        canvas_width: Width of the canvas in pixels
+        fig_width: Desired figure width in inches (default 12)
+
+    Returns:
+        Tuple of (fig_width, fig_height) in inches
+    """
+    aspect_ratio = canvas_height / canvas_width
+    fig_height = fig_width * aspect_ratio
+
+    # Apply reasonable bounds (min 2 inches, max 10 inches for height)
+    fig_height = max(2.0, min(10.0, fig_height))
+
+    return (fig_width, fig_height)
+
 
 def format_loss(loss_value):
     """Format loss value for display"""
