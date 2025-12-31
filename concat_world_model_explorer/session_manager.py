@@ -51,7 +51,7 @@ def load_session(session_choice):
     print("Pre-building all canvases for batch training...")
     print("="*60)
     prebuild_start = time.time()
-    canvas_cache = prebuild_all_canvases(
+    canvas_cache, detected_frame_size = prebuild_all_canvases(
         session_dir,
         observations,
         actions,
@@ -59,7 +59,9 @@ def load_session(session_choice):
     )
     prebuild_time = time.time() - prebuild_start
     print(f"Canvas pre-building completed in {prebuild_time:.2f}s")
-    print(f"Memory usage: ~{len(canvas_cache) * 224 * 688 * 3 / (1024**2):.1f} MB")
+    # Calculate canvas width based on detected frame size
+    canvas_width = detected_frame_size[1] * 3 + config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH * 2
+    print(f"Memory usage: ~{len(canvas_cache) * detected_frame_size[0] * canvas_width * 3 / (1024**2):.1f} MB")
     print("="*60 + "\n")
 
     # Store action space for robot-agnostic action handling
@@ -74,6 +76,7 @@ def load_session(session_choice):
         "actions": actions,
         "canvas_cache": canvas_cache,
         "action_space": action_space,  # Added for JetBot support
+        "detected_frame_size": detected_frame_size,  # (H, W) tuple from first loaded image
     })
 
     # Build session info
@@ -118,6 +121,7 @@ def load_session(session_choice):
         replay_robot,
         action_selector=action_selector_adapter,
         device=state.device,
+        frame_size=detected_frame_size,
     )
 
     info += "\n\n**World model initialized and ready to run**"

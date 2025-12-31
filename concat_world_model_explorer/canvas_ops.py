@@ -61,10 +61,16 @@ def build_canvas_from_frame(frame_idx):
         if i + 1 < len(selected_frames):
             interleaved.append(selected_frames[i + 1])
 
+    # Get detected frame size from session state, fallback to config
+    detected_frame_size = state.session_state.get(
+        "detected_frame_size",
+        config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE
+    )
+
     # Build training canvas
     training_canvas = build_canvas(
         interleaved,
-        frame_size=config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+        frame_size=detected_frame_size,
         sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
     )
 
@@ -96,10 +102,16 @@ def build_counterfactual_canvas(frame_idx, counterfactual_action):
     counterfactual_interleaved = interleaved.copy()
     counterfactual_interleaved[-2] = {"action": counterfactual_action}
 
+    # Get detected frame size from session state, fallback to config
+    detected_frame_size = state.session_state.get(
+        "detected_frame_size",
+        config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE
+    )
+
     # Build counterfactual canvas
     counterfactual_canvas = build_canvas(
         counterfactual_interleaved,
-        frame_size=config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+        frame_size=detected_frame_size,
         sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
     )
 

@@ -4,6 +4,7 @@ Visualization functions for training progress, loss plots, and observation grids
 
 import random
 import math
+from datetime import timedelta
 import matplotlib.pyplot as plt
 import torch
 
@@ -148,22 +149,14 @@ def generate_batch_training_update(samples_seen, total_samples, cumulative_metri
     if completed:
         status = f"✅ **Training Complete: {samples_seen} samples**"
         if elapsed_time is not None:
-            mins = int(elapsed_time // 60)
-            secs = elapsed_time % 60
-            if mins > 0:
-                status += f"\n\n⏱️ **Time elapsed:** {mins}m {secs:.1f}s"
-            else:
-                status += f"\n\n⏱️ **Time elapsed:** {secs:.1f}s"
+            td = timedelta(seconds=int(elapsed_time))
+            status += f"\n\n⏱️ **Time elapsed:** {td}"
     else:
         progress_pct = (samples_seen / total_samples) * 100
         status = f"🔄 **Training... {samples_seen}/{total_samples} samples ({progress_pct:.1f}%)**"
         if elapsed_time is not None:
-            mins = int(elapsed_time // 60)
-            secs = elapsed_time % 60
-            if mins > 0:
-                status += f"\n\n⏱️ **Elapsed:** {mins}m {secs:.1f}s"
-            else:
-                status += f"\n\n⏱️ **Elapsed:** {secs:.1f}s"
+            td = timedelta(seconds=int(elapsed_time))
+            status += f"\n\n⏱️ **Elapsed:** {td}"
 
     # Loss vs samples plot (full history)
     fig_loss_vs_samples = create_loss_vs_samples_plot(cumulative_metrics)

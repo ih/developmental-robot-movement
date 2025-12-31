@@ -327,11 +327,13 @@ def prebuild_all_canvases(session_dir, observations, actions, config):
         config: AutoencoderConcatPredictorWorldModelConfig class
 
     Returns:
-        Dictionary mapping frame_idx -> {
+        Tuple of:
+        - canvas_cache: Dictionary mapping frame_idx -> {
             'canvas': numpy HxWx3 uint8 array,
             'start_idx': starting frame index for canvas,
             'interleaved': interleaved history [frame, action, frame, ...]
-        }
+          }
+        - detected_frame_size: Tuple (H, W) detected from first loaded image
     """
     from models.autoencoder_concat_predictor import build_canvas
     import numpy as np
@@ -340,6 +342,7 @@ def prebuild_all_canvases(session_dir, observations, actions, config):
 
     min_frames_needed = config.CANVAS_HISTORY_SIZE
     canvas_cache = {}
+    detected_frame_size = config.FRAME_SIZE  # Default to config, will be updated from first image
 
     # Pre-load all frame images to avoid repeated disk I/O
     print(f"Pre-loading {len(observations)} frames from disk...")
@@ -353,11 +356,16 @@ def prebuild_all_canvases(session_dir, observations, actions, config):
         try:
             with open(full_path, "rb") as f:
                 img = Image.open(io.BytesIO(f.read())).convert("RGB")
-                frame_images.append(np.array(img))
+                frame_arr = np.array(img)
+                frame_images.append(frame_arr)
+                # Detect frame size from first successfully loaded image
+                if len(frame_images) == 1:
+                    detected_frame_size = (frame_arr.shape[0], frame_arr.shape[1])  # (H, W)
+                    print(f"  Detected frame size: {detected_frame_size}")
         except Exception as e:
             print(f"  Warning: Failed to load frame {i} from {full_path}: {e}")
-            # Use black placeholder
-            frame_images.append(np.zeros((224, 224, 3), dtype=np.uint8))
+            # Use black placeholder with detected size
+            frame_images.append(np.zeros((detected_frame_size[0], detected_frame_size[1], 3), dtype=np.uint8))
 
     print(f"Pre-loaded {len(frame_images)} frames")
 
@@ -398,7 +406,7 @@ def prebuild_all_canvases(session_dir, observations, actions, config):
         try:
             canvas = build_canvas(
                 interleaved,
-                frame_size=config.FRAME_SIZE,
+                frame_size=detected_frame_size,  # Use detected size instead of config
                 sep_width=config.SEPARATOR_WIDTH,
             )
 
@@ -411,7 +419,7 @@ def prebuild_all_canvases(session_dir, observations, actions, config):
             print(f"  Warning: Failed to build canvas for frame {frame_idx}: {e}")
 
     print(f"Pre-built {len(canvas_cache)} canvases successfully")
-    return canvas_cache
+    return canvas_cache, detected_frame_size
 
 
 def tensor_to_numpy_image(tensor):

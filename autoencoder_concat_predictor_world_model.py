@@ -44,6 +44,7 @@ class AutoencoderConcatPredictorWorldModel:
         action_selector: Optional[Callable] = None,
         device: Optional[torch.device] = None,
         training_callback: Optional[Callable] = None,
+        frame_size: Optional[Tuple[int, int]] = None,
     ):
         """
         Initialize the autoencoder concat predictor world model.
@@ -54,16 +55,27 @@ class AutoencoderConcatPredictorWorldModel:
                            If None, uses default random action selection
             device: torch.device for model computations (defaults to cuda if available)
             training_callback: Optional callback(iteration, loss) called after each training step
+            frame_size: Optional (H, W) tuple for frame dimensions. If None, uses config default.
         """
         self.robot = robot_interface
         self.action_selector = action_selector or self._default_action_selector
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.training_callback = training_callback
 
+        # Use provided frame_size or fall back to config
+        if frame_size is not None:
+            frame_height, frame_width = frame_size
+        else:
+            frame_height = Config.FRAME_SIZE[0]
+            frame_width = Config.FRAME_SIZE[1]
+
+        # Store the frame size used for this model instance
+        self.frame_size = (frame_height, frame_width)
+
         # Initialize autoencoder model for canvas dimensions
-        # Canvas: height=224, width = CANVAS_HISTORY_SIZE * 224 + (CANVAS_HISTORY_SIZE - 1) * SEPARATOR_WIDTH
-        canvas_height = Config.FRAME_SIZE[0]
-        canvas_width = Config.CANVAS_HISTORY_SIZE * Config.FRAME_SIZE[1] + (Config.CANVAS_HISTORY_SIZE - 1) * Config.SEPARATOR_WIDTH
+        # Canvas: height=frame_height, width = CANVAS_HISTORY_SIZE * frame_width + (CANVAS_HISTORY_SIZE - 1) * SEPARATOR_WIDTH
+        canvas_height = frame_height
+        canvas_width = Config.CANVAS_HISTORY_SIZE * frame_width + (Config.CANVAS_HISTORY_SIZE - 1) * Config.SEPARATOR_WIDTH
 
         self.autoencoder = TargetedMAEWrapper(
             img_height=canvas_height,
@@ -105,7 +117,7 @@ class AutoencoderConcatPredictorWorldModel:
 
         print(f"AutoencoderConcatPredictorWorldModel initialized on {self.device}")
         print(f"Canvas history size: {Config.CANVAS_HISTORY_SIZE}")
-        print(f"Frame size: {Config.FRAME_SIZE}")
+        print(f"Frame size: {self.frame_size}")
         print(f"Separator width: {Config.SEPARATOR_WIDTH}")
 
     def _default_action_selector(self, observation: np.ndarray, action_space: list) -> dict:

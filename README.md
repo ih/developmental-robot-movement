@@ -10,8 +10,9 @@ This repository contains research code for a canvas-based world model that learn
 1. **RobotInterface** (`robot_interface.py`) - Abstract base class defining robot interaction contract
 2. **JetBot Implementation** (`jetbot_interface.py`, `jetbot_remote_client.py`) - Physical robot interface
 3. **Toroidal Dot Environment** (`toroidal_dot_env.py`, `toroidal_dot_interface.py`) - Simulated environment for testing
-4. **Autoencoder Concat Predictor World Model** (`autoencoder_concat_predictor_world_model.py`) - Canvas-based world model
-5. **Concat World Model Explorer** (`concat_world_model_explorer/`) - Interactive web-based interface for exploring sessions
+4. **SO-101 Robot Arm** (`lerobot_policy_simple_joint/`, `convert_lerobot_to_explorer.py`) - LeRobot integration for SO-101 follower arm
+5. **Autoencoder Concat Predictor World Model** (`autoencoder_concat_predictor_world_model.py`) - Canvas-based world model
+6. **Concat World Model Explorer** (`concat_world_model_explorer/`) - Interactive web-based interface for exploring sessions
 
 ## Architecture
 
@@ -24,6 +25,7 @@ The concat world model uses a unique approach to visual prediction:
 - **MAE-native training**: Optimizes only masked patches using the MaskedAutoencoderViT architecture
 - **Action encoding**: Actions encoded as thin colored separators between frames (e.g., red for stay, green for move)
 - **Non-square canvases**: Handles non-square concatenated images (e.g., 224x688 for 3 frames + 2 separators)
+- **Multi-resolution support**: Automatic frame size detection from loaded sessions (e.g., 448x224 for SO-101 dual-camera stacking)
 - **Single-step training**: One training step per world model iteration for real-time learning
 
 ### RobotInterface Abstraction
@@ -51,12 +53,22 @@ The concat world model uses a unique approach to visual prediction:
 - **No hardware needed**: Perfect for debugging and development
 - **Configurable**: Dot size, movement speed, image size via ToroidalDotConfig
 
+### SO-101 Robot Arm
+
+- **LeRobot integration**: Custom policy package for SO-101 follower arm control
+- **Single-joint control**: 3 discrete actions (stay, move positive, move negative) per joint
+- **Configurable joint**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
+- **Dual-camera support**: Stacks base_0_rgb and left_wrist_0_rgb cameras vertically for 448x224 combined frames
+- **Discrete action logging**: Automatic JSONL logs for 100% accurate action reconstruction
+- **Dataset converter**: Convert LeRobot v3.0 datasets to concat_world_model_explorer format
+
 ### Action Selectors
 
 - **Pluggable architecture**: Action selectors are functions that take observations and return actions
 - **Toroidal action selectors** (`toroidal_action_selectors.py`):
   - `create_constant_action_selector(action)`: Always returns the same action
   - `create_sequence_action_selector(sequence)`: Cycles through a sequence of actions
+  - `create_random_duration_action_selector(min_duration, max_duration, seed)`: Random actions with random durations
   - Pre-defined sequences: `SEQUENCE_ALWAYS_MOVE`, `SEQUENCE_ALWAYS_STAY`, `SEQUENCE_ALTERNATE`, `SEQUENCE_DOUBLE_MOVE`, `SEQUENCE_TRIPLE_MOVE`
 - **Recorded action selector** (`recorded_policy.py`):
   - `create_recorded_action_selector(reader)`: Replays actions from recorded sessions
@@ -72,7 +84,7 @@ python -m concat_world_model_explorer
 
 **The primary way to interact with the concat world model.** This modular web-based interface provides:
 
-- **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/`
+- **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/` or `saved/sessions/so101/`
 - **Frame navigation**: Browse session frames with slider and text input
 - **World model execution**: Run world model for specified number of iterations
 - **Full masking approach**: Uses MASK_RATIO = 1.0 for complete next-frame inpainting
@@ -132,8 +144,47 @@ To create new sessions for exploration, you need to implement a script that:
 Sessions are automatically saved to robot-specific directories:
 - JetBot: `saved/sessions/jetbot/`
 - Toroidal dot: `saved/sessions/toroidal_dot/`
+- SO-101: `saved/sessions/so101/`
 
 **Disk space management**: Automatic cleanup of oldest sessions when total recordings exceed configurable disk limit (default 10 GB per robot type).
+
+### SO-101 Robot Arm with LeRobot
+
+#### Install the Policy Package
+```bash
+cd lerobot_policy_simple_joint
+pip install -e .
+```
+
+#### Record with lerobot-record
+
+Use `run_lerobot_record.py` wrapper for action sequences (auto-calculates episode time):
+```bash
+python run_lerobot_record.py \
+    --robot.type=so101_follower \
+    --robot.port=COM8 \
+    --robot.id=my_so101_follower \
+    --robot.cameras="{ base_0_rgb: {type: opencv, index_or_path: 0, width: 1280, height: 720, fps: 30}, left_wrist_0_rgb: {type: opencv, index_or_path: 1, width: 1280, height: 720, fps: 30}}" \
+    --policy.type=simple_joint \
+    --policy.joint_name=wrist_roll.pos \
+    --policy.action_duration=0.5 \
+    --policy.position_delta=10 \
+    --policy.action_sequence="[1, 0, 2, 0, 1]" \
+    --dataset.repo_id=${HF_USER}/so101-test \
+    --dataset.num_episodes=1 \
+    --dataset.single_task="Single joint movement"
+```
+
+#### Convert LeRobot Dataset to Explorer Format
+```bash
+python convert_lerobot_to_explorer.py \
+    --lerobot-path ${HF_USER}/so101-single-joint \
+    --output-dir saved/sessions/so101 \
+    --cameras base_0_rgb left_wrist_0_rgb \
+    --stack-cameras vertical
+```
+
+The converter downloads from HuggingFace Hub and reads action parameters from discrete action logs automatically.
 
 ### Interactive Testing
 
@@ -190,12 +241,16 @@ Required Python packages:
 - `jetbot_remote_client.py`: Low-level JetBot RPyC client
 - `toroidal_dot_env.py`: Simulated toroidal environment
 - `toroidal_dot_interface.py`: ToroidalDotRobot implementation
+- `lerobot_policy_simple_joint/`: LeRobot custom policy for SO-101 single-joint control
+- `run_lerobot_record.py`: Wrapper for lerobot-record with auto-calculated episode timing
+- `convert_lerobot_to_explorer.py`: Dataset converter for LeRobot v3.0 to explorer format
 
 ### Models
 - `models/__init__.py`: Module exports
 - `models/base_autoencoder.py`: Base class for autoencoders
 - `models/vit_autoencoder.py`: MaskedAutoencoderViT with powerful transformer encoder/decoder
 - `models/autoencoder_concat_predictor.py`: Canvas building and TargetedMAEWrapper for masked inpainting
+- `models/canvas_dataset.py`: PyTorch Dataset and DataLoader for high-performance batch training
 
 ### Action Selection and Recording
 - `toroidal_action_selectors.py`: Action selector factories (constant and sequence selectors)
@@ -257,6 +312,13 @@ To add support for a new robot:
 - Inpainting threshold of 0.0001 for quality gating
 - AdamW optimizer with cosine decay learning rate schedule
 
+**Batch Training Performance (4-phase optimization):**
+- **Phase 1**: Canvas pre-building at session load (~6400 canvases cached in memory)
+- **Phase 2**: PyTorch DataLoader with pinned memory for async GPU transfers
+- **Phase 3**: GPU-accelerated mask generation using vectorized torch operations
+- **Phase 4**: CUDA stream pipelining for overlapping GPU training with CPU→GPU transfers
+- **Results**: 6.92x speedup (129.5s → 18.7s for 6400 samples at batch size 64)
+
 ### Decoder Attention Analysis
 
 The concat world model explorer provides powerful attention visualization:
@@ -286,7 +348,8 @@ The `config.py` file contains:
 
 - **AutoencoderConcatPredictorWorldModelConfig**: Canvas size, separator width, history size, training thresholds
 - **ToroidalDotConfig**: Simulated environment parameters (dot size, movement speed, image dimensions)
-- **Robot-specific directories**: Separate checkpoint and recording directories for JetBot and toroidal dot
+- **SO101Config**: Configuration for SO-101 follower arm (joint names, action parameters, dual-camera frame size)
+- **Robot-specific directories**: Separate checkpoint and recording directories for JetBot, toroidal dot, and SO-101
 - **Recording configuration**: `RECORDING_MODE` boolean and `RECORDING_MAX_DISK_GB` for disk management
 
 ## Next Steps
