@@ -68,12 +68,15 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     gr.Markdown("---")
 
     # Frame Viewer
-    gr.Markdown("## Current Frame")
+    gr.Markdown("## Current Frame & Canvas")
     with gr.Row():
         with gr.Column(scale=2):
             frame_image = gr.Image(label="Current Frame", type="pil", interactive=False)
         with gr.Column(scale=1):
             frame_info = gr.Markdown("Load a session to view frames.")
+
+    # Canvas ending at current frame
+    canvas_image = gr.Image(label="Canvas (ending at current frame)", type="numpy", interactive=False)
 
     # Frame Navigation
     with gr.Row():
@@ -216,7 +219,83 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Maximum number of best model checkpoints to keep (auto-deletes worse models)"
         )
 
+    # Resume Mode Controls
+    gr.Markdown("### Resume Training from Checkpoint")
+    with gr.Row():
+        resume_mode_checkbox = gr.Checkbox(
+            label="Resume Mode",
+            value=False,
+            info="Continue training from loaded checkpoint (preserves samples count, plots, W&B steps)"
+        )
+        samples_mode_radio = gr.Radio(
+            choices=["Train additional samples", "Train to total samples"],
+            value="Train additional samples",
+            label="Samples Mode",
+            info="How to interpret 'Total Samples' when resuming"
+        )
+        starting_samples_input = gr.Number(
+            value=0,
+            label="Starting Samples Seen",
+            precision=0,
+            minimum=0,
+            interactive=True,
+            info="Prefilled from checkpoint; adjust if needed"
+        )
+
+    with gr.Row():
+        preserve_optimizer_checkbox = gr.Checkbox(
+            label="Keep Optimizer State",
+            value=True,
+            info="Preserve momentum/velocity from checkpoint (recommended for resuming)"
+        )
+        preserve_scheduler_checkbox = gr.Checkbox(
+            label="Keep Scheduler State",
+            value=True,
+            info="Continue LR schedule from checkpoint step"
+        )
+
+    # Learning Rate Controls
+    gr.Markdown("### Learning Rate Settings")
+    with gr.Row():
+        custom_lr_input = gr.Number(
+            value=0,
+            label="Custom Base LR (0=default)",
+            minimum=0,
+            interactive=True,
+            info=f"Override base LR (default: 2e-5). Set 0 to use config default."
+        )
+        disable_lr_scaling_checkbox = gr.Checkbox(
+            label="Disable LR Scaling",
+            value=False,
+            info="Use exact LR instead of scaling by batch size"
+        )
+        custom_warmup_input = gr.Number(
+            value=-1,
+            label="Warmup Steps (-1=default)",
+            precision=0,
+            minimum=-1,
+            interactive=True,
+            info="-1 uses scaled default, 0 disables warmup, >0 sets exact steps"
+        )
+        lr_min_ratio_input = gr.Number(
+            value=0.01,
+            label="LR Min Ratio",
+            minimum=0,
+            maximum=1,
+            interactive=True,
+            info="Minimum LR as ratio of base LR for cosine decay"
+        )
+        resume_warmup_ratio_input = gr.Number(
+            value=0.01,
+            label="Resume Warmup Ratio",
+            minimum=0,
+            maximum=1,
+            interactive=True,
+            info="Warmup steps as ratio of session steps when resuming (0=instant jump, 0.01=1%)"
+        )
+
     # Weights & Biases logging controls
+    gr.Markdown("### Logging")
     with gr.Row():
         enable_wandb_input = gr.Checkbox(
             label="Enable Weights & Biases Logging",
@@ -229,11 +308,15 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Custom name for this wandb run"
         )
 
-    # Training info display (dynamically updated)
+    # Training info display (dynamically updated based on total_samples and batch_size)
     training_info_display = gr.Markdown("")
+
+    # Pre-flight summary (shows configuration before training)
+    preflight_summary = gr.Markdown("")
 
     with gr.Row():
         run_batch_btn = gr.Button("🚀 Run Batch Training", variant="primary")
+        show_preflight_btn = gr.Button("📋 Show Config", variant="secondary")
 
     batch_training_status = gr.Markdown("")
 
@@ -406,7 +489,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     load_session_btn.click(
         fn=session_manager.load_session,
         inputs=[session_dropdown],
-        outputs=[session_info, frame_image, frame_info, checkpoint_dropdown, counterfactual_action_radio]
+        outputs=[session_info, frame_image, frame_info, canvas_image, checkpoint_dropdown, counterfactual_action_radio]
     )
 
     # Checkpoint management event handlers
@@ -422,21 +505,28 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         outputs=[checkpoint_dropdown]
     )
 
+    def load_checkpoint_and_update_resume(checkpoint_name):
+        """Load checkpoint and update resume-related fields."""
+        status = checkpoint_manager.load_model_weights(checkpoint_name)
+        # Return the samples_seen from loaded metadata
+        samples_seen = state.loaded_checkpoint_metadata.get('samples_seen', 0)
+        return status, samples_seen
+
     load_checkpoint_btn.click(
-        fn=checkpoint_manager.load_model_weights,
+        fn=load_checkpoint_and_update_resume,
         inputs=[checkpoint_dropdown],
-        outputs=[load_checkpoint_status]
+        outputs=[load_checkpoint_status, starting_samples_input]
     )
 
     def jump_to_frame(frame_num):
         frame_num = int(frame_num)
-        img, info = session_manager.update_frame(frame_num)
-        return img, info
+        img, info, canvas = session_manager.update_frame(frame_num)
+        return img, info, canvas
 
     jump_btn.click(
         fn=jump_to_frame,
         inputs=[frame_number_input],
-        outputs=[frame_image, frame_info]
+        outputs=[frame_image, frame_info, canvas_image]
     )
 
     # Counterfactual testing
@@ -498,9 +588,17 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     # Batch training handler (takes current slider value as input)
     run_batch_btn.click(
         fn=training.run_world_model_batch,
-        inputs=[total_samples_input, batch_size_input, frame_number_input, update_interval_input,
-                window_size_input, num_random_obs_input, num_best_models_input,
-                enable_wandb_input, wandb_run_name_input],
+        inputs=[
+            total_samples_input, batch_size_input, frame_number_input, update_interval_input,
+            window_size_input, num_random_obs_input, num_best_models_input,
+            enable_wandb_input, wandb_run_name_input,
+            # Resume mode parameters
+            resume_mode_checkbox, samples_mode_radio, starting_samples_input,
+            preserve_optimizer_checkbox, preserve_scheduler_checkbox,
+            # Learning rate parameters
+            custom_lr_input, disable_lr_scaling_checkbox, custom_warmup_input, lr_min_ratio_input,
+            resume_warmup_ratio_input,
+        ],
         outputs=[
             batch_training_status,
             loss_vs_samples_plot,
@@ -510,6 +608,19 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             observation_samples_status,
             observation_samples_plot,
         ]
+    )
+
+    # Pre-flight summary button
+    show_preflight_btn.click(
+        fn=training.generate_preflight_summary,
+        inputs=[
+            total_samples_input, batch_size_input,
+            resume_mode_checkbox, samples_mode_radio, starting_samples_input,
+            preserve_optimizer_checkbox, preserve_scheduler_checkbox,
+            custom_lr_input, disable_lr_scaling_checkbox, custom_warmup_input, lr_min_ratio_input,
+            resume_warmup_ratio_input,
+        ],
+        outputs=[preflight_summary]
     )
 
     generate_attn_btn.click(

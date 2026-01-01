@@ -67,6 +67,9 @@ def load_session(session_choice):
     # Store action space for robot-agnostic action handling
     action_space = metadata.get("action_space", [])
 
+    # Reset checkpoint metadata when loading a new session (fresh start)
+    state.reset_checkpoint_metadata()
+
     state.session_state.update({
         "session_name": os.path.basename(session_dir),
         "session_dir": session_dir,
@@ -82,7 +85,7 @@ def load_session(session_choice):
     # Build session info
     if not observations:
         info = f"**{state.session_state['session_name']}** has no observation frames."
-        return info, None, "", checkpoint_manager.refresh_checkpoints(), gr.Radio()
+        return info, None, "", None, checkpoint_manager.refresh_checkpoints(), gr.Radio()
 
     details = [
         f"**Session:** {state.session_state['session_name']}",
@@ -126,15 +129,20 @@ def load_session(session_choice):
 
     info += "\n\n**World model initialized and ready to run**"
 
+    # Initial canvas is None (frame 0 doesn't have enough history)
+    min_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+    frame_info += f"\n\n**Canvas:** Not available (need {min_frames} frames)"
+    initial_canvas = None
+
     # Update counterfactual action radio based on session's action space
     cf_choices = get_counterfactual_action_choices()
-    return info, first_frame, frame_info, checkpoint_manager.refresh_checkpoints(), gr.update(choices=cf_choices, value=1)
+    return info, first_frame, frame_info, initial_canvas, checkpoint_manager.refresh_checkpoints(), gr.update(choices=cf_choices, value=1)
 
 
 def update_frame(frame_idx):
-    """Update frame display"""
+    """Update frame display and canvas ending at this frame"""
     if not state.session_state.get("observations"):
-        return None, ""
+        return None, "", None
 
     frame_idx = int(frame_idx)  # Convert to int (Gradio sliders pass floats)
 
@@ -146,4 +154,17 @@ def update_frame(frame_idx):
     frame = load_frame_image(obs["full_path"])
     frame_info = f"**Observation {frame_idx + 1} / {len(observations)}**\n\nStep: {obs['step']}\n\nTimestamp: {format_timestamp(obs['timestamp'])}"
 
-    return frame, frame_info
+    # Get canvas from cache if available
+    canvas_cache = state.session_state.get("canvas_cache", {})
+    canvas_image = None
+    if frame_idx in canvas_cache:
+        canvas_data = canvas_cache[frame_idx]
+        canvas_image = canvas_data['canvas']  # numpy HxWx3 uint8
+        start_idx = canvas_data['start_idx']
+        frame_info += f"\n\n**Canvas:** frames {start_idx + 1} → {frame_idx + 1}"
+    else:
+        min_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+        if frame_idx < min_frames - 1:
+            frame_info += f"\n\n**Canvas:** Not available (need {min_frames} frames)"
+
+    return frame, frame_info, canvas_image

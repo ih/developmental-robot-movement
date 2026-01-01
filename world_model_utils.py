@@ -62,7 +62,7 @@ def create_param_groups(model, weight_decay):
     ]
 
 
-def create_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps=100000, lr_min_ratio=0.01):
+def create_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps=100000, lr_min_ratio=0.01, lr_min=None):
     """
     Create warmup + cosine decay learning rate scheduler.
 
@@ -70,14 +70,20 @@ def create_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps=100000, 
         optimizer: The optimizer to schedule
         warmup_steps: Number of warmup steps (linear increase from 0 to base_lr)
         total_steps: Total training steps (default: 100000)
-        lr_min_ratio: Minimum LR as ratio of base LR (default: 0.01)
+        lr_min_ratio: Minimum LR as ratio of base LR (default: 0.01), used if lr_min not specified
+        lr_min: Absolute minimum LR (overrides lr_min_ratio if specified)
 
     Returns:
         Learning rate scheduler (torch.optim.lr_scheduler.LambdaLR)
     """
     # Calculate minimum learning rate
     base_lr = optimizer.param_groups[0]['lr']
-    lr_min = max(base_lr * lr_min_ratio, 1e-6)
+    if lr_min is not None:
+        # Use absolute minimum LR
+        actual_lr_min = max(lr_min, 1e-8)
+    else:
+        # Use ratio-based minimum LR
+        actual_lr_min = max(base_lr * lr_min_ratio, 1e-8)
 
     # Create warmup + cosine decay scheduler using LambdaLR
     def lr_lambda(current_step):
@@ -88,9 +94,55 @@ def create_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps=100000, 
             # Cosine decay from 1 to lr_min_ratio
             progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
             cosine_decay = 0.5 * (1.0 + np.cos(np.pi * min(progress, 1.0)))
-            # Scale between lr_min_ratio and 1.0
-            min_ratio = lr_min / base_lr
+            # Scale between min_ratio and 1.0
+            min_ratio = actual_lr_min / base_lr
             return min_ratio + (1.0 - min_ratio) * cosine_decay
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def create_resume_scheduler(optimizer, warmup_from_lr, warmup_to_lr, warmup_steps,
+                             decay_to_lr, total_steps):
+    """
+    Create scheduler for resuming training with gradual LR warmup.
+
+    This scheduler:
+    1. Warmup: Ramps from warmup_from_lr to warmup_to_lr over warmup_steps
+    2. Decay: Cosine decay from warmup_to_lr to decay_to_lr over remaining steps
+
+    Used when resuming from a checkpoint where the LR needs to "jump up" to match
+    the global schedule - the warmup gives momentum time to adapt.
+
+    Args:
+        optimizer: The optimizer to schedule (should have LR set to warmup_from_lr)
+        warmup_from_lr: Starting LR (typically checkpoint's ending LR)
+        warmup_to_lr: Target LR after warmup (computed from global schedule)
+        warmup_steps: Number of steps to ramp from warmup_from_lr to warmup_to_lr
+        decay_to_lr: Final minimum LR after decay
+        total_steps: Total training steps for this session
+
+    Returns:
+        Learning rate scheduler (torch.optim.lr_scheduler.LambdaLR)
+    """
+    decay_steps = max(1, total_steps - warmup_steps)
+
+    # The optimizer's current LR should be set to warmup_from_lr before calling this
+    base_lr = optimizer.param_groups[0]['lr']
+
+    def lr_lambda(step):
+        if step < warmup_steps and warmup_steps > 0:
+            # Linear warmup from warmup_from_lr to warmup_to_lr
+            progress = float(step) / float(warmup_steps)
+            current_lr = warmup_from_lr + progress * (warmup_to_lr - warmup_from_lr)
+        else:
+            # Cosine decay from warmup_to_lr to decay_to_lr
+            decay_progress = float(step - warmup_steps) / float(decay_steps)
+            decay_progress = min(decay_progress, 1.0)  # Clamp to [0, 1]
+            cosine_decay = 0.5 * (1.0 + np.cos(np.pi * decay_progress))
+            current_lr = decay_to_lr + (warmup_to_lr - decay_to_lr) * cosine_decay
+
+        # Return multiplier (scheduler applies this to base_lr)
+        return current_lr / base_lr if base_lr > 0 else 1.0
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 

@@ -178,6 +178,9 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
     checkpoint_name = f"best_model_auto_loss_{current_loss:.6f}.pth"
     checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
 
+    # Ensure checkpoint directory exists
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     try:
         # Save the new checkpoint
         checkpoint = {
@@ -187,6 +190,9 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
             'timestamp': datetime.now().isoformat(),
             'samples_seen': samples_seen,
             'loss': current_loss,
+            # Preserve original peak LR for global schedule calculation when resuming
+            'original_peak_lr': state.loaded_checkpoint_metadata.get('original_peak_lr')
+                                or world_model.ae_optimizer.param_groups[0]['lr'],
             'config': {
                 'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
                 'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
@@ -224,14 +230,164 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
         return False, error_msg, auto_saved_checkpoints
 
 
+def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_mode, starting_samples,
+                                preserve_optimizer, preserve_scheduler, custom_lr, disable_lr_scaling,
+                                custom_warmup, lr_min_ratio, resume_warmup_ratio=0.01):
+    """
+    Generate a pre-flight summary of the training configuration.
+
+    Returns a markdown string showing what will happen when training starts.
+    """
+    import math
+
+    # Compute derived values
+    total_samples = int(total_samples)
+    batch_size = int(batch_size)
+    starting_samples = int(starting_samples)
+    custom_warmup = int(custom_warmup)
+
+    # Compute actual samples to train
+    if resume_mode:
+        if samples_mode == "Train additional samples":
+            samples_to_train = total_samples
+            final_samples_target = starting_samples + total_samples
+        else:
+            samples_to_train = max(0, total_samples - starting_samples)
+            final_samples_target = total_samples
+    else:
+        samples_to_train = total_samples
+        starting_samples = 0
+        final_samples_target = total_samples
+
+    num_gradient_updates = math.ceil(samples_to_train / batch_size)
+
+    # Compute imaginary total for global schedule
+    imaginary_total = starting_samples + samples_to_train
+
+    # Compute peak LR (same logic as training)
+    if custom_lr > 0:
+        peak_lr = custom_lr
+        lr_source = "custom override"
+        if not disable_lr_scaling:
+            peak_lr = peak_lr * batch_size
+    elif resume_mode and state.loaded_checkpoint_metadata.get('original_peak_lr'):
+        peak_lr = state.loaded_checkpoint_metadata['original_peak_lr']
+        lr_source = "from checkpoint (original peak)"
+    else:
+        base_lr_config = config.AutoencoderConcatPredictorWorldModelConfig.AUTOENCODER_LR
+        lr_source = "config default"
+        if disable_lr_scaling:
+            peak_lr = base_lr_config
+        else:
+            peak_lr = base_lr_config * batch_size
+
+    # Compute global min LR
+    global_min_lr = peak_lr * lr_min_ratio
+
+    # Compute starting LR based on global schedule
+    if resume_mode and starting_samples > 0:
+        global_progress = starting_samples / imaginary_total
+        target_lr = global_min_lr + 0.5 * (peak_lr - global_min_lr) * (1 + math.cos(math.pi * global_progress))
+        checkpoint_lr = state.loaded_checkpoint_metadata.get('learning_rate') or target_lr
+    else:
+        global_progress = 0.0
+        target_lr = peak_lr
+        checkpoint_lr = None
+
+    # Compute warmup
+    base_warmup = config.AutoencoderConcatPredictorWorldModelConfig.WARMUP_STEPS
+    if custom_warmup == 0:
+        warmup_steps = 0
+        warmup_note = "disabled"
+    elif custom_warmup > 0:
+        warmup_steps = custom_warmup
+        warmup_note = "custom"
+    else:
+        warmup_steps = max(1, int(base_warmup / batch_size))
+        warmup_note = f"scaled (base {base_warmup} / batch_size)"
+
+    # Resume warmup steps (proportional to session steps, capped at 25% of total)
+    resume_warmup_steps = int(num_gradient_updates * resume_warmup_ratio) if resume_mode and starting_samples > 0 else 0
+    resume_warmup_steps = min(resume_warmup_steps, num_gradient_updates // 4)  # Cap at 25% to leave room for decay
+
+    # Build summary
+    summary = "📋 **Training Configuration Summary**\n\n"
+
+    # Mode
+    if resume_mode:
+        summary += f"**Mode:** 🔄 Resuming from checkpoint\n"
+        summary += f"- Starting samples: {starting_samples:,}\n"
+        if samples_mode == "Train additional samples":
+            summary += f"- Additional samples: {samples_to_train:,}\n"
+        else:
+            summary += f"- Target total: {total_samples:,} (training {samples_to_train:,} more)\n"
+        summary += f"- Final samples: {final_samples_target:,}\n\n"
+    else:
+        summary += f"**Mode:** 🆕 Fresh training\n"
+        summary += f"- Total samples: {total_samples:,}\n\n"
+
+    # Training parameters
+    summary += f"**Training Parameters:**\n"
+    summary += f"- Batch size: {batch_size}\n"
+    summary += f"- Gradient updates: {num_gradient_updates:,}\n\n"
+
+    # Learning rate (global schedule)
+    summary += f"**Learning Rate (Global Schedule):**\n"
+    summary += f"- Peak LR: {peak_lr:.2e} ({lr_source})\n"
+    summary += f"- Min LR: {global_min_lr:.2e} (ratio: {lr_min_ratio})\n"
+
+    if resume_mode and starting_samples > 0:
+        summary += f"- Global progress: {global_progress:.1%} ({starting_samples:,} / {imaginary_total:,})\n"
+        summary += f"- Target LR: {target_lr:.2e} (from cosine at {global_progress:.1%})\n"
+        if checkpoint_lr is not None:
+            summary += f"- Checkpoint LR: {checkpoint_lr:.2e}\n"
+        if resume_warmup_steps > 0:
+            summary += f"- Resume warmup: {resume_warmup_steps} steps ({resume_warmup_ratio:.0%} of {num_gradient_updates} steps)\n"
+            summary += f"  ({checkpoint_lr:.2e} → {target_lr:.2e})\n"
+    else:
+        summary += f"- Starting LR: {target_lr:.2e}\n"
+    summary += "\n"
+
+    # Warmup (for fresh training)
+    if not resume_mode or starting_samples == 0:
+        summary += f"**Warmup:**\n"
+        summary += f"- Warmup steps: {warmup_steps} ({warmup_note})\n"
+        if warmup_steps > 0:
+            summary += f"- Warmup samples: {warmup_steps * batch_size:,}\n"
+        summary += "\n"
+
+    # State preservation (only relevant for resume mode)
+    if resume_mode:
+        summary += f"**State Preservation:**\n"
+        summary += f"- Optimizer state: {'✅ Preserved' if preserve_optimizer else '🔄 Reset'}\n"
+        summary += f"- Scheduler state: {'✅ Preserved' if preserve_scheduler else '🔄 Reset'}\n"
+
+        # Get current LR from optimizer if available
+        if state.world_model is not None:
+            current_optimizer_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
+            summary += f"- Current optimizer LR: {current_optimizer_lr:.2e}\n"
+
+        if state.loaded_checkpoint_metadata.get('loss') is not None:
+            summary += f"- Checkpoint loss: {state.loaded_checkpoint_metadata['loss']:.6f}\n"
+
+    return summary
+
+
 def run_world_model_batch(total_samples, batch_size, current_observation_idx, update_interval=100,
                           window_size=10, num_random_obs=5, num_best_models_to_keep=3,
-                          enable_wandb=False, wandb_run_name=""):
+                          enable_wandb=False, wandb_run_name="",
+                          # Resume mode parameters
+                          resume_mode=False, samples_mode="Train additional samples",
+                          starting_samples=0,
+                          preserve_optimizer=True, preserve_scheduler=True,
+                          # Learning rate parameters
+                          custom_lr=0, disable_lr_scaling=False,
+                          custom_warmup=-1, lr_min_ratio=0.01, resume_warmup_ratio=0.01):
     """
     Run batch training with periodic full-session evaluation.
 
     Args:
-        total_samples: Total number of training samples
+        total_samples: Total number of training samples (or additional samples if resume_mode)
         batch_size: Batch size for training
         current_observation_idx: Currently selected observation to refresh during updates
         update_interval: Evaluate every N samples (default: 100)
@@ -240,13 +396,25 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         num_best_models_to_keep: Number of best model checkpoints to keep (default: 3)
         enable_wandb: Whether to log metrics to Weights & Biases (default: False)
         wandb_run_name: Optional custom name for wandb run (default: "")
+        resume_mode: Whether to resume from loaded checkpoint (default: False)
+        samples_mode: "Train additional samples" or "Train to total samples" (default: "Train additional samples")
+        starting_samples: Starting samples seen count for resume (default: 0)
+        preserve_optimizer: Keep optimizer state from checkpoint (default: True)
+        preserve_scheduler: Keep scheduler state from checkpoint (default: True)
+        custom_lr: Override base learning rate, 0 = use config default (default: 0)
+        disable_lr_scaling: Use exact LR instead of scaling by batch size (default: False)
+        custom_warmup: Override warmup steps, -1 = scaled default, 0 = none (default: -1)
+        lr_min_ratio: Minimum LR as ratio of base LR (default: 0.01)
+        resume_warmup_ratio: Warmup steps as ratio of session gradient updates when resuming (default: 0.01)
 
     Yields:
         Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
                   obs_status, obs_combined_fig)
     """
 
-    print(f"[DEBUG] run_world_model_batch called with: total_samples={total_samples}, batch_size={batch_size}, update_interval={update_interval}, num_best_models_to_keep={num_best_models_to_keep}")
+    print(f"[DEBUG] run_world_model_batch called with: total_samples={total_samples}, batch_size={batch_size}, "
+          f"update_interval={update_interval}, num_best_models_to_keep={num_best_models_to_keep}, "
+          f"resume_mode={resume_mode}, preserve_optimizer={preserve_optimizer}, custom_lr={custom_lr}")
 
     # Validation
     if state.world_model is None:
@@ -261,6 +429,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     batch_size = int(batch_size)
     current_observation_idx = int(current_observation_idx)
     update_interval = int(update_interval)
+    starting_samples = int(starting_samples)
+    custom_warmup = int(custom_warmup)
 
     if total_samples <= 0:
         yield "Total samples must be greater than 0", None, None, None, None, "", None
@@ -288,43 +458,164 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         yield "Canvas cache not found. Please reload the session.", None, None, None, None, "", None
         return
 
-    # Sample with replacement to reach total_samples (allows looping through session)
+    # Handle resume mode: compute actual samples to train
+    if resume_mode:
+        if samples_mode == "Train additional samples":
+            # total_samples is the number of ADDITIONAL samples to train
+            samples_to_train = total_samples
+            final_samples_target = starting_samples + total_samples
+        else:
+            # total_samples is the TOTAL target, train the difference
+            samples_to_train = max(0, total_samples - starting_samples)
+            final_samples_target = total_samples
+            if samples_to_train <= 0:
+                yield f"Already at {starting_samples:,} samples, target is {total_samples:,}. Nothing to train.", None, None, None, None, "", None
+                return
+        print(f"[DEBUG] Resume mode: starting_samples={starting_samples}, samples_to_train={samples_to_train}, final_target={final_samples_target}")
+    else:
+        samples_to_train = total_samples
+        starting_samples = 0  # Fresh start
+        final_samples_target = total_samples
+
+    # Sample with replacement to reach samples_to_train (allows looping through session)
     all_valid_indices = list(range(min_frames_needed - 1, len(observations)))
-    sampled_indices = random.choices(all_valid_indices, k=total_samples)
+    sampled_indices = random.choices(all_valid_indices, k=samples_to_train)
     print(f"[DEBUG] Sampled {len(sampled_indices)} indices from {len(all_valid_indices)} valid observations")
     print(f"[DEBUG] Expected batches: {len(sampled_indices) // batch_size} (with batch_size={batch_size})")
 
-    # Apply linear scaling rule to learning rate and recreate optimizer/scheduler
+    # Compute learning rate using global schedule for consistent multi-session training
     import math
-    num_gradient_updates = math.ceil(total_samples / batch_size)
+    num_gradient_updates = math.ceil(samples_to_train / batch_size)
     base_batch_size = 1  # Base LR is defined for batch size 1
-    base_lr = config.AutoencoderConcatPredictorWorldModelConfig.AUTOENCODER_LR
-    scaled_lr = base_lr * (batch_size / base_batch_size)
 
-    print(f"[DEBUG] Linear LR scaling: base_lr={base_lr:.6f} (BS={base_batch_size}) -> scaled_lr={scaled_lr:.6f} (BS={batch_size})")
+    # Compute imaginary total samples for global schedule
+    imaginary_total = starting_samples + samples_to_train
 
-    # Scale warmup steps inversely with batch size (to see same amount of data)
+    # Determine peak LR (for fresh training or from checkpoint's original peak)
+    if custom_lr > 0:
+        # User override - use specified LR as peak
+        peak_lr = custom_lr
+        lr_source = "custom override"
+        # Apply scaling unless disabled
+        if not disable_lr_scaling:
+            peak_lr = peak_lr * (batch_size / base_batch_size)
+        print(f"[DEBUG] Using custom LR override: peak_lr={peak_lr:.6e}")
+    elif resume_mode and state.loaded_checkpoint_metadata.get('original_peak_lr'):
+        # Resume: use checkpoint's original peak LR for global schedule calculation
+        peak_lr = state.loaded_checkpoint_metadata['original_peak_lr']
+        lr_source = "from checkpoint (original peak)"
+        print(f"[DEBUG] Using checkpoint's original peak LR: {peak_lr:.6e}")
+    else:
+        # Fresh training: compute peak LR from config
+        base_lr = config.AutoencoderConcatPredictorWorldModelConfig.AUTOENCODER_LR
+        lr_source = "config default"
+        if disable_lr_scaling:
+            peak_lr = base_lr
+        else:
+            peak_lr = base_lr * (batch_size / base_batch_size)
+        print(f"[DEBUG] Using config default: peak_lr={peak_lr:.6e}")
+
+    # Compute global min LR (same floor for all sessions)
+    global_min_lr = peak_lr * lr_min_ratio
+
+    # Compute starting LR based on global schedule position
+    if resume_mode and starting_samples > 0:
+        # Resume: compute where we are in the global cosine schedule
+        global_progress = starting_samples / imaginary_total
+        # Cosine annealing formula: lr = min + 0.5 * (max - min) * (1 + cos(π * progress))
+        target_lr = global_min_lr + 0.5 * (peak_lr - global_min_lr) * (1 + math.cos(math.pi * global_progress))
+        print(f"[DEBUG] Global schedule: progress={global_progress:.2%} ({starting_samples}/{imaginary_total}), target_lr={target_lr:.6e}")
+
+        # Get checkpoint's ending LR for warmup start
+        checkpoint_lr = state.loaded_checkpoint_metadata.get('learning_rate') or target_lr
+    else:
+        # Fresh training: start at peak LR
+        target_lr = peak_lr
+        checkpoint_lr = None  # Not resuming, no checkpoint LR
+
+    # Compute warmup steps
     base_warmup_steps = config.AutoencoderConcatPredictorWorldModelConfig.WARMUP_STEPS
-    scaled_warmup_steps = max(1, int(base_warmup_steps / batch_size))  # Minimum 1 step
-    warmup_samples_seen = scaled_warmup_steps * batch_size
+    if custom_warmup == 0:
+        # Warmup disabled
+        scaled_warmup_steps = 0
+        print(f"[DEBUG] Warmup disabled (custom_warmup=0)")
+    elif custom_warmup > 0:
+        # Use exact custom warmup steps
+        scaled_warmup_steps = custom_warmup
+        print(f"[DEBUG] Custom warmup: {scaled_warmup_steps} steps")
+    else:
+        # Default: scale warmup inversely with batch size
+        scaled_warmup_steps = max(1, int(base_warmup_steps / batch_size))
+        print(f"[DEBUG] Warmup scaling: base_warmup={base_warmup_steps} steps -> scaled_warmup={scaled_warmup_steps} steps (BS={batch_size})")
 
-    print(f"[DEBUG] Warmup scaling: base_warmup={base_warmup_steps} steps (BS={base_batch_size}) -> scaled_warmup={scaled_warmup_steps} steps (BS={batch_size}), samples_seen={warmup_samples_seen}")
+    # Resume warmup: additional warmup steps to ramp from checkpoint LR to target LR (proportional to session steps)
+    resume_warmup_steps = int(num_gradient_updates * resume_warmup_ratio) if resume_mode and starting_samples > 0 else 0
+    resume_warmup_steps = min(resume_warmup_steps, num_gradient_updates // 4)  # Cap at 25% to leave room for decay
 
-    # Recreate optimizer with scaled LR
+    # Handle optimizer state
     import torch.optim as optim
-    param_groups = [
-        {"params": state.world_model.autoencoder.parameters()},
-    ]
-    state.world_model.ae_optimizer = optim.AdamW(param_groups, lr=scaled_lr)
+    if resume_mode and preserve_optimizer:
+        # Keep existing optimizer, set LR to starting point
+        # For resume with warmup, start at checkpoint_lr; otherwise use target_lr
+        starting_lr = checkpoint_lr if resume_warmup_steps > 0 else target_lr
+        for param_group in state.world_model.ae_optimizer.param_groups:
+            param_group['lr'] = starting_lr
+        print(f"[DEBUG] Preserved optimizer state, set LR to {starting_lr:.6e}")
+    else:
+        # Recreate optimizer - start at checkpoint_lr if resuming with warmup, else target_lr
+        # Use create_param_groups for consistency with world model initialization (2 param groups)
+        starting_lr = checkpoint_lr if (resume_mode and resume_warmup_steps > 0) else target_lr
+        param_groups = world_model_utils.create_param_groups(
+            state.world_model.autoencoder,
+            config.AutoencoderConcatPredictorWorldModelConfig.WEIGHT_DECAY
+        )
+        state.world_model.ae_optimizer = optim.AdamW(
+            param_groups,
+            lr=starting_lr,
+        )
+        print(f"[DEBUG] Created new optimizer with LR={starting_lr:.6e} (2 param groups: decay/no-decay)")
 
-    # Recreate scheduler with updated total steps and scaled warmup
-    state.world_model.ae_scheduler = world_model_utils.create_warmup_cosine_scheduler(
-        state.world_model.ae_optimizer,
-        warmup_steps=scaled_warmup_steps,
-        total_steps=num_gradient_updates,
-        lr_min_ratio=config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO,
-    )
-    print(f"[DEBUG] Scheduler configured for {num_gradient_updates} steps (warmup: {scaled_warmup_steps}) with LR range {scaled_lr:.6f} -> {scaled_lr * config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO:.6f}")
+    # Create scheduler
+    # Note: When resuming with global schedule (starting_samples > 0), we ALWAYS create a new scheduler
+    # because the old scheduler doesn't know about the new total samples. The preserve_scheduler
+    # option only applies when NOT using global schedule (e.g., continuing with exact same schedule).
+    if resume_mode and preserve_scheduler and starting_samples == 0:
+        # Keep existing scheduler only if not using global schedule
+        print(f"[DEBUG] Preserved scheduler state (step {state.world_model.ae_scheduler.last_epoch})")
+    elif resume_mode and starting_samples > 0:
+        # Resume with warmup: use special resume scheduler
+        # Reset initial_lr to current lr before creating new scheduler
+        # (prevents LambdaLR from reusing checkpoint's initial_lr which was set by previous scheduler)
+        for param_group in state.world_model.ae_optimizer.param_groups:
+            param_group['initial_lr'] = param_group['lr']
+        print(f"[DEBUG] Reset initial_lr to {state.world_model.ae_optimizer.param_groups[0]['lr']:.6e} for all param groups")
+        state.world_model.ae_scheduler = world_model_utils.create_resume_scheduler(
+            optimizer=state.world_model.ae_optimizer,
+            warmup_from_lr=checkpoint_lr,
+            warmup_to_lr=target_lr,
+            warmup_steps=resume_warmup_steps,
+            decay_to_lr=global_min_lr,
+            total_steps=num_gradient_updates,
+        )
+        print(f"[DEBUG] Created resume scheduler: warmup {checkpoint_lr:.6e} -> {target_lr:.6e} ({resume_warmup_steps} steps), "
+              f"then decay to {global_min_lr:.6e}")
+        # Debug: check what LR the scheduler set after creation
+        print(f"[DEBUG] After scheduler creation, optimizer LR = {state.world_model.ae_optimizer.param_groups[0]['lr']:.6e}")
+    else:
+        # Fresh training: use regular warmup + cosine scheduler
+        state.world_model.ae_scheduler = world_model_utils.create_warmup_cosine_scheduler(
+            state.world_model.ae_optimizer,
+            warmup_steps=scaled_warmup_steps,
+            total_steps=num_gradient_updates,
+            lr_min=global_min_lr,  # Use absolute min, not ratio
+        )
+        print(f"[DEBUG] Created new scheduler: {num_gradient_updates} steps (warmup: {scaled_warmup_steps}), "
+              f"LR range {target_lr:.6e} -> {global_min_lr:.6e}")
+
+    # Store original peak LR in metadata for future checkpoints (if not already set)
+    if not state.loaded_checkpoint_metadata.get('original_peak_lr'):
+        state.loaded_checkpoint_metadata['original_peak_lr'] = peak_lr
+        print(f"[DEBUG] Stored original_peak_lr={peak_lr:.6e} in metadata")
 
     # Determine optimal number of workers
     import platform
@@ -353,17 +644,22 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         yield f"Error creating DataLoader: {str(e)}", None, None, None, None, "", None
         return
 
-    # Initialize metrics
+    # Initialize metrics with resume offset
     cumulative_metrics = {
         'samples_seen': [],
         'loss_at_sample': [],
     }
-    samples_seen = 0
+    samples_seen = starting_samples  # Start from checkpoint offset if resuming
     UPDATE_INTERVAL = int(update_interval)  # Evaluate every N samples
-    last_eval_samples = 0
+    last_eval_samples = starting_samples
 
     # Track best loss for automatic checkpoint saving
-    best_loss = float('inf')
+    # Initialize from checkpoint loss if resuming
+    if resume_mode and state.loaded_checkpoint_metadata.get('loss') is not None:
+        best_loss = state.loaded_checkpoint_metadata['loss']
+        print(f"[DEBUG] Initialized best_loss from checkpoint: {best_loss:.6f}")
+    else:
+        best_loss = float('inf')
 
     # Track auto-saved checkpoints for this training run (list of tuples: (loss, filepath))
     auto_saved_checkpoints = []
@@ -382,10 +678,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     project="developmental-robot-movement",
                     name=wandb_run_name if wandb_run_name else None,  # auto-generate if empty
                     config={
-                        "total_samples": total_samples,
+                        "total_samples": samples_to_train,
+                        "final_samples_target": final_samples_target,
                         "batch_size": batch_size,
-                        "base_lr": base_lr,
-                        "scaled_lr": scaled_lr,
+                        "peak_lr": peak_lr,
+                        "target_lr": target_lr,
+                        "global_min_lr": global_min_lr,
                         "warmup_steps": scaled_warmup_steps,
                         "total_gradient_updates": num_gradient_updates,
                         "update_interval": update_interval,
@@ -395,9 +693,16 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         "canvas_history_size": config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
                         "patch_size": config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
                         "weight_decay": config.AutoencoderConcatPredictorWorldModelConfig.WEIGHT_DECAY,
-                        "lr_min_ratio": config.AutoencoderConcatPredictorWorldModelConfig.LR_MIN_RATIO,
+                        "lr_min_ratio": lr_min_ratio,
                         "focal_beta": config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA,
                         "focal_loss_alpha": config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
+                        # Resume mode info
+                        "resume_mode": resume_mode,
+                        "starting_samples": starting_samples,
+                        "preserve_optimizer": preserve_optimizer,
+                        "preserve_scheduler": preserve_scheduler,
+                        "custom_lr": custom_lr,
+                        "disable_lr_scaling": disable_lr_scaling,
                     }
                 )
                 print(f"[WANDB] Initialized run: {wandb.run.name}")
@@ -427,8 +732,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 next_canvas = None
                 print(f"[DEBUG] DataLoader empty - no batches available!")
 
-            print(f"[DEBUG] Starting training loop: next_canvas is {'not None' if next_canvas is not None else 'None'}, samples_seen={samples_seen}, total_samples={total_samples}")
-            while next_canvas is not None and samples_seen < total_samples:
+            print(f"[DEBUG] Starting training loop: next_canvas is {'not None' if next_canvas is not None else 'None'}, samples_seen={samples_seen}, final_target={final_samples_target}")
+            while next_canvas is not None and samples_seen < final_samples_target:
                 batch_count += 1
                 # Wait for transfer to complete
                 torch.cuda.current_stream().wait_stream(transfer_stream)
@@ -463,7 +768,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         print(f"[WANDB WARNING] Failed to log per-batch metrics: {str(e)}")
 
                 if batch_count <= 5 or batch_count % 10 == 0:
-                    print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{total_samples}, loss={loss:.6f}")
+                    current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
+                    print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{final_samples_target}, loss={loss:.6f}, lr={current_lr:.6e}")
 
                 # Periodic progress update (no evaluation)
                 if samples_seen - last_eval_samples >= UPDATE_INTERVAL:
@@ -508,7 +814,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Status message
                     current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
                     status_msg = f"📊 **Training Progress**\n\n"
-                    status_msg += f"- Samples: {samples_seen:,} / {total_samples:,}\n"
+                    status_msg += f"- Samples: {samples_seen:,} / {final_samples_target:,}\n"
+                    if resume_mode:
+                        status_msg += f"- Training: {samples_seen - starting_samples:,} / {samples_to_train:,} additional\n"
                     status_msg += f"- Current batch loss: {loss:.6f}\n"
                     status_msg += f"- Best loss: {best_loss:.6f}\n"
                     status_msg += f"- Learning rate: {current_lr:.6e}\n"
@@ -516,7 +824,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
                     update_result = generate_batch_training_update(
-                        samples_seen, total_samples, cumulative_metrics,
+                        samples_seen, final_samples_target, cumulative_metrics,
                         status_msg, None, None, current_observation_idx,
                         window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
                     )
@@ -533,16 +841,16 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
 
-            print(f"[DEBUG] Exited training loop: batches_processed={batch_count}, samples_seen={samples_seen}, total_samples={total_samples}")
-            print(f"[DEBUG] Exit reason: next_canvas is {'None' if next_canvas is None else 'not None'}, samples_seen >= total_samples: {samples_seen >= total_samples}")
+            print(f"[DEBUG] Exited training loop: batches_processed={batch_count}, samples_seen={samples_seen}, final_target={final_samples_target}")
+            print(f"[DEBUG] Exit reason: next_canvas is {'None' if next_canvas is None else 'not None'}, samples_seen >= final_target: {samples_seen >= final_samples_target}")
 
         else:
             # Fallback: no stream pipelining
             print(f"[DEBUG] Using fallback mode (no stream pipelining)")
             for canvas_tensor, patch_mask, _ in dataloader:
                 batch_count += 1
-                if samples_seen >= total_samples:
-                    print(f"[DEBUG] Breaking: samples_seen ({samples_seen}) >= total_samples ({total_samples})")
+                if samples_seen >= final_samples_target:
+                    print(f"[DEBUG] Breaking: samples_seen ({samples_seen}) >= final_target ({final_samples_target})")
                     break
 
                 # Train on batch
@@ -573,7 +881,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     raise ValueError(error_msg)
 
                 if batch_count <= 5 or batch_count % 10 == 0:
-                    print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{total_samples}, loss={loss:.6f}")
+                    current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
+                    print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{final_samples_target}, loss={loss:.6f}, lr={current_lr:.6e}")
 
                 # Periodic progress update (no evaluation)
                 if samples_seen - last_eval_samples >= UPDATE_INTERVAL:
@@ -618,7 +927,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Status message
                     current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
                     status_msg = f"📊 **Training Progress**\n\n"
-                    status_msg += f"- Samples: {samples_seen:,} / {total_samples:,}\n"
+                    status_msg += f"- Samples: {samples_seen:,} / {final_samples_target:,}\n"
+                    if resume_mode:
+                        status_msg += f"- Training: {samples_seen - starting_samples:,} / {samples_to_train:,} additional\n"
                     status_msg += f"- Current batch loss: {loss:.6f}\n"
                     status_msg += f"- Best loss: {best_loss:.6f}\n"
                     status_msg += f"- Learning rate: {current_lr:.6e}\n"
@@ -626,7 +937,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
                     update_result = generate_batch_training_update(
-                        samples_seen, total_samples, cumulative_metrics,
+                        samples_seen, final_samples_target, cumulative_metrics,
                         status_msg, None, None, current_observation_idx,
                         window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
                     )
@@ -643,7 +954,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
 
-            print(f"[DEBUG] Exited training loop (fallback): batches_processed={batch_count}, samples_seen={samples_seen}, total_samples={total_samples}")
+            print(f"[DEBUG] Exited training loop (fallback): batches_processed={batch_count}, samples_seen={samples_seen}, final_target={final_samples_target}")
 
         # Final evaluation after training complete
         print(f"[DEBUG] Running final evaluation...")
@@ -700,9 +1011,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         # Calculate total elapsed time
         total_elapsed_time = time.time() - training_start_time
 
-        print(f"[DEBUG] Final yield: samples_seen={samples_seen}, total_samples={total_samples}, elapsed_time={total_elapsed_time:.2f}s")
+        print(f"[DEBUG] Final yield: samples_seen={samples_seen}, final_target={final_samples_target}, elapsed_time={total_elapsed_time:.2f}s")
         yield generate_batch_training_update(
-            samples_seen, total_samples, cumulative_metrics,
+            samples_seen, final_samples_target, cumulative_metrics,
             status_msg, fig_loss, fig_dist, current_observation_idx,
             window_size, num_random_obs, completed=True, elapsed_time=total_elapsed_time
         )

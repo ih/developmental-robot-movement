@@ -53,6 +53,9 @@ def save_model_weights(checkpoint_name):
     checkpoint_dir = state.get_checkpoint_dir_for_session(state.session_state["session_dir"])
     checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
 
+    # Ensure checkpoint directory exists
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     try:
         # Save model state dict, optimizer state, scheduler state, and metadata
         checkpoint = {
@@ -60,6 +63,9 @@ def save_model_weights(checkpoint_name):
             'optimizer_state_dict': state.world_model.ae_optimizer.state_dict(),
             'scheduler_state_dict': state.world_model.ae_scheduler.state_dict(),
             'timestamp': datetime.now().isoformat(),
+            # Preserve original peak LR for global schedule calculation when resuming
+            'original_peak_lr': state.loaded_checkpoint_metadata.get('original_peak_lr')
+                                or state.world_model.ae_optimizer.param_groups[0]['lr'],
             'config': {
                 'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
                 'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
@@ -150,6 +156,24 @@ def load_model_weights(checkpoint_name):
 
         state.current_checkpoint_name = checkpoint_name
 
+        # Populate checkpoint metadata for resume functionality
+        current_lr = state.world_model.ae_optimizer.param_groups[0]['lr'] if optimizer_loaded else None
+        state.loaded_checkpoint_metadata = {
+            'samples_seen': checkpoint.get('samples_seen', 0),
+            'loss': checkpoint.get('loss', None),
+            'learning_rate': current_lr,
+            # Original peak LR for global schedule calculation (fall back to current LR if not saved)
+            'original_peak_lr': checkpoint.get('original_peak_lr', current_lr),
+            'scheduler_step': state.world_model.ae_scheduler.last_epoch if scheduler_loaded else 0,
+            'timestamp': checkpoint.get('timestamp', None),
+            'checkpoint_name': checkpoint_name,
+            'optimizer_loaded': optimizer_loaded,
+            'scheduler_loaded': scheduler_loaded,
+        }
+        print(f"[CHECKPOINT] Loaded metadata: samples_seen={state.loaded_checkpoint_metadata['samples_seen']}, "
+              f"loss={state.loaded_checkpoint_metadata['loss']}, lr={state.loaded_checkpoint_metadata['learning_rate']}")
+        print(f"[CHECKPOINT] Loaded original_peak_lr: {state.loaded_checkpoint_metadata['original_peak_lr']}")
+
         status_msg = f"✅ **Model weights loaded successfully!**\n\n"
         status_msg += f"**Checkpoint:** {checkpoint_name}\n"
         status_msg += f"**Location:** {checkpoint_path}\n"
@@ -189,6 +213,14 @@ def load_model_weights(checkpoint_name):
                 status_msg += f"- Final training loss: {format_loss(checkpoint['metrics']['final_training_loss'])}\n"
             if checkpoint['metrics']['final_prediction_error'] is not None:
                 status_msg += f"- Final prediction error: {format_loss(checkpoint['metrics']['final_prediction_error'])}\n"
+
+        # Resume info
+        status_msg += f"\n**Resume Info:**\n"
+        status_msg += f"- To continue training, enable 'Resume Mode' in batch training\n"
+        if state.loaded_checkpoint_metadata['samples_seen'] > 0:
+            status_msg += f"- Starting samples: {state.loaded_checkpoint_metadata['samples_seen']:,}\n"
+        if state.loaded_checkpoint_metadata['learning_rate'] is not None:
+            status_msg += f"- Current LR: {state.loaded_checkpoint_metadata['learning_rate']:.2e}\n"
 
         return status_msg
 

@@ -14,6 +14,32 @@ session_state = {}
 world_model = None
 current_checkpoint_name = None
 
+# Checkpoint metadata (populated when loading a checkpoint)
+# Used for resume functionality
+loaded_checkpoint_metadata = {
+    'samples_seen': 0,
+    'loss': None,
+    'learning_rate': None,
+    'original_peak_lr': None,  # Peak LR from first training session (for global schedule)
+    'scheduler_step': 0,
+    'timestamp': None,
+    'checkpoint_name': None,
+}
+
+
+def reset_checkpoint_metadata():
+    """Reset checkpoint metadata to defaults (e.g., when starting fresh)."""
+    global loaded_checkpoint_metadata
+    loaded_checkpoint_metadata = {
+        'samples_seen': 0,
+        'loss': None,
+        'learning_rate': None,
+        'original_peak_lr': None,  # Peak LR from first training session (for global schedule)
+        'scheduler_step': 0,
+        'timestamp': None,
+        'checkpoint_name': None,
+    }
+
 
 def get_checkpoint_dir_for_session(session_path: str) -> str:
     """
@@ -25,6 +51,9 @@ def get_checkpoint_dir_for_session(session_path: str) -> str:
     Returns:
         Path to robot-specific checkpoint directory
     """
-    if "jetbot" in session_path.lower():
+    session_lower = session_path.lower()
+    if "jetbot" in session_lower:
         return config.JETBOT_CHECKPOINT_DIR
+    elif "so101" in session_lower:
+        return config.SO101_CHECKPOINT_DIR
     return config.TOROIDAL_DOT_CHECKPOINT_DIR
