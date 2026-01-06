@@ -37,6 +37,110 @@ from .visualization import (
     create_loss_vs_recent_checkpoints_plot,
 )
 
+
+def log_training_debug_state(world_model, batch_count, samples_seen, loss, enable_wandb=False):
+    """
+    Log debug information to help diagnose periodic loss spikes.
+
+    Logs:
+    - Optimizer momentum/velocity norms (AdamW exp_avg, exp_avg_sq)
+    - Model weight norms (first parameter)
+    - Scheduler internal state
+    - Current batch/sample info
+
+    Args:
+        world_model: The world model instance with autoencoder, optimizer, scheduler
+        batch_count: Current batch number
+        samples_seen: Total samples seen so far
+        loss: Current batch loss
+        enable_wandb: Whether to log to wandb
+    """
+    debug_info = {
+        'batch_count': batch_count,
+        'samples_seen': samples_seen,
+        'loss': loss,
+    }
+
+    # 1. Optimizer state (momentum and velocity norms)
+    try:
+        # Get a sample parameter to check optimizer state
+        params = list(world_model.autoencoder.parameters())
+        if params and params[0] in world_model.ae_optimizer.state:
+            opt_state = world_model.ae_optimizer.state[params[0]]
+            if 'exp_avg' in opt_state:
+                debug_info['momentum_norm'] = opt_state['exp_avg'].norm().item()
+            if 'exp_avg_sq' in opt_state:
+                debug_info['velocity_norm'] = opt_state['exp_avg_sq'].norm().item()
+            if 'step' in opt_state:
+                # step can be a tensor in newer PyTorch versions
+                step_val = opt_state['step']
+                debug_info['optimizer_step'] = step_val.item() if torch.is_tensor(step_val) else step_val
+    except Exception as e:
+        debug_info['optimizer_error'] = str(e)
+
+    # 2. Model weight norms (first and last parameter)
+    try:
+        params = list(world_model.autoencoder.parameters())
+        if params:
+            debug_info['first_param_norm'] = params[0].data.norm().item()
+            debug_info['last_param_norm'] = params[-1].data.norm().item()
+            # Also track total model norm
+            total_norm = sum(p.data.norm().item() ** 2 for p in params) ** 0.5
+            debug_info['total_model_norm'] = total_norm
+    except Exception as e:
+        debug_info['weight_error'] = str(e)
+
+    # 3. Scheduler state
+    try:
+        debug_info['scheduler_last_epoch'] = world_model.ae_scheduler.last_epoch
+        debug_info['scheduler_lr'] = world_model.ae_scheduler.get_last_lr()[0]
+    except Exception as e:
+        debug_info['scheduler_error'] = str(e)
+
+    # Print to console
+    print(f"[DEBUG STATE] batch={batch_count}, samples={samples_seen}, loss={loss:.6f}")
+    if 'momentum_norm' in debug_info:
+        print(f"  Optimizer: momentum_norm={debug_info['momentum_norm']:.6f}, "
+              f"velocity_norm={debug_info.get('velocity_norm', 'N/A')}, "
+              f"step={debug_info.get('optimizer_step', 'N/A')}")
+    if 'first_param_norm' in debug_info:
+        print(f"  Weights: first_param={debug_info['first_param_norm']:.6f}, "
+              f"last_param={debug_info['last_param_norm']:.6f}, "
+              f"total={debug_info['total_model_norm']:.6f}")
+    if 'scheduler_last_epoch' in debug_info:
+        print(f"  Scheduler: last_epoch={debug_info['scheduler_last_epoch']}, "
+              f"lr={debug_info['scheduler_lr']:.6e}")
+
+    # Log to wandb if enabled
+    if enable_wandb:
+        try:
+            wandb_debug = {
+                'debug/batch_count': batch_count,
+                'debug/loss': loss,
+            }
+            if 'momentum_norm' in debug_info:
+                wandb_debug['debug/optimizer_momentum_norm'] = debug_info['momentum_norm']
+            if 'velocity_norm' in debug_info:
+                wandb_debug['debug/optimizer_velocity_norm'] = debug_info['velocity_norm']
+            if 'optimizer_step' in debug_info:
+                wandb_debug['debug/optimizer_step'] = debug_info['optimizer_step']
+            if 'first_param_norm' in debug_info:
+                wandb_debug['debug/first_param_norm'] = debug_info['first_param_norm']
+            if 'last_param_norm' in debug_info:
+                wandb_debug['debug/last_param_norm'] = debug_info['last_param_norm']
+            if 'total_model_norm' in debug_info:
+                wandb_debug['debug/total_model_norm'] = debug_info['total_model_norm']
+            if 'scheduler_last_epoch' in debug_info:
+                wandb_debug['debug/scheduler_last_epoch'] = debug_info['scheduler_last_epoch']
+            if 'scheduler_lr' in debug_info:
+                wandb_debug['debug/scheduler_lr'] = debug_info['scheduler_lr']
+
+            wandb.log(wandb_debug, step=samples_seen)
+        except Exception as e:
+            print(f"[DEBUG] Failed to log to wandb: {e}")
+
+    return debug_info
+
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -232,7 +336,8 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
 
 def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_mode, starting_samples,
                                 preserve_optimizer, preserve_scheduler, custom_lr, disable_lr_scaling,
-                                custom_warmup, lr_min_ratio, resume_warmup_ratio=0.01):
+                                custom_warmup, lr_min_ratio, resume_warmup_ratio=0.01,
+                                sampling_mode="Random (with replacement)"):
     """
     Generate a pre-flight summary of the training configuration.
 
@@ -329,7 +434,20 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
     # Training parameters
     summary += f"**Training Parameters:**\n"
     summary += f"- Batch size: {batch_size}\n"
-    summary += f"- Gradient updates: {num_gradient_updates:,}\n\n"
+    summary += f"- Gradient updates: {num_gradient_updates:,}\n"
+    summary += f"- Sampling mode: {sampling_mode}\n"
+
+    # For epoch-based mode, show epoch breakdown if we have session info
+    if sampling_mode == "Epoch-based (shuffle each epoch)" and state.session_state.get("observations"):
+        observations = state.session_state["observations"]
+        min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+        num_valid = len(observations) - (min_frames_needed - 1)
+        if num_valid > 0:
+            num_epochs = samples_to_train // num_valid
+            remainder = samples_to_train % num_valid
+            summary += f"  - {num_epochs} complete epoch(s) + {remainder} remainder samples\n"
+            summary += f"  - {num_valid} unique frames per epoch\n"
+    summary += "\n"
 
     # Learning rate (global schedule)
     summary += f"**Learning Rate (Global Schedule):**\n"
@@ -382,7 +500,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           preserve_optimizer=True, preserve_scheduler=True,
                           # Learning rate parameters
                           custom_lr=0, disable_lr_scaling=False,
-                          custom_warmup=-1, lr_min_ratio=0.01, resume_warmup_ratio=0.01):
+                          custom_warmup=-1, lr_min_ratio=0.01, resume_warmup_ratio=0.01,
+                          # Sampling mode
+                          sampling_mode="Random (with replacement)"):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -406,6 +526,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         custom_warmup: Override warmup steps, -1 = scaled default, 0 = none (default: -1)
         lr_min_ratio: Minimum LR as ratio of base LR (default: 0.01)
         resume_warmup_ratio: Warmup steps as ratio of session gradient updates when resuming (default: 0.01)
+        sampling_mode: "Random (with replacement)" or "Epoch-based (shuffle each epoch)" (default: "Random (with replacement)")
 
     Yields:
         Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
@@ -414,7 +535,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
     print(f"[DEBUG] run_world_model_batch called with: total_samples={total_samples}, batch_size={batch_size}, "
           f"update_interval={update_interval}, num_best_models_to_keep={num_best_models_to_keep}, "
-          f"resume_mode={resume_mode}, preserve_optimizer={preserve_optimizer}, custom_lr={custom_lr}")
+          f"resume_mode={resume_mode}, preserve_optimizer={preserve_optimizer}, custom_lr={custom_lr}, "
+          f"sampling_mode={sampling_mode}")
 
     # Validation
     if state.world_model is None:
@@ -477,11 +599,40 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         starting_samples = 0  # Fresh start
         final_samples_target = total_samples
 
-    # Sample with replacement to reach samples_to_train (allows looping through session)
+    # Sample indices based on sampling mode
     all_valid_indices = list(range(min_frames_needed - 1, len(observations)))
-    sampled_indices = random.choices(all_valid_indices, k=samples_to_train)
-    print(f"[DEBUG] Sampled {len(sampled_indices)} indices from {len(all_valid_indices)} valid observations")
+
+    if sampling_mode == "Random (with replacement)":
+        # Random sampling with replacement (allows looping through session)
+        sampled_indices = random.choices(all_valid_indices, k=samples_to_train)
+        print(f"[DEBUG] Random sampling: {len(sampled_indices)} samples from {len(all_valid_indices)} valid observations")
+    else:
+        # Epoch-based: shuffle each epoch, allow partial final epoch
+        num_epochs = samples_to_train // len(all_valid_indices)
+        remainder = samples_to_train % len(all_valid_indices)
+
+        sampled_indices = []
+        for _ in range(num_epochs):
+            epoch_indices = all_valid_indices.copy()
+            random.shuffle(epoch_indices)
+            sampled_indices.extend(epoch_indices)
+
+        if remainder > 0:
+            final_epoch = all_valid_indices.copy()
+            random.shuffle(final_epoch)
+            sampled_indices.extend(final_epoch[:remainder])
+
+        print(f"[DEBUG] Epoch-based sampling: {num_epochs} complete epochs + {remainder} remainder = {len(sampled_indices)} samples")
+
     print(f"[DEBUG] Expected batches: {len(sampled_indices) // batch_size} (with batch_size={batch_size})")
+
+    # Store epoch info for debug prints (only relevant for epoch-based mode)
+    epoch_mode = (sampling_mode != "Random (with replacement)")
+    samples_per_epoch = len(all_valid_indices) if epoch_mode else 0
+    if epoch_mode:
+        total_epochs = num_epochs + (1 if remainder > 0 else 0)
+    else:
+        total_epochs = 0
 
     # Compute learning rate using global schedule for consistent multi-session training
     import math
@@ -769,7 +920,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
                 if batch_count <= 5 or batch_count % 10 == 0:
                     current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
-                    print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{final_samples_target}, loss={loss:.6f}, lr={current_lr:.6e}")
+                    if epoch_mode and samples_per_epoch > 0:
+                        current_epoch = (samples_seen - starting_samples) // samples_per_epoch + 1
+                        print(f"[DEBUG] Batch {batch_count}: epoch={current_epoch}/{total_epochs}, samples_seen={samples_seen}/{final_samples_target}, loss={loss:.6f}, lr={current_lr:.6e}")
+                    else:
+                        print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{final_samples_target}, loss={loss:.6f}, lr={current_lr:.6e}")
 
                 # Periodic progress update (no evaluation)
                 if samples_seen - last_eval_samples >= UPDATE_INTERVAL:
@@ -779,6 +934,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Track training loss for progress plots
                     cumulative_metrics['samples_seen'].append(samples_seen)
                     cumulative_metrics['loss_at_sample'].append(loss)
+
+                    # Debug logging to diagnose periodic loss spikes
+                    log_training_debug_state(state.world_model, batch_count, samples_seen, loss, enable_wandb)
 
                     # Save best model if loss improved
                     if loss < best_loss:
@@ -828,15 +986,6 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         status_msg, None, None, current_observation_idx,
                         window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
                     )
-
-                    # Log observation samples visualization to wandb
-                    if enable_wandb and len(update_result) > 6 and update_result[6] is not None:
-                        try:
-                            wandb.log({
-                                "visualizations/observation_samples": wandb.Image(update_result[6]),
-                            }, step=samples_seen)
-                        except Exception as e:
-                            print(f"[WANDB WARNING] Failed to log observation samples: {str(e)}")
 
                     yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
@@ -882,7 +1031,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
                 if batch_count <= 5 or batch_count % 10 == 0:
                     current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
-                    print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{final_samples_target}, loss={loss:.6f}, lr={current_lr:.6e}")
+                    if epoch_mode and samples_per_epoch > 0:
+                        current_epoch = (samples_seen - starting_samples) // samples_per_epoch + 1
+                        print(f"[DEBUG] Batch {batch_count}: epoch={current_epoch}/{total_epochs}, samples_seen={samples_seen}/{final_samples_target}, loss={loss:.6f}, lr={current_lr:.6e}")
+                    else:
+                        print(f"[DEBUG] Batch {batch_count}: samples_seen={samples_seen}/{final_samples_target}, loss={loss:.6f}, lr={current_lr:.6e}")
 
                 # Periodic progress update (no evaluation)
                 if samples_seen - last_eval_samples >= UPDATE_INTERVAL:
@@ -892,6 +1045,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Track training loss for progress plots
                     cumulative_metrics['samples_seen'].append(samples_seen)
                     cumulative_metrics['loss_at_sample'].append(loss)
+
+                    # Debug logging to diagnose periodic loss spikes
+                    log_training_debug_state(state.world_model, batch_count, samples_seen, loss, enable_wandb)
 
                     # Save best model if loss improved
                     if loss < best_loss:
@@ -942,15 +1098,6 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
                     )
 
-                    # Log observation samples visualization to wandb
-                    if enable_wandb and len(update_result) > 6 and update_result[6] is not None:
-                        try:
-                            wandb.log({
-                                "visualizations/observation_samples": wandb.Image(update_result[6]),
-                            }, step=samples_seen)
-                        except Exception as e:
-                            print(f"[WANDB WARNING] Failed to log observation samples: {str(e)}")
-
                     yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
 
@@ -995,16 +1142,6 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     "eval/loss_standard_std": stats['standard']['std'],
                     "eval/final_lr": final_lr,
                 }, step=samples_seen)
-
-                # Log evaluation visualizations
-                if fig_loss is not None:
-                    wandb.log({
-                        "visualizations/eval_loss_over_time": wandb.Image(fig_loss),
-                    }, step=samples_seen)
-                if fig_dist is not None:
-                    wandb.log({
-                        "visualizations/eval_loss_distribution": wandb.Image(fig_dist),
-                    }, step=samples_seen)
             except Exception as e:
                 print(f"[WANDB WARNING] Failed to log evaluation metrics: {str(e)}")
 

@@ -184,6 +184,12 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             interactive=True,
             info="Samples per batch"
         )
+        sampling_mode_dropdown = gr.Dropdown(
+            choices=["Random (with replacement)", "Epoch-based (shuffle each epoch)"],
+            value="Random (with replacement)",
+            label="Sampling Mode",
+            info="Random: same sample can repeat. Epoch: each sample seen once per epoch."
+        )
         update_interval_input = gr.Number(
             value=2000,
             label="Update Interval",
@@ -598,6 +604,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             # Learning rate parameters
             custom_lr_input, disable_lr_scaling_checkbox, custom_warmup_input, lr_min_ratio_input,
             resume_warmup_ratio_input,
+            # Sampling mode
+            sampling_mode_dropdown,
         ],
         outputs=[
             batch_training_status,
@@ -619,6 +627,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             preserve_optimizer_checkbox, preserve_scheduler_checkbox,
             custom_lr_input, disable_lr_scaling_checkbox, custom_warmup_input, lr_min_ratio_input,
             resume_warmup_ratio_input,
+            sampling_mode_dropdown,
         ],
         outputs=[preflight_summary]
     )
