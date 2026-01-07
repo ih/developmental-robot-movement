@@ -19,13 +19,27 @@ from models.autoencoder_concat_predictor import (
 
 
 def create_loss_vs_samples_plot(cumulative_metrics):
-    """Create plot of loss vs samples seen"""
+    """Create plot of loss vs samples seen, with optional validation loss"""
     fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Training loss (blue solid line)
     ax.plot(cumulative_metrics['samples_seen'],
             cumulative_metrics['loss_at_sample'],
-            'b-o', linewidth=2, markersize=6)
+            'b-o', linewidth=2, markersize=6, label='Train Loss')
+
+    # Validation loss (orange dashed line) - if available
+    val_losses = cumulative_metrics.get('val_loss_at_sample', [])
+    if val_losses and any(v is not None for v in val_losses):
+        # Filter out None values for plotting
+        valid_val_data = [(s, v) for s, v in zip(cumulative_metrics['samples_seen'], val_losses) if v is not None]
+        if valid_val_data:
+            val_samples, val_loss_values = zip(*valid_val_data)
+            ax.plot(val_samples, val_loss_values,
+                    'orange', linestyle='--', marker='s', linewidth=2, markersize=6, label='Val Loss')
+            ax.legend(loc='upper right')
+
     ax.set_xlabel('Samples Seen', fontsize=12)
-    ax.set_ylabel('Mean Hybrid Loss (Full Session Eval)', fontsize=12)
+    ax.set_ylabel('Mean Hybrid Loss', fontsize=12)
     ax.set_title('Training Progress: Loss vs Samples', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -33,7 +47,7 @@ def create_loss_vs_samples_plot(cumulative_metrics):
 
 
 def create_loss_vs_recent_checkpoints_plot(cumulative_metrics, window_size=10):
-    """Create plot of loss vs recent checkpoints (rolling window)"""
+    """Create plot of loss vs recent checkpoints (rolling window), with optional validation loss"""
     if not cumulative_metrics['samples_seen']:
         return None
 
@@ -45,7 +59,22 @@ def create_loss_vs_recent_checkpoints_plot(cumulative_metrics, window_size=10):
         return None
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(samples, losses, 'g-o', linewidth=2, markersize=6)
+
+    # Training loss (green solid line)
+    ax.plot(samples, losses, 'g-o', linewidth=2, markersize=6, label='Train Loss')
+
+    # Validation loss (orange dashed line) - if available
+    val_losses = cumulative_metrics.get('val_loss_at_sample', [])
+    if val_losses:
+        val_losses_window = val_losses[-window_size:]
+        # Filter out None values
+        valid_val_data = [(s, v) for s, v in zip(samples, val_losses_window) if v is not None]
+        if valid_val_data:
+            val_samples, val_loss_values = zip(*valid_val_data)
+            ax.plot(val_samples, val_loss_values,
+                    'orange', linestyle='--', marker='s', linewidth=2, markersize=6, label='Val Loss')
+            ax.legend(loc='upper right')
+
     ax.set_xlabel('Samples Seen', fontsize=12)
     ax.set_ylabel('Mean Hybrid Loss', fontsize=12)
     ax.set_title(f'Recent Progress: Last {len(samples)} Checkpoints', fontsize=14, fontweight='bold')

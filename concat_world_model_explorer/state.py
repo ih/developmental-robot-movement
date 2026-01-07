@@ -11,8 +11,10 @@ print(f"Using device: {device}")
 
 # Global state variables
 session_state = {}
+validation_session_state = {}  # Stores validation session data (observations, actions, canvas_cache)
 world_model = None
 current_checkpoint_name = None
+selected_robot_type = "toroidal_dot"  # Default robot type for session selection
 
 # Checkpoint metadata (populated when loading a checkpoint)
 # Used for resume functionality
@@ -39,6 +41,12 @@ def reset_checkpoint_metadata():
         'timestamp': None,
         'checkpoint_name': None,
     }
+
+
+def clear_validation_session():
+    """Clear validation session state."""
+    global validation_session_state
+    validation_session_state = {}
 
 
 def get_checkpoint_dir_for_session(session_path: str) -> str:

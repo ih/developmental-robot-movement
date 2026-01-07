@@ -98,6 +98,15 @@ python -m concat_world_model_explorer
   - Predicted next frame
   - Prediction error
 - **Metric graphs**: Plots tracking prediction error and iteration time
+- **Batch training with configurable modes**:
+  - **Random sampling**: Sample batches with replacement
+  - **Epoch-based sampling**: Shuffle and see each sample once per epoch
+  - **Resume training**: Continue from checkpoint with adaptive learning rate warmup
+  - **Train until divergence**: Run indefinitely until validation loss diverges from training loss
+    - Requires a validation session
+    - Uses ReduceLROnPlateau scheduler for unknown training length
+    - Configurable divergence detection (gap and ratio thresholds)
+    - Automatic chunked epoch regeneration for memory efficiency
 - **Model checkpoint management**:
   - Save/load model weights, optimizer, and scheduler state
   - Metadata tracking (timestamp, config, training metrics)

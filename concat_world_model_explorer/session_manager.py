@@ -26,11 +26,55 @@ from session_explorer_lib import (
 from recorded_policy import create_recorded_action_selector
 
 
-def refresh_sessions():
-    """Refresh session list - returns all sessions (JetBot and toroidal dot)"""
-    sessions = list_session_dirs()  # Already returns both robot types
+def get_robot_types():
+    """Return list of available robot types."""
+    return ["toroidal_dot", "jetbot", "so101"]
+
+
+def get_sessions_dir_for_type(robot_type):
+    """Return the sessions directory for a given robot type."""
+    if robot_type == "jetbot":
+        return config.JETBOT_RECORDING_DIR
+    elif robot_type == "so101":
+        return config.SO101_RECORDING_DIR
+    else:  # default to toroidal_dot
+        return config.TOROIDAL_DOT_RECORDING_DIR
+
+
+def refresh_sessions_for_type(robot_type):
+    """Refresh session list for a specific robot type."""
+    from session_explorer_lib import list_session_dirs_from_base
+
+    sessions_dir = get_sessions_dir_for_type(robot_type)
+    sessions = list_session_dirs_from_base(sessions_dir)
+
+    # Store the selected robot type in state
+    state.selected_robot_type = robot_type
+
+    # Create choices with just session names (since all are from same directory)
     choices = [os.path.basename(s) + " - " + s for s in sessions]
     return gr.Dropdown(choices=choices, value=choices[-1] if choices else None)
+
+
+def refresh_sessions():
+    """Refresh session list for currently selected robot type."""
+    return refresh_sessions_for_type(state.selected_robot_type)
+
+
+def get_validation_session_choices(robot_type=None):
+    """Get session choices for validation dropdown with 'None' option at the start."""
+    from session_explorer_lib import list_session_dirs_from_base
+
+    if robot_type is None:
+        robot_type = state.selected_robot_type
+
+    sessions_dir = get_sessions_dir_for_type(robot_type)
+    sessions = list_session_dirs_from_base(sessions_dir)
+
+    # Add "None" as first option, then session choices
+    choices = ["None - No validation"]
+    choices.extend([os.path.basename(s) + " - " + s for s in sessions])
+    return choices
 
 
 def load_session(session_choice):
@@ -168,3 +212,72 @@ def update_frame(frame_idx):
             frame_info += f"\n\n**Canvas:** Not available (need {min_frames} frames)"
 
     return frame, frame_info, canvas_image
+
+
+def load_validation_session(session_choice):
+    """Load a session as validation set (pre-builds canvases but doesn't create world model)"""
+    # Handle empty selection or "None" option
+    if not session_choice or session_choice.startswith("None"):
+        state.clear_validation_session()
+        return "No validation session selected"
+
+    # Extract session_dir from choice
+    session_dir = session_choice.split(" - ")[-1]
+    session_name = os.path.basename(session_dir)
+
+    # Check if this is the same as training session
+    if state.session_state.get("session_dir") == session_dir:
+        state.clear_validation_session()
+        return "⚠️ Cannot use same session for training and validation"
+
+    metadata = load_session_metadata(session_dir)
+    events = load_session_events(session_dir)
+    observations = extract_observations(events, session_dir)
+    actions = extract_actions(events)
+
+    if not observations:
+        state.clear_validation_session()
+        return f"⚠️ Session **{session_name}** has no observation frames"
+
+    # Pre-build all canvases for validation
+    print("\n" + "="*60)
+    print(f"Pre-building validation canvases for {session_name}...")
+    print("="*60)
+    prebuild_start = time.time()
+    canvas_cache, detected_frame_size = prebuild_all_canvases(
+        session_dir,
+        observations,
+        actions,
+        config.AutoencoderConcatPredictorWorldModelConfig
+    )
+    prebuild_time = time.time() - prebuild_start
+    print(f"Validation canvas pre-building completed in {prebuild_time:.2f}s")
+    canvas_width = detected_frame_size[1] * 3 + config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH * 2
+    print(f"Memory usage: ~{len(canvas_cache) * detected_frame_size[0] * canvas_width * 3 / (1024**2):.1f} MB")
+    print("="*60 + "\n")
+
+    # Store validation session state
+    state.validation_session_state.update({
+        "session_name": session_name,
+        "session_dir": session_dir,
+        "observations": observations,
+        "actions": actions,
+        "canvas_cache": canvas_cache,
+        "detected_frame_size": detected_frame_size,
+    })
+
+    min_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+    num_valid_canvases = len(observations) - (min_frames - 1)
+
+    # Check frame size compatibility with training session
+    train_frame_size = state.session_state.get("detected_frame_size")
+    if train_frame_size and detected_frame_size != train_frame_size:
+        return f"⚠️ **Validation:** {session_name} ({len(observations)} frames) - **Frame size mismatch!** Val: {detected_frame_size}, Train: {train_frame_size}. Validation will be skipped."
+
+    return f"✅ **Validation:** {session_name} ({len(observations)} frames, {num_valid_canvases} canvases)"
+
+
+def clear_validation_session_ui():
+    """Clear validation session and return status message"""
+    state.clear_validation_session()
+    return "No validation session selected"

@@ -38,6 +38,100 @@ from .visualization import (
 )
 
 
+def calculate_validation_loss(batch_size):
+    """
+    Sample batch from validation set and compute loss without training.
+
+    Args:
+        batch_size: Number of samples to evaluate
+
+    Returns:
+        Validation loss (float) or None if no validation session loaded or incompatible
+    """
+    val_state = state.validation_session_state
+    if not val_state or "canvas_cache" not in val_state:
+        return None
+
+    # Check frame size compatibility
+    val_frame_size = val_state.get("detected_frame_size")
+    train_frame_size = state.session_state.get("detected_frame_size")
+    if val_frame_size and train_frame_size and val_frame_size != train_frame_size:
+        # Frame sizes don't match - skip validation to avoid errors
+        print(f"[WARNING] Validation frame size {val_frame_size} != training frame size {train_frame_size}, skipping validation")
+        return None
+
+    val_canvas_cache = val_state["canvas_cache"]
+    val_observations = val_state["observations"]
+
+    # Get all valid indices (frames with enough history for canvas)
+    min_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+    all_valid_indices = list(range(min_frames - 1, len(val_observations)))
+
+    if not all_valid_indices:
+        return None
+
+    # Sample batch indices
+    batch_indices = random.choices(all_valid_indices, k=min(batch_size, len(all_valid_indices)))
+
+    # Build batch tensor from cache
+    canvases = []
+    for idx in batch_indices:
+        if idx in val_canvas_cache:
+            canvases.append(val_canvas_cache[idx]['canvas'])
+
+    if not canvases:
+        return None
+
+    # Stack canvases into tensor
+    # canvas_to_tensor returns [1, 3, H, W], so we use cat instead of stack
+    canvas_tensors = [canvas_to_tensor(c) for c in canvases]
+    canvas_batch = torch.cat(canvas_tensors, dim=0).to(state.device)
+
+    # Get canvas dimensions for mask generation
+    canvas_height, canvas_width = canvas_batch.shape[-2:]
+    num_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+
+    # Generate mask for the batch
+    patch_mask = compute_randomized_patch_mask_for_last_slot_gpu(
+        batch_size=len(canvases),
+        img_size=(canvas_height, canvas_width),
+        patch_size=config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
+        num_frame_slots=num_frames,
+        sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+        mask_ratio_min=config.MASK_RATIO_MIN,
+        mask_ratio_max=config.MASK_RATIO_MAX,
+        device=state.device,
+    )
+
+    # Forward pass (eval mode, no gradients)
+    state.world_model.autoencoder.eval()
+    with torch.no_grad():
+        # Get predictions - forward_with_patch_mask returns (pred_patches, latent)
+        pred_patches, _ = state.world_model.autoencoder.forward_with_patch_mask(
+            canvas_batch, patch_mask
+        )
+
+        # Get ground truth patches from the canvas
+        target_patches = state.world_model.autoencoder.patchify(canvas_batch)
+
+        # Select only masked patches for loss computation
+        masked_pred = pred_patches[patch_mask]
+        masked_target = target_patches[patch_mask]
+
+        # Compute loss
+        loss_dict = compute_hybrid_loss_on_masked_patches(
+            masked_pred, masked_target,
+            focal_beta=config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA,
+            focal_alpha=config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
+        )
+        val_loss = loss_dict['loss_hybrid']
+
+    # Switch back to train mode
+    state.world_model.autoencoder.train()
+
+    return val_loss.item()
+
+
 def log_training_debug_state(world_model, batch_count, samples_seen, loss, enable_wandb=False):
     """
     Log debug information to help diagnose periodic loss spikes.
@@ -264,7 +358,7 @@ def train_on_single_canvas(frame_idx, num_training_steps):
     return status_msg, training_info, grad_diag_info, fig_loss_history, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite
 
 
-def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep):
+def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep, is_val_loss=False):
     """
     Save a best model checkpoint and manage the list to keep only N best models.
 
@@ -274,12 +368,14 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
         world_model: The world model instance
         auto_saved_checkpoints: List of (loss, filepath) tuples for auto-saved checkpoints
         num_best_models_to_keep: Maximum number of best models to keep
+        is_val_loss: Whether the loss is validation loss (True) or training loss (False)
 
     Returns:
         Tuple of (success: bool, message: str, updated_checkpoints_list)
     """
     checkpoint_dir = state.get_checkpoint_dir_for_session(state.session_state["session_dir"])
-    checkpoint_name = f"best_model_auto_loss_{current_loss:.6f}.pth"
+    loss_type = "val" if is_val_loss else "train"
+    checkpoint_name = f"best_model_auto_{samples_seen:08d}_{loss_type}_{current_loss:.6f}.pth"
     checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
 
     # Ensure checkpoint directory exists
@@ -337,7 +433,9 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
 def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_mode, starting_samples,
                                 preserve_optimizer, preserve_scheduler, custom_lr, disable_lr_scaling,
                                 custom_warmup, lr_min_ratio, resume_warmup_ratio=0.01,
-                                sampling_mode="Random (with replacement)"):
+                                sampling_mode="Random (with replacement)",
+                                stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=1.5,
+                                divergence_patience=3, divergence_min_updates=5):
     """
     Generate a pre-flight summary of the training configuration.
 
@@ -350,7 +448,82 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
     batch_size = int(batch_size)
     starting_samples = int(starting_samples)
     custom_warmup = int(custom_warmup)
+    divergence_patience = int(divergence_patience)
+    divergence_min_updates = int(divergence_min_updates)
 
+    # Build summary
+    summary = "📋 **Training Configuration Summary**\n\n"
+
+    # Check for divergence mode first - it changes everything
+    if stop_on_divergence:
+        # Divergence mode - check if validation session is loaded
+        has_validation = bool(state.validation_session_state.get("canvas_cache"))
+
+        summary += f"**Mode:** 🎯 Train Until Divergence\n"
+        if not has_validation:
+            summary += f"- ⚠️ **WARNING: No validation session loaded!**\n"
+            summary += f"- This mode requires a validation session to detect divergence.\n"
+            summary += f"- Please load a validation session before starting.\n\n"
+        else:
+            val_name = state.validation_session_state.get("session_name", "unknown")
+            summary += f"- Validation session: {val_name}\n"
+            summary += f"- Training will run until validation loss diverges from training loss\n"
+            summary += f"- `Total Samples` setting is ignored\n\n"
+
+        summary += f"**Divergence Detection:**\n"
+        summary += f"- Gap threshold: {divergence_gap} (stop if val - train >= {divergence_gap})\n"
+        summary += f"- Ratio threshold: {divergence_ratio} (stop if val / train >= {divergence_ratio})\n"
+        summary += f"- Patience: {divergence_patience} consecutive checks\n"
+        summary += f"- Min updates before checking: {divergence_min_updates}\n\n"
+
+        # Calculate epochs for divergence mode
+        if state.session_state.get("observations"):
+            observations = state.session_state["observations"]
+            min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+            samples_per_epoch = len(observations) - (min_frames_needed - 1)
+            epochs_per_chunk = 100
+            samples_per_chunk = samples_per_epoch * epochs_per_chunk
+            summary += f"**Training Parameters:**\n"
+            summary += f"- Batch size: {batch_size}\n"
+            summary += f"- Sampling mode: Epoch-based (forced for divergence mode)\n"
+            summary += f"- Samples per epoch: {samples_per_epoch:,}\n"
+            summary += f"- Epochs per chunk: {epochs_per_chunk}\n"
+            summary += f"- Samples per chunk: {samples_per_chunk:,}\n"
+            summary += f"- Training continues indefinitely until divergence detected\n\n"
+        else:
+            summary += f"**Training Parameters:**\n"
+            summary += f"- Batch size: {batch_size}\n"
+            summary += f"- Sampling mode: Epoch-based (forced for divergence mode)\n\n"
+
+        # Compute peak LR for display
+        if custom_lr > 0:
+            peak_lr = custom_lr
+            lr_source = "custom override"
+            if not disable_lr_scaling:
+                peak_lr = peak_lr * batch_size
+        elif resume_mode and state.loaded_checkpoint_metadata.get('original_peak_lr'):
+            peak_lr = state.loaded_checkpoint_metadata['original_peak_lr']
+            lr_source = "from checkpoint (original peak)"
+        else:
+            base_lr_config = config.AutoencoderConcatPredictorWorldModelConfig.AUTOENCODER_LR
+            lr_source = "config default"
+            if disable_lr_scaling:
+                peak_lr = base_lr_config
+            else:
+                peak_lr = base_lr_config * batch_size
+
+        global_min_lr = peak_lr * lr_min_ratio
+
+        summary += f"**Learning Rate (ReduceLROnPlateau):**\n"
+        summary += f"- Starting LR: {peak_lr:.2e} ({lr_source})\n"
+        summary += f"- Min LR: {global_min_lr:.2e}\n"
+        summary += f"- Scheduler: ReduceLROnPlateau (stepped at update intervals with val_loss)\n"
+        summary += f"- Plateau patience: {divergence_patience * 2} updates\n"
+        summary += f"- Reduction factor: 0.5\n"
+
+        return summary
+
+    # Standard mode (not divergence) - original logic
     # Compute actual samples to train
     if resume_mode:
         if samples_mode == "Train additional samples":
@@ -414,9 +587,6 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
     # Resume warmup steps (proportional to session steps, capped at 25% of total)
     resume_warmup_steps = int(num_gradient_updates * resume_warmup_ratio) if resume_mode and starting_samples > 0 else 0
     resume_warmup_steps = min(resume_warmup_steps, num_gradient_updates // 4)  # Cap at 25% to leave room for decay
-
-    # Build summary
-    summary = "📋 **Training Configuration Summary**\n\n"
 
     # Mode
     if resume_mode:
@@ -502,12 +672,16 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           custom_lr=0, disable_lr_scaling=False,
                           custom_warmup=-1, lr_min_ratio=0.01, resume_warmup_ratio=0.01,
                           # Sampling mode
-                          sampling_mode="Random (with replacement)"):
+                          sampling_mode="Random (with replacement)",
+                          # Divergence-based early stopping parameters
+                          stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=1.5,
+                          divergence_patience=3, divergence_min_updates=5):
     """
     Run batch training with periodic full-session evaluation.
 
     Args:
-        total_samples: Total number of training samples (or additional samples if resume_mode)
+        total_samples: Total number of training samples (or additional samples if resume_mode).
+                      Ignored if stop_on_divergence=True.
         batch_size: Batch size for training
         current_observation_idx: Currently selected observation to refresh during updates
         update_interval: Evaluate every N samples (default: 100)
@@ -527,6 +701,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         lr_min_ratio: Minimum LR as ratio of base LR (default: 0.01)
         resume_warmup_ratio: Warmup steps as ratio of session gradient updates when resuming (default: 0.01)
         sampling_mode: "Random (with replacement)" or "Epoch-based (shuffle each epoch)" (default: "Random (with replacement)")
+        stop_on_divergence: Train until validation loss diverges from training loss (default: False).
+                           When True, total_samples is ignored and requires a validation session.
+        divergence_gap: Stop if (val_loss - train_loss) >= this value (default: 0.001)
+        divergence_ratio: Stop if (val_loss / train_loss) >= this ratio (default: 1.5)
+        divergence_patience: Consecutive divergence checks before stopping (default: 3)
+        divergence_min_updates: Minimum update intervals before checking divergence (default: 5)
 
     Yields:
         Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
@@ -536,7 +716,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     print(f"[DEBUG] run_world_model_batch called with: total_samples={total_samples}, batch_size={batch_size}, "
           f"update_interval={update_interval}, num_best_models_to_keep={num_best_models_to_keep}, "
           f"resume_mode={resume_mode}, preserve_optimizer={preserve_optimizer}, custom_lr={custom_lr}, "
-          f"sampling_mode={sampling_mode}")
+          f"sampling_mode={sampling_mode}, stop_on_divergence={stop_on_divergence}")
 
     # Validation
     if state.world_model is None:
@@ -553,6 +733,19 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     update_interval = int(update_interval)
     starting_samples = int(starting_samples)
     custom_warmup = int(custom_warmup)
+    divergence_patience = int(divergence_patience)
+    divergence_min_updates = int(divergence_min_updates)
+
+    # Divergence mode validation
+    if stop_on_divergence:
+        if not state.validation_session_state.get("canvas_cache"):
+            yield "Train-until-divergence mode requires a validation session. Please load one first.", None, None, None, None, "", None
+            return
+        # In divergence mode, we train until divergence is detected
+        # We can't pre-generate infinite samples, so we use epoch-based mode with many epochs
+        # Force epoch-based mode for divergence training (more memory efficient for long runs)
+        sampling_mode = "Epoch-based (shuffle each epoch)"
+        print(f"[DEBUG] Divergence mode enabled: forcing epoch-based sampling")
 
     if total_samples <= 0:
         yield "Total samples must be greater than 0", None, None, None, None, "", None
@@ -580,6 +773,14 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         yield "Canvas cache not found. Please reload the session.", None, None, None, None, "", None
         return
 
+    # For divergence mode, we'll use chunked training - generate epochs in batches
+    # and keep looping until divergence is detected
+    divergence_epochs_per_chunk = 100  # Generate 100 epochs at a time
+    if stop_on_divergence:
+        # Start with one chunk, we'll regenerate as needed
+        total_samples = max_samples_per_epoch * divergence_epochs_per_chunk
+        print(f"[DEBUG] Divergence mode: starting with {divergence_epochs_per_chunk} epochs ({total_samples:,} samples), will regenerate as needed")
+
     # Handle resume mode: compute actual samples to train
     if resume_mode:
         if samples_mode == "Train additional samples":
@@ -601,6 +802,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
     # Sample indices based on sampling mode
     all_valid_indices = list(range(min_frames_needed - 1, len(observations)))
+    chunk_number = 0  # For divergence mode - track which chunk we're on
 
     if sampling_mode == "Random (with replacement)":
         # Random sampling with replacement (allows looping through session)
@@ -730,7 +932,20 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     # Note: When resuming with global schedule (starting_samples > 0), we ALWAYS create a new scheduler
     # because the old scheduler doesn't know about the new total samples. The preserve_scheduler
     # option only applies when NOT using global schedule (e.g., continuing with exact same schedule).
-    if resume_mode and preserve_scheduler and starting_samples == 0:
+    use_plateau_scheduler = False  # Track which scheduler type we're using
+
+    if stop_on_divergence:
+        # Divergence mode: use ReduceLROnPlateau since total steps are unknown
+        # This scheduler adapts based on validation loss
+        state.world_model.ae_scheduler = world_model_utils.create_reduce_on_plateau_scheduler(
+            state.world_model.ae_optimizer,
+            patience=divergence_patience * 2,  # More patient than divergence check
+            factor=0.5,
+            min_lr=global_min_lr,
+        )
+        use_plateau_scheduler = True
+        print(f"[DEBUG] Created ReduceLROnPlateau scheduler (divergence mode): patience={divergence_patience * 2}, min_lr={global_min_lr:.6e}")
+    elif resume_mode and preserve_scheduler and starting_samples == 0:
         # Keep existing scheduler only if not using global schedule
         print(f"[DEBUG] Preserved scheduler state (step {state.world_model.ae_scheduler.last_epoch})")
     elif resume_mode and starting_samples > 0:
@@ -799,7 +1014,14 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     cumulative_metrics = {
         'samples_seen': [],
         'loss_at_sample': [],
+        'val_loss_at_sample': [],  # Validation loss (if validation session loaded)
     }
+
+    # Check if validation session is loaded
+    has_validation = bool(state.validation_session_state.get("canvas_cache"))
+    if has_validation:
+        val_name = state.validation_session_state.get("session_name", "unknown")
+        print(f"[DEBUG] Validation session loaded: {val_name}")
     samples_seen = starting_samples  # Start from checkpoint offset if resuming
     UPDATE_INTERVAL = int(update_interval)  # Evaluate every N samples
     last_eval_samples = starting_samples
@@ -814,6 +1036,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
     # Track auto-saved checkpoints for this training run (list of tuples: (loss, filepath))
     auto_saved_checkpoints = []
+
+    # Divergence tracking for early stopping
+    divergence_count = 0
+    update_count = 0
+    stop_early = False
+    stop_reason = ""
 
     # Track total training time
     training_start_time = time.time()
@@ -862,12 +1090,13 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 print("[WANDB WARNING] Continuing training without wandb logging")
                 enable_wandb = False  # Disable wandb for rest of training
 
-    # Training loop
+    # Training loop - outer loop for divergence mode (regenerates epochs as needed)
     state.world_model.autoencoder.train()
 
     batch_count = 0
     try:
-        if use_stream_pipelining:
+        while True:  # Outer loop for divergence mode - will break when done or stopped early
+          if use_stream_pipelining:
             # CUDA stream pipelining for optimal performance
             transfer_stream = torch.cuda.Stream()
             dataloader_iter = iter(dataloader)
@@ -904,7 +1133,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
                     canvas_tensor, patch_mask, state.world_model.ae_optimizer
                 )
-                state.world_model.ae_scheduler.step()
+                # Step scheduler every batch only for non-plateau schedulers
+                # Plateau scheduler is stepped at update intervals with val_loss
+                if not use_plateau_scheduler:
+                    state.world_model.ae_scheduler.step()
                 samples_seen += canvas_tensor.shape[0]
 
                 # Log per-batch metrics to wandb
@@ -935,14 +1167,50 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     cumulative_metrics['samples_seen'].append(samples_seen)
                     cumulative_metrics['loss_at_sample'].append(loss)
 
+                    # Calculate validation loss if validation session is loaded
+                    val_loss = None
+                    if has_validation:
+                        val_loss = calculate_validation_loss(batch_size)
+                        cumulative_metrics['val_loss_at_sample'].append(val_loss)
+                        if val_loss is not None:
+                            print(f"[DEBUG] Validation loss: {val_loss:.6f}")
+
+                    # Step plateau scheduler with validation loss (at update intervals, not every batch)
+                    if use_plateau_scheduler and val_loss is not None:
+                        state.world_model.ae_scheduler.step(val_loss)
+
+                    # Divergence checking for early stopping
+                    update_count += 1
+                    if stop_on_divergence and val_loss is not None:
+                        if update_count >= divergence_min_updates:
+                            gap = val_loss - loss
+                            ratio = val_loss / max(loss, 1e-8)
+                            diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio)
+                            if diverged:
+                                divergence_count += 1
+                                print(f"[DIVERGENCE] Check {divergence_count}/{divergence_patience}: "
+                                      f"gap={gap:.6f} (thresh={divergence_gap}), ratio={ratio:.2f} (thresh={divergence_ratio})")
+                            else:
+                                divergence_count = 0  # Reset on non-divergent check
+
+                            if divergence_count >= divergence_patience:
+                                stop_early = True
+                                stop_reason = (f"Divergence detected after {update_count} updates: "
+                                              f"val={val_loss:.6f} vs train={loss:.6f} "
+                                              f"(gap={gap:.6f}, ratio={ratio:.2f})")
+                                print(f"[DIVERGENCE] {stop_reason}")
+
                     # Debug logging to diagnose periodic loss spikes
                     log_training_debug_state(state.world_model, batch_count, samples_seen, loss, enable_wandb)
 
                     # Save best model if loss improved
-                    if loss < best_loss:
-                        best_loss = loss
+                    # Use validation loss if available, otherwise use training loss
+                    checkpoint_loss = val_loss if (val_loss is not None) else loss
+                    if checkpoint_loss < best_loss:
+                        best_loss = checkpoint_loss
                         success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
-                            loss, samples_seen, state.world_model, auto_saved_checkpoints, num_best_models_to_keep
+                            checkpoint_loss, samples_seen, state.world_model, auto_saved_checkpoints, num_best_models_to_keep,
+                            is_val_loss=(val_loss is not None)
                         )
                         if success:
                             print(f"[AUTO-SAVE] {save_msg}")
@@ -975,6 +1243,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     status_msg += f"- Samples: {samples_seen:,} / {final_samples_target:,}\n"
                     if resume_mode:
                         status_msg += f"- Training: {samples_seen - starting_samples:,} / {samples_to_train:,} additional\n"
+                    if stop_on_divergence:
+                        status_msg += f"- Mode: Train until divergence\n"
+                        status_msg += f"- Divergence checks: {divergence_count}/{divergence_patience}\n"
                     status_msg += f"- Current batch loss: {loss:.6f}\n"
                     status_msg += f"- Best loss: {best_loss:.6f}\n"
                     status_msg += f"- Learning rate: {current_lr:.6e}\n"
@@ -990,10 +1261,18 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
 
+                    # Check for early stop after yield
+                    if stop_early:
+                        break
+
+            # Check if we exited due to early stop
+            if stop_early:
+                print(f"[DEBUG] Training stopped early: {stop_reason}")
+
             print(f"[DEBUG] Exited training loop: batches_processed={batch_count}, samples_seen={samples_seen}, final_target={final_samples_target}")
             print(f"[DEBUG] Exit reason: next_canvas is {'None' if next_canvas is None else 'not None'}, samples_seen >= final_target: {samples_seen >= final_samples_target}")
 
-        else:
+          else:
             # Fallback: no stream pipelining
             print(f"[DEBUG] Using fallback mode (no stream pipelining)")
             for canvas_tensor, patch_mask, _ in dataloader:
@@ -1006,7 +1285,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
                     canvas_tensor, patch_mask, state.world_model.ae_optimizer
                 )
-                state.world_model.ae_scheduler.step()
+                # Step scheduler every batch only for non-plateau schedulers
+                # Plateau scheduler is stepped at update intervals with val_loss
+                if not use_plateau_scheduler:
+                    state.world_model.ae_scheduler.step()
                 samples_seen += canvas_tensor.shape[0]
 
                 # Log per-batch metrics to wandb
@@ -1046,14 +1328,50 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     cumulative_metrics['samples_seen'].append(samples_seen)
                     cumulative_metrics['loss_at_sample'].append(loss)
 
+                    # Calculate validation loss if validation session is loaded
+                    val_loss = None
+                    if has_validation:
+                        val_loss = calculate_validation_loss(batch_size)
+                        cumulative_metrics['val_loss_at_sample'].append(val_loss)
+                        if val_loss is not None:
+                            print(f"[DEBUG] Validation loss: {val_loss:.6f}")
+
+                    # Step plateau scheduler with validation loss (at update intervals, not every batch)
+                    if use_plateau_scheduler and val_loss is not None:
+                        state.world_model.ae_scheduler.step(val_loss)
+
+                    # Divergence checking for early stopping
+                    update_count += 1
+                    if stop_on_divergence and val_loss is not None:
+                        if update_count >= divergence_min_updates:
+                            gap = val_loss - loss
+                            ratio = val_loss / max(loss, 1e-8)
+                            diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio)
+                            if diverged:
+                                divergence_count += 1
+                                print(f"[DIVERGENCE] Check {divergence_count}/{divergence_patience}: "
+                                      f"gap={gap:.6f} (thresh={divergence_gap}), ratio={ratio:.2f} (thresh={divergence_ratio})")
+                            else:
+                                divergence_count = 0  # Reset on non-divergent check
+
+                            if divergence_count >= divergence_patience:
+                                stop_early = True
+                                stop_reason = (f"Divergence detected after {update_count} updates: "
+                                              f"val={val_loss:.6f} vs train={loss:.6f} "
+                                              f"(gap={gap:.6f}, ratio={ratio:.2f})")
+                                print(f"[DIVERGENCE] {stop_reason}")
+
                     # Debug logging to diagnose periodic loss spikes
                     log_training_debug_state(state.world_model, batch_count, samples_seen, loss, enable_wandb)
 
                     # Save best model if loss improved
-                    if loss < best_loss:
-                        best_loss = loss
+                    # Use validation loss if available, otherwise use training loss
+                    checkpoint_loss = val_loss if (val_loss is not None) else loss
+                    if checkpoint_loss < best_loss:
+                        best_loss = checkpoint_loss
                         success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
-                            loss, samples_seen, state.world_model, auto_saved_checkpoints, num_best_models_to_keep
+                            checkpoint_loss, samples_seen, state.world_model, auto_saved_checkpoints, num_best_models_to_keep,
+                            is_val_loss=(val_loss is not None)
                         )
                         if success:
                             print(f"[AUTO-SAVE] {save_msg}")
@@ -1086,6 +1404,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     status_msg += f"- Samples: {samples_seen:,} / {final_samples_target:,}\n"
                     if resume_mode:
                         status_msg += f"- Training: {samples_seen - starting_samples:,} / {samples_to_train:,} additional\n"
+                    if stop_on_divergence:
+                        status_msg += f"- Mode: Train until divergence\n"
+                        status_msg += f"- Divergence checks: {divergence_count}/{divergence_patience}\n"
                     status_msg += f"- Current batch loss: {loss:.6f}\n"
                     status_msg += f"- Best loss: {best_loss:.6f}\n"
                     status_msg += f"- Learning rate: {current_lr:.6e}\n"
@@ -1101,23 +1422,90 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
 
+                    # Check for early stop after yield
+                    if stop_early:
+                        break
+
+            # Check if we exited due to early stop
+            if stop_early:
+                print(f"[DEBUG] Training stopped early: {stop_reason}")
+
             print(f"[DEBUG] Exited training loop (fallback): batches_processed={batch_count}, samples_seen={samples_seen}, final_target={final_samples_target}")
 
-        # Final evaluation after training complete
+          # For divergence mode: if not stopped early, regenerate indices and continue
+          if stop_on_divergence and not stop_early:
+            chunk_number += 1
+            print(f"[DEBUG] Divergence mode: generating chunk {chunk_number + 1} ({divergence_epochs_per_chunk} more epochs)")
+
+            # Regenerate indices for next chunk (always epoch-based in divergence mode)
+            new_samples = max_samples_per_epoch * divergence_epochs_per_chunk
+            sampled_indices = []
+            for _ in range(divergence_epochs_per_chunk):
+                epoch_indices = all_valid_indices.copy()
+                random.shuffle(epoch_indices)
+                sampled_indices.extend(epoch_indices)
+
+            # Update targets
+            final_samples_target = samples_seen + new_samples
+
+            # Recreate DataLoader
+            try:
+                dataloader = create_canvas_dataloader(
+                    canvas_cache=canvas_cache,
+                    frame_indices=sampled_indices,
+                    batch_size=batch_size,
+                    config=config.AutoencoderConcatPredictorWorldModelConfig,
+                    device=state.device,
+                    num_workers=num_workers,
+                    shuffle=False,
+                    pin_memory=True,
+                    persistent_workers=(num_workers > 0),
+                    transfer_to_device=(not use_stream_pipelining),
+                )
+            except Exception as e:
+                print(f"[DEBUG] Error recreating DataLoader: {e}")
+                stop_early = True
+                stop_reason = f"Error regenerating training data: {e}"
+
+            if not stop_early:
+                # Reset batch count for new chunk
+                batch_count = 0
+                # Continue to next iteration of the outer training loop
+                continue
+
+          # Exit the training loop (either stopped early or not in divergence mode)
+          break
+
+        # Final evaluation after training complete (outside while loop, inside try block)
         print(f"[DEBUG] Running final evaluation...")
         status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
         cumulative_metrics['samples_seen'].append(samples_seen)
         current_loss = stats['hybrid']['mean']
         cumulative_metrics['loss_at_sample'].append(current_loss)
 
+        # Calculate final validation loss if validation session is loaded
+        if has_validation:
+            val_loss = calculate_validation_loss(batch_size)
+            cumulative_metrics['val_loss_at_sample'].append(val_loss)
+            if val_loss is not None:
+                print(f"[DEBUG] Final validation loss: {val_loss:.6f}")
+
         # Save best model automatically if final loss is the best
-        if current_loss < best_loss:
-            best_loss = current_loss
+        # Use validation loss if available, otherwise use training loss
+        final_checkpoint_loss = val_loss if (has_validation and val_loss is not None) else current_loss
+        is_val = has_validation and val_loss is not None
+        if final_checkpoint_loss < best_loss:
+            best_loss = final_checkpoint_loss
             success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
-                current_loss, samples_seen, state.world_model, auto_saved_checkpoints, num_best_models_to_keep
+                final_checkpoint_loss, samples_seen, state.world_model, auto_saved_checkpoints, num_best_models_to_keep,
+                is_val_loss=is_val
             )
             if success:
                 status_msg += f"\n\n{save_msg}"
+
+        # Add early stop reason if applicable
+        if stop_early:
+            status_msg = f"**Training Stopped Early**\n{stop_reason}\n\n" + status_msg
 
         # Add final learning rate to status
         final_lr = state.world_model.ae_optimizer.param_groups[0]['lr']

@@ -101,6 +101,29 @@ def create_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps=100000, 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def create_reduce_on_plateau_scheduler(optimizer, patience=5, factor=0.5, min_lr=1e-7):
+    """
+    Create ReduceLROnPlateau scheduler for validation-driven LR adjustment.
+    Used when training length is unknown (e.g., train-until-divergence mode).
+
+    Unlike cosine schedulers, this adapts based on validation loss and doesn't
+    require knowing total_steps ahead of time.
+
+    Args:
+        optimizer: The optimizer to schedule
+        patience: Number of validation checks with no improvement before LR reduction
+        factor: Factor to reduce LR by (new_lr = old_lr * factor)
+        min_lr: Minimum LR floor
+
+    Returns:
+        torch.optim.lr_scheduler.ReduceLROnPlateau
+    """
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=factor, patience=patience,
+        min_lr=min_lr
+    )
+
+
 def create_resume_scheduler(optimizer, warmup_from_lr, warmup_to_lr, warmup_steps,
                              decay_to_lr, total_steps):
     """

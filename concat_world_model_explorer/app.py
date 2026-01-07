@@ -27,7 +27,14 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     gr.Markdown("Run AutoencoderConcatPredictorWorldModel on recorded robot sessions.")
 
     # Session Selection
+    gr.Markdown("### Session Selection")
     with gr.Row():
+        robot_type_dropdown = gr.Dropdown(
+            label="Robot Type",
+            choices=session_manager.get_robot_types(),
+            value="so101",
+            interactive=True
+        )
         session_dropdown = gr.Dropdown(label="Session", choices=[], interactive=True)
         refresh_btn = gr.Button("🔄 Refresh", size="sm")
         load_session_btn = gr.Button("Load Session", variant="primary")
@@ -80,7 +87,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     # Frame Navigation
     with gr.Row():
-        frame_number_input = gr.Number(value=0, label="Jump to Frame", precision=0)
+        frame_number_input = gr.Number(value=3, label="Jump to Frame", precision=0)
         jump_btn = gr.Button("Jump", size="sm")
 
     gr.Markdown("---")
@@ -177,7 +184,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Number of training samples (loops through session if needed)"
         )
         batch_size_input = gr.Number(
-            value=64,
+            value=2,
             label="Batch Size",
             precision=0,
             minimum=1,
@@ -186,12 +193,12 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         )
         sampling_mode_dropdown = gr.Dropdown(
             choices=["Random (with replacement)", "Epoch-based (shuffle each epoch)"],
-            value="Random (with replacement)",
+            value="Epoch-based (shuffle each epoch)",
             label="Sampling Mode",
             info="Random: same sample can repeat. Epoch: each sample seen once per epoch."
         )
         update_interval_input = gr.Number(
-            value=2000,
+            value=100,
             label="Update Interval",
             precision=0,
             minimum=10,
@@ -199,7 +206,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Evaluate every N samples (lower = more frequent updates)"
         )
         window_size_input = gr.Number(
-            value=500,
+            value=25,
             label="Rolling Window Size",
             precision=0,
             minimum=1,
@@ -223,6 +230,63 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             maximum=10,
             interactive=True,
             info="Maximum number of best model checkpoints to keep (auto-deletes worse models)"
+        )
+
+    # Validation Set Controls
+    gr.Markdown("### Validation Set (Optional)")
+    gr.Markdown("Select a different session to use as validation set for monitoring generalization during training.")
+    with gr.Row():
+        validation_session_dropdown = gr.Dropdown(
+            label="Validation Session",
+            choices=[],
+            interactive=True,
+            info="Select a session to use as validation set"
+        )
+        clear_validation_btn = gr.Button("🗑️ Clear", size="sm")
+
+    validation_status = gr.Markdown("No validation session selected")
+
+    # Divergence-based Early Stopping Controls
+    gr.Markdown("### Early Stopping on Divergence")
+    gr.Markdown("Stop training when validation loss diverges from training loss. Requires a validation session.")
+    with gr.Row():
+        stop_on_divergence_checkbox = gr.Checkbox(
+            label="Stop on Divergence",
+            value=True,
+            info="Stop training when validation loss exceeds training loss by threshold"
+        )
+        divergence_patience_input = gr.Number(
+            value=3,
+            label="Patience",
+            precision=0,
+            minimum=1,
+            maximum=100,
+            interactive=True,
+            info="Number of consecutive divergence checks before stopping"
+        )
+        divergence_min_updates_input = gr.Number(
+            value=5,
+            label="Min Updates",
+            precision=0,
+            minimum=1,
+            interactive=True,
+            info="Minimum update intervals before checking divergence"
+        )
+
+    with gr.Row():
+        divergence_gap_input = gr.Number(
+            value=0.001,
+            label="Divergence Gap",
+            minimum=0,
+            interactive=True,
+            info="Stop if (val_loss - train_loss) >= this value"
+        )
+        divergence_ratio_input = gr.Number(
+            value=1.5,
+            label="Divergence Ratio",
+            minimum=1.0,
+            interactive=True,
+            info="Stop if (val_loss / train_loss) >= this ratio"
         )
 
     # Resume Mode Controls
@@ -486,16 +550,54 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     gr.Markdown("---")
 
     # Event handlers
+
+    # Robot type selection - updates both session and validation dropdowns
+    def on_robot_type_change(robot_type):
+        sessions_update = session_manager.refresh_sessions_for_type(robot_type)
+        val_choices = session_manager.get_validation_session_choices(robot_type)
+        # Clear validation when robot type changes
+        state.clear_validation_session()
+        return sessions_update, gr.Dropdown(choices=val_choices, value="None - No validation"), "No validation session selected"
+
+    robot_type_dropdown.change(
+        fn=on_robot_type_change,
+        inputs=[robot_type_dropdown],
+        outputs=[session_dropdown, validation_session_dropdown, validation_status]
+    )
+
+    # Refresh button - refreshes both dropdowns for current robot type
+    def refresh_all_sessions():
+        sessions_update = session_manager.refresh_sessions()
+        val_choices = session_manager.get_validation_session_choices()
+        return sessions_update, gr.Dropdown(choices=val_choices, value="None - No validation")
+
     refresh_btn.click(
-        fn=session_manager.refresh_sessions,
+        fn=refresh_all_sessions,
         inputs=[],
-        outputs=[session_dropdown]
+        outputs=[session_dropdown, validation_session_dropdown]
     )
 
     load_session_btn.click(
         fn=session_manager.load_session,
         inputs=[session_dropdown],
         outputs=[session_info, frame_image, frame_info, canvas_image, checkpoint_dropdown, counterfactual_action_radio]
+    )
+
+    # Validation session handlers
+    validation_session_dropdown.change(
+        fn=session_manager.load_validation_session,
+        inputs=[validation_session_dropdown],
+        outputs=[validation_status]
+    )
+
+    def clear_validation_and_reset_dropdown():
+        state.clear_validation_session()
+        return "No validation session selected", gr.Dropdown(value="None - No validation")
+
+    clear_validation_btn.click(
+        fn=clear_validation_and_reset_dropdown,
+        inputs=[],
+        outputs=[validation_status, validation_session_dropdown]
     )
 
     # Checkpoint management event handlers
@@ -606,6 +708,9 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             resume_warmup_ratio_input,
             # Sampling mode
             sampling_mode_dropdown,
+            # Divergence-based early stopping parameters
+            stop_on_divergence_checkbox, divergence_gap_input, divergence_ratio_input,
+            divergence_patience_input, divergence_min_updates_input,
         ],
         outputs=[
             batch_training_status,
@@ -628,6 +733,9 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             custom_lr_input, disable_lr_scaling_checkbox, custom_warmup_input, lr_min_ratio_input,
             resume_warmup_ratio_input,
             sampling_mode_dropdown,
+            # Divergence-based early stopping parameters
+            stop_on_divergence_checkbox, divergence_gap_input, divergence_ratio_input,
+            divergence_patience_input, divergence_min_updates_input,
         ],
         outputs=[preflight_summary]
     )
@@ -675,14 +783,17 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     # Initialize session dropdown and checkpoint dropdown on load
     def initialize_ui():
-        sessions = session_manager.refresh_sessions()
+        # Initialize sessions for default robot type (toroidal_dot)
+        sessions = session_manager.refresh_sessions_for_type("toroidal_dot")
         checkpoints = checkpoint_manager.refresh_checkpoints()
         # Initialize training info with default values
         training_info = visualization.calculate_training_info(10000000, 64)
-        return sessions, checkpoints, training_info
+        # Validation dropdown with "None" option
+        val_choices = session_manager.get_validation_session_choices("toroidal_dot")
+        return sessions, gr.Dropdown(choices=val_choices, value="None - No validation"), checkpoints, training_info
 
     demo.load(
         fn=initialize_ui,
         inputs=[],
-        outputs=[session_dropdown, checkpoint_dropdown, training_info_display]
+        outputs=[session_dropdown, validation_session_dropdown, checkpoint_dropdown, training_info_display]
     )
