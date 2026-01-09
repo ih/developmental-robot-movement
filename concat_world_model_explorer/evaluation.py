@@ -17,6 +17,151 @@ from models.autoencoder_concat_predictor import (
 )
 
 
+def evaluate_validation_session():
+    """
+    Evaluate model loss on all observations in the validation session.
+    Only computes and plots hybrid loss (not standard loss).
+
+    Returns: (status_msg, fig_loss, fig_dist, stats_text, stats)
+             or (None, None, None, None, None) if no validation session
+    """
+    if state.world_model is None:
+        return None, None, None, None, None
+
+    val_state = state.validation_session_state
+    if not val_state or "canvas_cache" not in val_state:
+        return None, None, None, None, None
+
+    observations = val_state.get("observations", [])
+    canvas_cache = val_state.get("canvas_cache", {})
+
+    if not observations or not canvas_cache:
+        return None, None, None, None, None
+
+    # Collect results
+    results = {
+        'observation_indices': [],
+        'loss_hybrid': [],
+    }
+
+    # Iterate through all cached canvases
+    state.world_model.autoencoder.eval()
+    for frame_idx, cache_entry in canvas_cache.items():
+        canvas = cache_entry.get('canvas')
+        if canvas is None:
+            continue
+
+        # Compute patch mask
+        canvas_tensor = canvas_to_tensor(canvas).to(state.device)
+        canvas_height, canvas_width = canvas_tensor.shape[-2:]
+        num_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+
+        patch_mask = compute_randomized_patch_mask_for_last_slot(
+            img_size=(canvas_height, canvas_width),
+            patch_size=config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
+            num_frame_slots=num_frames,
+            sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+            mask_ratio_min=config.MASK_RATIO_MIN,
+            mask_ratio_max=config.MASK_RATIO_MAX,
+        ).to(state.device)
+
+        # Run inference
+        with torch.no_grad():
+            pred_patches, _ = state.world_model.autoencoder.forward_with_patch_mask(canvas_tensor, patch_mask)
+            target_patches = state.world_model.autoencoder.patchify(canvas_tensor)
+
+            # Select masked patches
+            masked_pred = pred_patches[patch_mask]
+            masked_target = target_patches[patch_mask]
+
+            # Compute loss
+            loss_dict = compute_hybrid_loss_on_masked_patches(
+                masked_pred,
+                masked_target,
+                focal_alpha=config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
+                focal_beta=config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA
+            )
+
+            # Store results
+            results['observation_indices'].append(frame_idx)
+            results['loss_hybrid'].append(loss_dict['loss_hybrid'].item() if torch.is_tensor(loss_dict['loss_hybrid']) else loss_dict['loss_hybrid'])
+
+    if len(results['observation_indices']) == 0:
+        return None, None, None, None, None
+
+    # Sort by observation index for proper plotting
+    sorted_indices = sorted(range(len(results['observation_indices'])), key=lambda i: results['observation_indices'][i])
+    results['observation_indices'] = [results['observation_indices'][i] for i in sorted_indices]
+    results['loss_hybrid'] = [results['loss_hybrid'][i] for i in sorted_indices]
+
+    # Compute statistics
+    loss_hybrid_array = np.array(results['loss_hybrid'])
+
+    # Check for NaN values
+    if np.any(np.isnan(loss_hybrid_array)):
+        return None, None, None, None, None
+
+    stats = {
+        'num_observations': len(results['observation_indices']),
+        'hybrid': {
+            'mean': np.mean(loss_hybrid_array),
+            'median': np.median(loss_hybrid_array),
+            'std': np.std(loss_hybrid_array),
+            'min': np.min(loss_hybrid_array),
+            'max': np.max(loss_hybrid_array),
+            'p25': np.percentile(loss_hybrid_array, 25),
+            'p75': np.percentile(loss_hybrid_array, 75),
+            'p90': np.percentile(loss_hybrid_array, 90),
+            'p95': np.percentile(loss_hybrid_array, 95),
+            'p99': np.percentile(loss_hybrid_array, 99),
+        },
+    }
+
+    # Create statistics display
+    stats_text = f"### Validation Hybrid Loss Statistics\n\n"
+    stats_text += f"**Evaluated {stats['num_observations']} observations**\n\n"
+    stats_text += f"| Statistic | Value |\n"
+    stats_text += f"|-----------|-------|\n"
+    stats_text += f"| Mean | {format_loss(stats['hybrid']['mean'])} |\n"
+    stats_text += f"| Median | {format_loss(stats['hybrid']['median'])} |\n"
+    stats_text += f"| Std Dev | {format_loss(stats['hybrid']['std'])} |\n"
+    stats_text += f"| Min | {format_loss(stats['hybrid']['min'])} |\n"
+    stats_text += f"| Max | {format_loss(stats['hybrid']['max'])} |\n"
+    stats_text += f"| 25th %ile | {format_loss(stats['hybrid']['p25'])} |\n"
+    stats_text += f"| 75th %ile | {format_loss(stats['hybrid']['p75'])} |\n"
+    stats_text += f"| 90th %ile | {format_loss(stats['hybrid']['p90'])} |\n"
+    stats_text += f"| 95th %ile | {format_loss(stats['hybrid']['p95'])} |\n"
+    stats_text += f"| 99th %ile | {format_loss(stats['hybrid']['p99'])} |\n"
+
+    # Create line plot: Loss over observations (single plot, hybrid only)
+    fig_loss_over_time, ax = plt.subplots(1, 1, figsize=(12, 5))
+    ax.plot(results['observation_indices'], results['loss_hybrid'], 'b-', linewidth=1, alpha=0.7, label='Hybrid Loss')
+    ax.axhline(y=stats['hybrid']['mean'], color='r', linestyle='--', linewidth=1.5, label=f"Mean: {format_loss(stats['hybrid']['mean'])}")
+    ax.axhline(y=stats['hybrid']['median'], color='g', linestyle='--', linewidth=1.5, label=f"Median: {format_loss(stats['hybrid']['median'])}")
+    ax.set_xlabel('Observation Index')
+    ax.set_ylabel('Hybrid Loss')
+    ax.set_title('Validation Session: Hybrid Loss Over Observations')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # Create distribution histogram (single plot, hybrid only)
+    fig_distribution, ax = plt.subplots(1, 1, figsize=(8, 5))
+    ax.hist(results['loss_hybrid'], bins=30, color='blue', alpha=0.7, edgecolor='black')
+    ax.axvline(x=stats['hybrid']['mean'], color='r', linestyle='--', linewidth=2, label=f"Mean: {format_loss(stats['hybrid']['mean'])}")
+    ax.axvline(x=stats['hybrid']['median'], color='g', linestyle='--', linewidth=2, label=f"Median: {format_loss(stats['hybrid']['median'])}")
+    ax.set_xlabel('Hybrid Loss')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Validation Session: Hybrid Loss Distribution')
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+
+    status_msg = f"✅ **Validation Evaluation complete!** Processed {stats['num_observations']} observations."
+
+    return status_msg, fig_loss_over_time, fig_distribution, stats_text, stats
+
+
 def evaluate_full_session():
     """Evaluate model loss on all observations in the session"""
     if state.world_model is None:

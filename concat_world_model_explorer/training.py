@@ -30,7 +30,7 @@ from session_explorer_lib import load_frame_image
 from . import state
 from .utils import format_loss, format_grad_diagnostics, compute_canvas_figsize
 from .canvas_ops import build_canvas_from_frame
-from .evaluation import evaluate_full_session
+from .evaluation import evaluate_full_session, evaluate_validation_session
 from .visualization import (
     generate_batch_training_update,
     create_loss_vs_samples_plot,
@@ -375,7 +375,8 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
     """
     checkpoint_dir = state.get_checkpoint_dir_for_session(state.session_state["session_dir"])
     loss_type = "val" if is_val_loss else "train"
-    checkpoint_name = f"best_model_auto_{samples_seen:08d}_{loss_type}_{current_loss:.6f}.pth"
+    session_name = state.session_state.get('session_name', 'unknown')
+    checkpoint_name = f"best_model_auto_{session_name}_{samples_seen:08d}_{loss_type}_{current_loss:.6f}.pth"
     checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
 
     # Ensure checkpoint directory exists
@@ -434,7 +435,7 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
                                 preserve_optimizer, preserve_scheduler, custom_lr, disable_lr_scaling,
                                 custom_warmup, lr_min_ratio, resume_warmup_ratio=0.01,
                                 sampling_mode="Random (with replacement)",
-                                stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=1.5,
+                                stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=2.5,
                                 divergence_patience=3, divergence_min_updates=5):
     """
     Generate a pre-flight summary of the training configuration.
@@ -674,7 +675,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           # Sampling mode
                           sampling_mode="Random (with replacement)",
                           # Divergence-based early stopping parameters
-                          stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=1.5,
+                          stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=2.5,
                           divergence_patience=3, divergence_min_updates=5):
     """
     Run batch training with periodic full-session evaluation.
@@ -704,7 +705,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         stop_on_divergence: Train until validation loss diverges from training loss (default: False).
                            When True, total_samples is ignored and requires a validation session.
         divergence_gap: Stop if (val_loss - train_loss) >= this value (default: 0.001)
-        divergence_ratio: Stop if (val_loss / train_loss) >= this ratio (default: 1.5)
+        divergence_ratio: Stop if (val_loss / train_loss) >= this ratio (default: 2.5)
         divergence_patience: Consecutive divergence checks before stopping (default: 3)
         divergence_min_updates: Minimum update intervals before checking divergence (default: 5)
 
@@ -1027,12 +1028,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     last_eval_samples = starting_samples
 
     # Track best loss for automatic checkpoint saving
-    # Initialize from checkpoint loss if resuming
-    if resume_mode and state.loaded_checkpoint_metadata.get('loss') is not None:
-        best_loss = state.loaded_checkpoint_metadata['loss']
-        print(f"[DEBUG] Initialized best_loss from checkpoint: {best_loss:.6f}")
-    else:
-        best_loss = float('inf')
+    # Always start fresh - don't inherit previous best_loss even in resume mode
+    best_loss = float('inf')
 
     # Track auto-saved checkpoints for this training run (list of tuples: (loss, filepath))
     auto_saved_checkpoints = []
@@ -1218,7 +1215,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Log gradient diagnostics and additional metrics to wandb
                     if enable_wandb and grad_diagnostics:
                         try:
-                            wandb.log({
+                            log_dict = {
                                 "gradients/head_weight_norm": grad_diagnostics.get('head_weight_norm'),
                                 "gradients/head_bias_norm": grad_diagnostics.get('head_bias_norm'),
                                 "gradients/mask_token_norm": grad_diagnostics.get('mask_token_norm'),
@@ -1233,7 +1230,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                 "focal/weight_max": grad_diagnostics.get('focal_weight_max'),
                                 "train/best_loss": best_loss,
                                 "train/elapsed_time": elapsed_time,
-                            }, step=samples_seen)
+                            }
+                            # Add validation loss if available
+                            if val_loss is not None:
+                                log_dict["val/loss"] = val_loss
+                            wandb.log(log_dict, step=samples_seen)
                         except Exception as e:
                             print(f"[WANDB WARNING] Failed to log gradient diagnostics: {str(e)}")
 
@@ -1379,7 +1380,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Log gradient diagnostics and additional metrics to wandb
                     if enable_wandb and grad_diagnostics:
                         try:
-                            wandb.log({
+                            log_dict = {
                                 "gradients/head_weight_norm": grad_diagnostics.get('head_weight_norm'),
                                 "gradients/head_bias_norm": grad_diagnostics.get('head_bias_norm'),
                                 "gradients/mask_token_norm": grad_diagnostics.get('mask_token_norm'),
@@ -1394,7 +1395,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                 "focal/weight_max": grad_diagnostics.get('focal_weight_max'),
                                 "train/best_loss": best_loss,
                                 "train/elapsed_time": elapsed_time,
-                            }, step=samples_seen)
+                            }
+                            # Add validation loss if available
+                            if val_loss is not None:
+                                log_dict["val/loss"] = val_loss
+                            wandb.log(log_dict, step=samples_seen)
                         except Exception as e:
                             print(f"[WANDB WARNING] Failed to log gradient diagnostics: {str(e)}")
 
@@ -1478,13 +1483,50 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
         # Final evaluation after training complete (outside while loop, inside try block)
         print(f"[DEBUG] Running final evaluation...")
-        status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
+
+        # In divergence mode with validation: load best checkpoint and evaluate on validation session
+        if stop_on_divergence and has_validation and auto_saved_checkpoints:
+            # Load best checkpoint for validation evaluation
+            _, best_checkpoint_path = auto_saved_checkpoints[0]  # First is best (sorted by loss)
+            print(f"[DEBUG] Loading best checkpoint for validation eval: {best_checkpoint_path}")
+
+            try:
+                checkpoint = torch.load(best_checkpoint_path, map_location=state.device)
+                state.world_model.autoencoder.load_state_dict(checkpoint['model_state_dict'])
+                best_samples = checkpoint.get('samples_seen', 0)
+                best_loss = checkpoint.get('loss', 0)
+                print(f"[DEBUG] Loaded best checkpoint: samples={best_samples}, loss={best_loss:.6f}")
+
+                # Run evaluation on validation session
+                val_status, fig_loss, fig_dist, val_stats_text, val_stats = evaluate_validation_session()
+
+                if val_stats is not None:
+                    status_msg = f"## Best Validation Checkpoint Evaluation\n\n"
+                    status_msg += f"**Checkpoint:** `{os.path.basename(best_checkpoint_path)}`\n"
+                    status_msg += f"**Saved at:** {best_samples:,} samples (val loss: {best_loss:.6f})\n\n"
+                    status_msg += val_stats_text
+                    stats = val_stats
+                    current_loss = stats['hybrid']['mean']
+                else:
+                    # Fallback to training session evaluation
+                    print(f"[DEBUG] Validation evaluation failed, falling back to training evaluation")
+                    status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
+                    current_loss = stats['hybrid']['mean'] if stats else 0
+            except Exception as e:
+                print(f"[DEBUG] Error loading best checkpoint: {e}, falling back to training evaluation")
+                status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
+                current_loss = stats['hybrid']['mean'] if stats else 0
+        else:
+            # Normal mode: run evaluation on training session
+            status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
+            current_loss = stats['hybrid']['mean'] if stats else 0
+
         cumulative_metrics['samples_seen'].append(samples_seen)
-        current_loss = stats['hybrid']['mean']
         cumulative_metrics['loss_at_sample'].append(current_loss)
 
-        # Calculate final validation loss if validation session is loaded
-        if has_validation:
+        # Calculate final validation loss if validation session is loaded (for non-divergence mode)
+        val_loss = None
+        if has_validation and not stop_on_divergence:
             val_loss = calculate_validation_loss(batch_size)
             cumulative_metrics['val_loss_at_sample'].append(val_loss)
             if val_loss is not None:
@@ -1514,7 +1556,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         # Log full-session evaluation metrics to wandb
         if enable_wandb and stats:
             try:
-                wandb.log({
+                log_dict = {
                     "eval/loss_hybrid_mean": stats['hybrid']['mean'],
                     "eval/loss_hybrid_median": stats['hybrid']['median'],
                     "eval/loss_hybrid_std": stats['hybrid']['std'],
@@ -1525,11 +1567,14 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     "eval/loss_hybrid_p90": stats['hybrid']['p90'],
                     "eval/loss_hybrid_p95": stats['hybrid']['p95'],
                     "eval/loss_hybrid_p99": stats['hybrid']['p99'],
-                    "eval/loss_standard_mean": stats['standard']['mean'],
-                    "eval/loss_standard_median": stats['standard']['median'],
-                    "eval/loss_standard_std": stats['standard']['std'],
                     "eval/final_lr": final_lr,
-                }, step=samples_seen)
+                }
+                # Add standard loss stats if available (not in validation-only evaluation)
+                if 'standard' in stats:
+                    log_dict["eval/loss_standard_mean"] = stats['standard']['mean']
+                    log_dict["eval/loss_standard_median"] = stats['standard']['median']
+                    log_dict["eval/loss_standard_std"] = stats['standard']['std']
+                wandb.log(log_dict, step=samples_seen)
             except Exception as e:
                 print(f"[WANDB WARNING] Failed to log evaluation metrics: {str(e)}")
 

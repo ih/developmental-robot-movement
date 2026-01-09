@@ -275,14 +275,14 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     with gr.Row():
         divergence_gap_input = gr.Number(
-            value=0.001,
+            value=0.1,
             label="Divergence Gap",
             minimum=0,
             interactive=True,
             info="Stop if (val_loss - train_loss) >= this value"
         )
         divergence_ratio_input = gr.Number(
-            value=1.5,
+            value=2.5,
             label="Divergence Ratio",
             minimum=1.0,
             interactive=True,
