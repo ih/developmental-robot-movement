@@ -255,24 +255,40 @@ python convert_lerobot_to_explorer.py \
 - Manually provide `--action-duration` and `--position-delta` if logs are unavailable
 
 ### Concat World Model Explorer
+
+**Usage:**
 ```bash
+# Auto-find available port starting from 7861
 python -m concat_world_model_explorer
+
+# Use specific port (for running multiple instances)
+python -m concat_world_model_explorer --port 7862
+
+# Create public Gradio link
+python -m concat_world_model_explorer --share
 ```
+
+**Features:**
 - **Canvas-based world model**: Interactive web UI for exploring AutoencoderConcatPredictorWorldModel on recorded sessions
 - **Session selection**: Choose from recorded sessions in `saved/sessions/toroidal_dot/` or `saved/sessions/so101/`
 - **Frame navigation**: Browse session frames with slider and text input
 - **World model execution**: Run world model for specified number of iterations with single-step training per iteration
 - **Full masking approach**: Uses MASK_RATIO = 1.0 for complete next-frame inpainting
-- **Live progress tracking**: Real-time display of prediction error and iteration timing during execution
-- **Comprehensive visualizations**: Four training views (original canvas, masked overlay, full inpainting output, composite) plus prediction display
+- **Live progress tracking**: Real-time display of prediction error, learning rate, and iteration timing during execution
+- **Comprehensive visualizations**:
+  - Four training canvas views (original canvas, masked overlay, full inpainting output, composite reconstruction)
+  - Loss graphs (full history + rolling window)
+  - Learning rate schedule graph (log scale for warmup + cosine decay visualization)
+  - Training observation samples (random frames + current frame)
 - **Post-run visualizations**: Current frame, predicted frame, and prediction error
-- **Metric graphs**: Plots tracking prediction error and iteration time over all iterations
+- **Metric graphs**: Plots tracking loss and learning rate over all iterations
 - **Authentic training**: Uses actual `AutoencoderConcatPredictorWorldModel.train_autoencoder()` method with MAE-native masked patch optimization
 - **Model checkpoint management**:
   - **Save weights**: Enter checkpoint name and click "💾 Save Weights" to save model, optimizer, and scheduler state
   - **Load weights**: Select checkpoint from dropdown and click "📂 Load Weights" to restore previous training state
-  - **Checkpoint location**: All checkpoints saved to `saved/checkpoints/toroidal_dot/`
+  - **Checkpoint location**: All checkpoints saved to robot-specific directories (e.g., `saved/checkpoints/toroidal_dot/`)
   - **Metadata tracking**: Each checkpoint includes timestamp, config parameters, and training metrics
+  - **Instance-aware naming**: Multiple instances running on different ports save checkpoints with unique names to prevent collisions
 - **Inference-only evaluation**:
   - **Single canvas inference**: Run inference without training on selected frame to see predictions
   - **Full session evaluation**: Calculate loss statistics over all observations for objective model comparison
@@ -284,6 +300,12 @@ python -m concat_world_model_explorer
   - **Configurable aggregation**: Choose how to aggregate attention across heads (mean/max/sum) and selected patches
   - **Layer and head filtering**: Toggle individual decoder layers (0-4) and attention heads (0-3) for detailed analysis
   - **Attention direction**: Shows attention FROM selected patches (e.g., dot patches) TO all other patches in the canvas
+
+**Parallel Training:**
+- Multiple instances can run simultaneously on different ports
+- Each instance automatically gets a unique checkpoint prefix (e.g., `p7861`, `p7862`)
+- Checkpoints are named: `best_model_auto_{session}_{instance_id}_{samples}_{type}_{loss}.pth`
+- Requires sufficient GPU memory for each instance (~1-4GB per instance depending on batch size)
 
 ### Recording Sessions
 To create new sessions for exploration:

@@ -83,6 +83,24 @@ def create_loss_vs_recent_checkpoints_plot(cumulative_metrics, window_size=10):
     return fig
 
 
+def create_lr_vs_samples_plot(cumulative_metrics):
+    """Create plot of learning rate vs samples seen"""
+    if not cumulative_metrics.get('samples_seen') or not cumulative_metrics.get('lr_at_sample'):
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(cumulative_metrics['samples_seen'],
+            cumulative_metrics['lr_at_sample'],
+            'purple', linewidth=2, marker='o', markersize=4)
+    ax.set_xlabel('Samples Seen', fontsize=12)
+    ax.set_ylabel('Learning Rate', fontsize=12)
+    ax.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+    ax.set_yscale('log')  # Log scale for better visualization of LR decay
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+
 def generate_multiple_observation_canvases(observation_indices):
     """Generate grid of canvas visualizations for multiple observations"""
     if state.world_model is None:
@@ -193,6 +211,9 @@ def generate_batch_training_update(samples_seen, total_samples, cumulative_metri
     # Create rolling window plot
     fig_loss_vs_recent = create_loss_vs_recent_checkpoints_plot(cumulative_metrics, window_size)
 
+    # Learning rate vs samples plot
+    fig_lr_vs_samples = create_lr_vs_samples_plot(cumulative_metrics)
+
     # Sample observations: N random + current frame
     observations = state.session_state.get("observations", [])
     min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
@@ -212,8 +233,8 @@ def generate_batch_training_update(samples_seen, total_samples, cumulative_metri
         obs_status = "No valid observations"
         obs_combined_fig = None
 
-    return (status, fig_loss_vs_samples, fig_loss_vs_recent, eval_loss_fig, eval_dist_fig,
-            obs_status, obs_combined_fig)
+    return (status, fig_loss_vs_samples, fig_loss_vs_recent, fig_lr_vs_samples,
+            eval_loss_fig, eval_dist_fig, obs_status, obs_combined_fig)
 
 
 def calculate_training_info(total_samples, batch_size):

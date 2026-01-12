@@ -15,6 +15,7 @@ validation_session_state = {}  # Stores validation session data (observations, a
 world_model = None
 current_checkpoint_name = None
 selected_robot_type = "toroidal_dot"  # Default robot type for session selection
+instance_id = None  # Unique identifier for this instance (set by __main__.py based on port)
 
 # Checkpoint metadata (populated when loading a checkpoint)
 # Used for resume functionality

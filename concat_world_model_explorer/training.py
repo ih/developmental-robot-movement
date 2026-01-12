@@ -376,7 +376,9 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
     checkpoint_dir = state.get_checkpoint_dir_for_session(state.session_state["session_dir"])
     loss_type = "val" if is_val_loss else "train"
     session_name = state.session_state.get('session_name', 'unknown')
-    checkpoint_name = f"best_model_auto_{session_name}_{samples_seen:08d}_{loss_type}_{current_loss:.6f}.pth"
+    # Include instance_id in checkpoint name to avoid collisions when running multiple instances
+    instance_suffix = f"_{state.instance_id}" if state.instance_id else ""
+    checkpoint_name = f"best_model_auto_{session_name}{instance_suffix}_{samples_seen:08d}_{loss_type}_{current_loss:.6f}.pth"
     checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
 
     # Ensure checkpoint directory exists
@@ -721,11 +723,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
     # Validation
     if state.world_model is None:
-        yield "Please load a session first", None, None, None, None, "", None
+        yield "Please load a session first", None, None, None, None, None, "", None
         return
 
     if not state.session_state.get("observations") or not state.session_state.get("actions"):
-        yield "No session data available", None, None, None, None, "", None
+        yield "No session data available", None, None, None, None, None, "", None
         return
 
     total_samples = int(total_samples)
@@ -740,7 +742,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     # Divergence mode validation
     if stop_on_divergence:
         if not state.validation_session_state.get("canvas_cache"):
-            yield "Train-until-divergence mode requires a validation session. Please load one first.", None, None, None, None, "", None
+            yield "Train-until-divergence mode requires a validation session. Please load one first.", None, None, None, None, None, "", None
             return
         # In divergence mode, we train until divergence is detected
         # We can't pre-generate infinite samples, so we use epoch-based mode with many epochs
@@ -749,15 +751,15 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         print(f"[DEBUG] Divergence mode enabled: forcing epoch-based sampling")
 
     if total_samples <= 0:
-        yield "Total samples must be greater than 0", None, None, None, None, "", None
+        yield "Total samples must be greater than 0", None, None, None, None, None, "", None
         return
 
     if batch_size <= 0:
-        yield "Batch size must be greater than 0", None, None, None, None, "", None
+        yield "Batch size must be greater than 0", None, None, None, None, None, "", None
         return
 
     if update_interval <= 0:
-        yield "Update interval must be greater than 0", None, None, None, None, "", None
+        yield "Update interval must be greater than 0", None, None, None, None, None, "", None
         return
 
     observations = state.session_state["observations"]
@@ -765,13 +767,13 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     max_samples_per_epoch = len(observations) - (min_frames_needed - 1)
 
     if max_samples_per_epoch <= 0:
-        yield f"Session too small: need at least {min_frames_needed} observations", None, None, None, None, "", None
+        yield f"Session too small: need at least {min_frames_needed} observations", None, None, None, None, None, "", None
         return
 
     # Check if canvas cache exists
     canvas_cache = state.session_state.get("canvas_cache", {})
     if not canvas_cache:
-        yield "Canvas cache not found. Please reload the session.", None, None, None, None, "", None
+        yield "Canvas cache not found. Please reload the session.", None, None, None, None, None, "", None
         return
 
     # For divergence mode, we'll use chunked training - generate epochs in batches
@@ -793,7 +795,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             samples_to_train = max(0, total_samples - starting_samples)
             final_samples_target = total_samples
             if samples_to_train <= 0:
-                yield f"Already at {starting_samples:,} samples, target is {total_samples:,}. Nothing to train.", None, None, None, None, "", None
+                yield f"Already at {starting_samples:,} samples, target is {total_samples:,}. Nothing to train.", None, None, None, None, None, "", None
                 return
         print(f"[DEBUG] Resume mode: starting_samples={starting_samples}, samples_to_train={samples_to_train}, final_target={final_samples_target}")
     else:
@@ -1008,7 +1010,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             transfer_to_device=(not use_stream_pipelining),
         )
     except Exception as e:
-        yield f"Error creating DataLoader: {str(e)}", None, None, None, None, "", None
+        yield f"Error creating DataLoader: {str(e)}", None, None, None, None, None, "", None
         return
 
     # Initialize metrics with resume offset
@@ -1016,6 +1018,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         'samples_seen': [],
         'loss_at_sample': [],
         'val_loss_at_sample': [],  # Validation loss (if validation session loaded)
+        'lr_at_sample': [],  # Learning rate at each checkpoint
     }
 
     # Check if validation session is loaded
@@ -1160,9 +1163,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     last_eval_samples = samples_seen
                     elapsed_time = time.time() - training_start_time
 
-                    # Track training loss for progress plots
+                    # Track training loss and learning rate for progress plots
+                    current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
                     cumulative_metrics['samples_seen'].append(samples_seen)
                     cumulative_metrics['loss_at_sample'].append(loss)
+                    cumulative_metrics['lr_at_sample'].append(current_lr)
 
                     # Calculate validation loss if validation session is loaded
                     val_loss = None
@@ -1325,9 +1330,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     last_eval_samples = samples_seen
                     elapsed_time = time.time() - training_start_time
 
-                    # Track training loss for progress plots
+                    # Track training loss and learning rate for progress plots
+                    current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
                     cumulative_metrics['samples_seen'].append(samples_seen)
                     cumulative_metrics['loss_at_sample'].append(loss)
+                    cumulative_metrics['lr_at_sample'].append(current_lr)
 
                     # Calculate validation loss if validation session is loaded
                     val_loss = None
@@ -1521,8 +1528,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
             current_loss = stats['hybrid']['mean'] if stats else 0
 
+        final_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
         cumulative_metrics['samples_seen'].append(samples_seen)
         cumulative_metrics['loss_at_sample'].append(current_loss)
+        cumulative_metrics['lr_at_sample'].append(final_lr)
 
         # Calculate final validation loss if validation session is loaded (for non-divergence mode)
         val_loss = None
@@ -1609,7 +1618,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             except Exception as wandb_err:
                 print(f"[WANDB WARNING] Error finishing wandb run: {str(wandb_err)}")
 
-        yield error_msg, None, None, None, None, "", None
+        yield error_msg, None, None, None, None, None, "", None
 
 
 def run_batch_comparison(batch_sizes_str, total_samples):

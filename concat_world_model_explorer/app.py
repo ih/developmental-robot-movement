@@ -401,6 +401,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
         with gr.Column(scale=1):
             loss_vs_recent_plot = gr.Plot(label="Loss vs Recent Checkpoints (Rolling Window)")
 
+    lr_vs_samples_plot = gr.Plot(label="Learning Rate vs Samples Seen")
+
     gr.Markdown("---")
 
     # Training Observation Samples
@@ -716,6 +718,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             batch_training_status,
             loss_vs_samples_plot,
             loss_vs_recent_plot,
+            lr_vs_samples_plot,
             latest_eval_loss_plot,
             latest_eval_dist_plot,
             observation_samples_status,
