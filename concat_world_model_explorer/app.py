@@ -206,7 +206,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Evaluate every N samples (lower = more frequent updates)"
         )
         window_size_input = gr.Number(
-            value=25,
+            value=100,
             label="Rolling Window Size",
             precision=0,
             minimum=1,

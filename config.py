@@ -13,6 +13,9 @@ MASK_RATIO_MAX = 1  # Maximum mask ratio for randomized masking
 # Root auxiliary directory for checkpoints and recordings
 AUX_DIR = "saved"
 
+# Training logs directory
+TRAINING_LOG_DIR = f"{AUX_DIR}/training_logs"
+
 # Robot-specific recording directories
 JETBOT_RECORDING_DIR = f"{AUX_DIR}/sessions/jetbot"
 TOROIDAL_DOT_RECORDING_DIR = f"{AUX_DIR}/sessions/toroidal_dot"

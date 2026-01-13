@@ -36,6 +36,7 @@ from .visualization import (
     create_loss_vs_samples_plot,
     create_loss_vs_recent_checkpoints_plot,
 )
+from .training_logger import TrainingLogger
 
 
 def calculate_validation_loss(batch_size):
@@ -776,6 +777,21 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         yield "Canvas cache not found. Please reload the session.", None, None, None, None, None, "", None
         return
 
+    # Initialize training logger
+    logger = None
+    session_name = state.session_state.get("session_name", "unknown")
+    if session_name != "unknown":
+        try:
+            logger = TrainingLogger(
+                session_name=session_name,
+                log_dir=config.TRAINING_LOG_DIR,
+                summary_interval=max(10, update_interval // 10)  # Summary every ~10 updates
+            )
+            print(f"[LOGGER] Initialized training logger for session: {session_name}")
+        except Exception as e:
+            print(f"[LOGGER WARNING] Failed to initialize logger: {e}")
+            logger = None
+
     # For divergence mode, we'll use chunked training - generate epochs in batches
     # and keep looping until divergence is detected
     divergence_epochs_per_chunk = 100  # Generate 100 epochs at a time
@@ -1046,6 +1062,38 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     # Track total training time
     training_start_time = time.time()
 
+    # Log training configuration
+    if logger:
+        try:
+            logger.log_config({
+                'session_name': session_name,
+                'total_samples': samples_to_train,
+                'final_samples_target': final_samples_target,
+                'starting_samples': starting_samples,
+                'batch_size': batch_size,
+                'learning_rate': peak_lr,
+                'target_lr': target_lr,
+                'global_min_lr': global_min_lr,
+                'warmup_steps': scaled_warmup_steps,
+                'num_gradient_updates': num_gradient_updates,
+                'num_training_examples': max_samples_per_epoch,
+                'update_interval': update_interval,
+                'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+                'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+                'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+                'patch_size': config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
+                'weight_decay': config.AutoencoderConcatPredictorWorldModelConfig.WEIGHT_DECAY,
+                'lr_min_ratio': lr_min_ratio,
+                'focal_beta': config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_BETA,
+                'focal_alpha': config.AutoencoderConcatPredictorWorldModelConfig.FOCAL_LOSS_ALPHA,
+                'resume_mode': resume_mode,
+                'preserve_optimizer': preserve_optimizer,
+                'preserve_scheduler': preserve_scheduler,
+                'sampling_mode': sampling_mode,
+            })
+        except Exception as e:
+            print(f"[LOGGER WARNING] Failed to log config: {e}")
+
     # Initialize wandb if enabled
     if enable_wandb:
         if not WANDB_AVAILABLE:
@@ -1103,13 +1151,14 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
             # Prefetch first batch
             try:
-                next_canvas_cpu, next_mask_cpu, _ = next(dataloader_iter)
+                next_canvas_cpu, next_mask_cpu, next_batch_indices = next(dataloader_iter)
                 with torch.cuda.stream(transfer_stream):
                     next_canvas = next_canvas_cpu.to(state.device, non_blocking=True)
                     next_mask = next_mask_cpu.to(state.device, non_blocking=True)
                 print(f"[DEBUG] Prefetched first batch successfully")
             except StopIteration:
                 next_canvas = None
+                next_batch_indices = []
                 print(f"[DEBUG] DataLoader empty - no batches available!")
 
             print(f"[DEBUG] Starting training loop: next_canvas is {'not None' if next_canvas is not None else 'None'}, samples_seen={samples_seen}, final_target={final_samples_target}")
@@ -1119,15 +1168,17 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 torch.cuda.current_stream().wait_stream(transfer_stream)
                 canvas_tensor = next_canvas
                 patch_mask = next_mask
+                batch_indices = next_batch_indices
 
                 # Prefetch next batch in parallel with training
                 with torch.cuda.stream(transfer_stream):
                     try:
-                        next_canvas_cpu, next_mask_cpu, _ = next(dataloader_iter)
+                        next_canvas_cpu, next_mask_cpu, next_batch_indices = next(dataloader_iter)
                         next_canvas = next_canvas_cpu.to(state.device, non_blocking=True)
                         next_mask = next_mask_cpu.to(state.device, non_blocking=True)
                     except StopIteration:
                         next_canvas = None
+                        next_batch_indices = []
 
                 # Train on current batch
                 loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
@@ -1149,6 +1200,37 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         }, step=samples_seen)
                     except Exception as e:
                         print(f"[WANDB WARNING] Failed to log per-batch metrics: {str(e)}")
+
+                # Log per-batch metrics to local logger
+                if logger:
+                    try:
+                        current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
+                        # Compute gradient norm from diagnostics
+                        grad_norm = 0.0
+                        if grad_diagnostics:
+                            grad_norm = sum([
+                                grad_diagnostics.get('head_weight_norm', 0),
+                                grad_diagnostics.get('head_bias_norm', 0),
+                                grad_diagnostics.get('mask_token_norm', 0),
+                                grad_diagnostics.get('qkv_weight_norm', 0),
+                            ])
+
+                        logger.log_batch({
+                            'batch': batch_count,
+                            'samples_seen': samples_seen,
+                            'timestamp': time.time(),
+                            'batch_indices': batch_indices.tolist() if hasattr(batch_indices, 'tolist') else list(batch_indices),
+                            'loss_hybrid': loss,
+                            'loss_plain': grad_diagnostics.get('loss_plain', 0) if grad_diagnostics else 0,
+                            'loss_focal': grad_diagnostics.get('loss_focal', 0) if grad_diagnostics else 0,
+                            'loss_standard': grad_diagnostics.get('loss_standard', 0) if grad_diagnostics else 0,
+                            'focal_weight_mean': grad_diagnostics.get('focal_weight_mean', 0) if grad_diagnostics else 0,
+                            'focal_weight_max': grad_diagnostics.get('focal_weight_max', 0) if grad_diagnostics else 0,
+                            'lr': current_lr,
+                            'grad_norm_total': grad_norm,
+                        })
+                    except Exception as e:
+                        print(f"[LOGGER WARNING] Failed to log batch: {e}")
 
                 if batch_count <= 5 or batch_count % 10 == 0:
                     current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
@@ -1281,7 +1363,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
           else:
             # Fallback: no stream pipelining
             print(f"[DEBUG] Using fallback mode (no stream pipelining)")
-            for canvas_tensor, patch_mask, _ in dataloader:
+            for canvas_tensor, patch_mask, batch_indices in dataloader:
                 batch_count += 1
                 if samples_seen >= final_samples_target:
                     print(f"[DEBUG] Breaking: samples_seen ({samples_seen}) >= final_target ({final_samples_target})")
@@ -1296,6 +1378,37 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 if not use_plateau_scheduler:
                     state.world_model.ae_scheduler.step()
                 samples_seen += canvas_tensor.shape[0]
+
+                # Log per-batch metrics to local logger
+                if logger:
+                    try:
+                        current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
+                        # Compute gradient norm from diagnostics
+                        grad_norm = 0.0
+                        if grad_diagnostics:
+                            grad_norm = sum([
+                                grad_diagnostics.get('head_weight_norm', 0),
+                                grad_diagnostics.get('head_bias_norm', 0),
+                                grad_diagnostics.get('mask_token_norm', 0),
+                                grad_diagnostics.get('qkv_weight_norm', 0),
+                            ])
+
+                        logger.log_batch({
+                            'batch': batch_count,
+                            'samples_seen': samples_seen,
+                            'timestamp': time.time(),
+                            'batch_indices': batch_indices.tolist() if hasattr(batch_indices, 'tolist') else list(batch_indices),
+                            'loss_hybrid': loss,
+                            'loss_plain': grad_diagnostics.get('loss_plain', 0) if grad_diagnostics else 0,
+                            'loss_focal': grad_diagnostics.get('loss_focal', 0) if grad_diagnostics else 0,
+                            'loss_standard': grad_diagnostics.get('loss_standard', 0) if grad_diagnostics else 0,
+                            'focal_weight_mean': grad_diagnostics.get('focal_weight_mean', 0) if grad_diagnostics else 0,
+                            'focal_weight_max': grad_diagnostics.get('focal_weight_max', 0) if grad_diagnostics else 0,
+                            'lr': current_lr,
+                            'grad_norm_total': grad_norm,
+                        })
+                    except Exception as e:
+                        print(f"[LOGGER WARNING] Failed to log batch: {e}")
 
                 # Log per-batch metrics to wandb
                 if enable_wandb:
@@ -1590,6 +1703,20 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         # Calculate total elapsed time
         total_elapsed_time = time.time() - training_start_time
 
+        # Generate LLM summary at training completion
+        if logger:
+            try:
+                final_metrics = {
+                    'final_loss': current_loss,
+                    'final_samples_seen': samples_seen,
+                    'total_batches': batch_count,
+                    'total_time': total_elapsed_time,
+                }
+                summary_text = logger.generate_llm_summary(final_metrics)
+                print(f"\n[LOGGER] Training summary generated:\n{summary_text}")
+            except Exception as e:
+                print(f"[LOGGER WARNING] Failed to generate summary: {e}")
+
         print(f"[DEBUG] Final yield: samples_seen={samples_seen}, final_target={final_samples_target}, elapsed_time={total_elapsed_time:.2f}s")
         yield generate_batch_training_update(
             samples_seen, final_samples_target, cumulative_metrics,
@@ -1780,9 +1907,9 @@ def run_batch_comparison(batch_sizes_str, total_samples):
                     batch_num += 1
             else:
                 # Fallback: CPU or no CUDA - no stream pipelining (automatic transfer in collate_fn)
-                for batch_num, (canvas_tensor, patch_mask, _) in enumerate(dataloader):
+                for batch_num, (canvas_tensor, patch_mask, batch_indices) in enumerate(dataloader):
                     # Train
-                    loss, _ = state.world_model.autoencoder.train_on_canvas(
+                    loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
                         canvas_tensor, patch_mask, state.world_model.ae_optimizer
                     )
                     state.world_model.ae_scheduler.step()
@@ -1790,6 +1917,37 @@ def run_batch_comparison(batch_sizes_str, total_samples):
                     samples_seen += canvas_tensor.shape[0]
                     loss_history.append(loss)
                     samples_seen_list.append(samples_seen)
+
+                    # Log per-batch metrics to local logger
+                    if logger:
+                        try:
+                            current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
+                            # Compute gradient norm from diagnostics
+                            grad_norm = 0.0
+                            if grad_diagnostics:
+                                grad_norm = sum([
+                                    grad_diagnostics.get('head_weight_norm', 0),
+                                    grad_diagnostics.get('head_bias_norm', 0),
+                                    grad_diagnostics.get('mask_token_norm', 0),
+                                    grad_diagnostics.get('qkv_weight_norm', 0),
+                                ])
+
+                            logger.log_batch({
+                                'batch': batch_num + 1,
+                                'samples_seen': samples_seen,
+                                'timestamp': time.time(),
+                                'batch_indices': batch_indices.tolist() if hasattr(batch_indices, 'tolist') else list(batch_indices),
+                                'loss_hybrid': loss,
+                                'loss_plain': grad_diagnostics.get('loss_plain', 0) if grad_diagnostics else 0,
+                                'loss_focal': grad_diagnostics.get('loss_focal', 0) if grad_diagnostics else 0,
+                                'loss_standard': grad_diagnostics.get('loss_standard', 0) if grad_diagnostics else 0,
+                                'focal_weight_mean': grad_diagnostics.get('focal_weight_mean', 0) if grad_diagnostics else 0,
+                                'focal_weight_max': grad_diagnostics.get('focal_weight_max', 0) if grad_diagnostics else 0,
+                                'lr': current_lr,
+                                'grad_norm_total': grad_norm,
+                            })
+                        except Exception as e:
+                            print(f"[LOGGER WARNING] Failed to log batch: {e}")
 
         else:
             # Fallback: Manual batching (backward compatibility, no cache available)

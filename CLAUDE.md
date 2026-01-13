@@ -133,6 +133,14 @@ This repository contains research code for developmental robot movement with a c
     - Maximizes GPU utilization, eliminates idle time
   - **Performance results** (BS=64): 29.44s → 18.72s (1.57x speedup, 36.4% faster)
   - **Absolute speedup** (BS=1 → BS=64): 129.50s → 18.72s (6.92x faster, 342 samples/sec)
+- **Comprehensive training diagnostics**: Multi-tier logging system for debugging and analysis
+  - **TrainingLogger**: Automatic per-batch metrics logging with rotated JSONL files
+  - **Interval summaries**: Compact aggregated statistics every N batches for LLM-friendly analysis
+  - **Batch composition tracking**: Monitor which samples appear in each batch to detect averaging issues
+  - **Gradient flow monitoring**: Track gradient norms across all model components
+  - **Real-time analysis**: `analyze_training_logs.py` tool for ongoing training diagnostics
+  - **Automatic diagnostics**: Detects plateau, gradient explosion, batch averaging, and other common training issues
+  - **File structure**: `saved/training_logs/{session}/run_{timestamp}/` with config, summaries, and raw metrics
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful transformer encoder and decoder
@@ -349,8 +357,10 @@ Required Python packages:
   - `attention.py`: Decoder attention visualization
   - `visualization.py`: Plotting and display utilities
   - `utils.py`: Shared helper functions
+  - `training_logger.py`: Multi-tier training diagnostics logger with automatic summarization
 - `config.py`: Shared configuration, image transforms, robot-specific directories, and world model parameters
 - `world_model_utils.py`: Utility functions for training and tensor operations
+- `analyze_training_logs.py`: Standalone tool for analyzing ongoing or completed training runs with batch composition, loss trajectory, and gradient diagnostics
 
 ### Robot Interfaces
 - `robot_interface.py`: Abstract base class defining robot interaction contract
