@@ -117,6 +117,14 @@ class TrainingLogger:
             self.sample_seen_counts.get(idx, 0) for idx in batch_indices
         ]
 
+        # Add per-sample loss statistics if available (for loss-weighted sampling)
+        per_sample_losses = metrics_dict.get('per_sample_losses')
+        if per_sample_losses and len(per_sample_losses) > 0:
+            metrics_dict['per_sample_loss_mean'] = float(np.mean(per_sample_losses))
+            metrics_dict['per_sample_loss_std'] = float(np.std(per_sample_losses))
+            metrics_dict['per_sample_loss_min'] = float(np.min(per_sample_losses))
+            metrics_dict['per_sample_loss_max'] = float(np.max(per_sample_losses))
+
         # Tier 1: Append to raw JSONL (rotated by 1000-batch chunks)
         chunk_id = batch // 1000
         raw_file = self.raw_dir / f"metrics_{chunk_id*1000:05d}-{(chunk_id+1)*1000:05d}.jsonl"

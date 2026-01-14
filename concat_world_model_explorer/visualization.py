@@ -101,6 +101,114 @@ def create_lr_vs_samples_plot(cumulative_metrics):
     return fig
 
 
+def create_sample_weights_plot(weights, frame_indices, temperature=None, sample_counts=None):
+    """
+    Create stem plot of sample weights vs frame numbers for loss-weighted sampling.
+
+    Helps users identify high-weight frames for inspection. When loss-weighted
+    sampling is active, higher weight = higher loss = more likely to be sampled
+    for training.
+
+    Args:
+        weights: torch.Tensor or list of sample weights (normalized probabilities)
+        frame_indices: List of frame indices corresponding to weights
+        temperature: Optional temperature value for title context
+        sample_counts: Optional dict mapping frame_idx -> times sampled
+
+    Returns:
+        matplotlib.figure.Figure or None if no valid data
+    """
+    import numpy as np
+
+    # Validate inputs
+    if weights is None or frame_indices is None:
+        return None
+
+    # Handle empty containers
+    try:
+        if len(weights) == 0 or len(frame_indices) == 0 or len(weights) != len(frame_indices):
+            return None
+    except (TypeError, AttributeError):
+        return None
+
+    # Data preparation
+    if hasattr(weights, 'cpu'):  # torch.Tensor
+        weights = weights.cpu().numpy()
+    else:
+        weights = np.array(weights)
+
+    frame_indices = np.array(frame_indices)
+
+    # Sort by frame index for cleaner visualization
+    sort_idx = np.argsort(frame_indices)
+    frame_indices = frame_indices[sort_idx]
+    weights = weights[sort_idx]
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Adaptive visualization based on data size
+    num_frames = len(frame_indices)
+    if num_frames > 1000:
+        # Scatter plot for many frames (lighter rendering)
+        ax.scatter(frame_indices, weights, s=20, alpha=0.7, color='purple', label='Weight')
+    else:
+        # Stem plot (lollipop chart) for <= 1000 frames
+        markerline, stemlines, baseline = ax.stem(
+            frame_indices, weights,
+            linefmt='purple', markerfmt='o',
+            basefmt='gray'
+        )
+        markerline.set_markersize(4)
+        stemlines.set_linewidth(1)
+
+    # Styling
+    title = "Sample Weights Distribution (Loss-Weighted Sampling"
+    if temperature is not None:
+        title += f", temp={temperature:.2f}"
+    title += ")"
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_xlabel('Frame Number', fontsize=12)
+    ax.set_ylabel('Sample Weight (Probability)', fontsize=12, color='purple')
+    ax.tick_params(axis='y', labelcolor='purple')
+    ax.grid(True, alpha=0.3)
+
+    # Set y-axis range to show full scale
+    ax.set_ylim([0, np.max(weights) * 1.1])
+
+    # Add sample counts on secondary y-axis if provided
+    if sample_counts is not None and len(sample_counts) > 0:
+        ax2 = ax.twinx()
+        counts = np.array([sample_counts.get(int(idx), 0) for idx in frame_indices])
+        ax2.bar(frame_indices, counts, alpha=0.3, color='green', width=0.8, label='Times Sampled')
+        ax2.set_ylabel('Times Sampled', fontsize=12, color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
+        # Set y-axis range to show full scale
+        if np.max(counts) > 0:
+            ax2.set_ylim([0, np.max(counts) * 1.1])
+
+    # Add statistics text box
+    max_idx = np.argmax(weights)
+    stats_text = f"Tracked: {len(weights)} frames\n"
+    stats_text += f"Max weight: {weights[max_idx]:.6f} @ frame {frame_indices[max_idx]}\n"
+    stats_text += f"Mean weight: {np.mean(weights):.6f}\n"
+    stats_text += f"Min weight: {np.min(weights):.6f}"
+
+    if sample_counts is not None and len(sample_counts) > 0:
+        total_samples = sum(sample_counts.values())
+        max_count = max(sample_counts.values()) if sample_counts else 0
+        stats_text += f"\nTotal samples: {total_samples:,}"
+        stats_text += f"\nMax count: {max_count}"
+
+    ax.text(0.98, 0.98, stats_text, transform=ax.transAxes,
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+            fontsize=9)
+
+    plt.tight_layout()
+    return fig
+
+
 def generate_multiple_observation_canvases(observation_indices):
     """Generate grid of canvas visualizations for multiple observations"""
     if state.world_model is None:
@@ -190,7 +298,8 @@ def generate_multiple_observation_canvases(observation_indices):
 def generate_batch_training_update(samples_seen, total_samples, cumulative_metrics,
                                    eval_status, eval_loss_fig, eval_dist_fig,
                                    current_observation_idx, window_size=10, num_random_obs=5,
-                                   completed=False, elapsed_time=None):
+                                   completed=False, elapsed_time=None,
+                                   sampling_mode=None, sample_weights_data=None):
     """Generate all UI outputs for batch training update"""
     # Status message
     if completed:
@@ -214,6 +323,17 @@ def generate_batch_training_update(samples_seen, total_samples, cumulative_metri
     # Learning rate vs samples plot
     fig_lr_vs_samples = create_lr_vs_samples_plot(cumulative_metrics)
 
+    # Sample weights plot (loss-weighted sampling only)
+    fig_sample_weights = None
+    if sampling_mode == "Loss-weighted" and sample_weights_data is not None:
+        # Unpack data - supports both 3-tuple (legacy) and 4-tuple (with sample_counts)
+        if len(sample_weights_data) == 4:
+            weights, valid_indices, temperature, sample_counts = sample_weights_data
+        else:
+            weights, valid_indices, temperature = sample_weights_data
+            sample_counts = None
+        fig_sample_weights = create_sample_weights_plot(weights, valid_indices, temperature, sample_counts)
+
     # Sample observations: N random + current frame
     observations = state.session_state.get("observations", [])
     min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
@@ -234,10 +354,11 @@ def generate_batch_training_update(samples_seen, total_samples, cumulative_metri
         obs_combined_fig = None
 
     return (status, fig_loss_vs_samples, fig_loss_vs_recent, fig_lr_vs_samples,
+            fig_sample_weights,  # Sample weights distribution (loss-weighted mode only)
             eval_loss_fig, eval_dist_fig, obs_status, obs_combined_fig)
 
 
-def calculate_training_info(total_samples, batch_size):
+def calculate_training_info(total_samples, batch_size, sampling_mode="Epoch-based (shuffle each epoch)"):
     """Calculate and display training parameters with linear scaling rule"""
     # Validate inputs
     try:
@@ -277,6 +398,7 @@ def calculate_training_info(total_samples, batch_size):
 📊 **Gradient Updates**: {num_gradient_updates:,} steps
 - Total samples: {total_samples:,}
 - Batch size: {batch_size}
+- Sampling mode: {sampling_mode}
 - Updates per epoch: {num_gradient_updates:,}
 
 📈 **Learning Rate (Linear Scaling)**

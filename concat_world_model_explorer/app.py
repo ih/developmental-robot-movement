@@ -6,6 +6,7 @@ Allows batch training with periodic progress updates and final full-session eval
 """
 
 import gradio as gr
+import config
 
 # Import all modules from the modular package
 from . import (
@@ -192,13 +193,37 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Samples per batch"
         )
         sampling_mode_dropdown = gr.Dropdown(
-            choices=["Random (with replacement)", "Epoch-based (shuffle each epoch)"],
+            choices=["Random (with replacement)", "Epoch-based (shuffle each epoch)", "Loss-weighted"],
             value="Epoch-based (shuffle each epoch)",
             label="Sampling Mode",
-            info="Random: same sample can repeat. Epoch: each sample seen once per epoch."
+            info="Random: repeat samples. Epoch: see each once. Loss-weighted: prioritize high-loss samples."
         )
+
+    # Loss-weighted sampling parameters
+    gr.Markdown("### Loss-Weighted Sampling Parameters")
+    gr.Markdown("Controls for loss-weighted sampling mode (only used when 'Loss-weighted' is selected above).")
+    with gr.Row():
+        loss_weight_temperature_input = gr.Slider(
+            value=0.5,
+            minimum=0.1,
+            maximum=5.0,
+            step=0.1,
+            label="Temperature",
+            info="Lower = focus more on high-loss samples, Higher = more uniform sampling"
+        )
+        loss_weight_refresh_input = gr.Number(
+            value=50,
+            label="Weight Refresh Interval",
+            precision=0,
+            minimum=10,
+            maximum=1000,
+            interactive=True,
+            info="Batches between weight updates (lower = more responsive)"
+        )
+
+    with gr.Row():
         update_interval_input = gr.Number(
-            value=100,
+            value=1000,
             label="Update Interval",
             precision=0,
             minimum=10,
@@ -223,7 +248,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Number of random observations to sample and visualize on each update"
         )
         num_best_models_input = gr.Number(
-            value=3,
+            value=1,
             label="Best Models to Keep",
             precision=0,
             minimum=1,
@@ -256,7 +281,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Stop training when validation loss exceeds training loss by threshold"
         )
         divergence_patience_input = gr.Number(
-            value=3,
+            value=25,
             label="Patience",
             precision=0,
             minimum=1,
@@ -332,7 +357,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             label="Custom Base LR (0=default)",
             minimum=0,
             interactive=True,
-            info=f"Override base LR (default: 2e-5). Set 0 to use config default."
+            info=f"Override base LR (default: {config.AutoencoderConcatPredictorWorldModelConfig.AUTOENCODER_LR}). Set 0 to use config default."
         )
         disable_lr_scaling_checkbox = gr.Checkbox(
             label="Disable LR Scaling",
@@ -348,7 +373,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="-1 uses scaled default, 0 disables warmup, >0 sets exact steps"
         )
         lr_min_ratio_input = gr.Number(
-            value=0.01,
+            value=0.001,
             label="LR Min Ratio",
             minimum=0,
             maximum=1,
@@ -402,6 +427,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             loss_vs_recent_plot = gr.Plot(label="Loss vs Recent Checkpoints (Rolling Window)")
 
     lr_vs_samples_plot = gr.Plot(label="Learning Rate vs Samples Seen")
+
+    sample_weights_plot = gr.Plot(label="Sample Weights Distribution (Loss-Weighted Only)")
 
     gr.Markdown("---")
 
@@ -685,13 +712,19 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
     # Dynamic training info update handlers
     total_samples_input.change(
         fn=visualization.calculate_training_info,
-        inputs=[total_samples_input, batch_size_input],
+        inputs=[total_samples_input, batch_size_input, sampling_mode_dropdown],
         outputs=[training_info_display]
     )
 
     batch_size_input.change(
         fn=visualization.calculate_training_info,
-        inputs=[total_samples_input, batch_size_input],
+        inputs=[total_samples_input, batch_size_input, sampling_mode_dropdown],
+        outputs=[training_info_display]
+    )
+
+    sampling_mode_dropdown.change(
+        fn=visualization.calculate_training_info,
+        inputs=[total_samples_input, batch_size_input, sampling_mode_dropdown],
         outputs=[training_info_display]
     )
 
@@ -710,6 +743,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             resume_warmup_ratio_input,
             # Sampling mode
             sampling_mode_dropdown,
+            # Loss-weighted sampling parameters
+            loss_weight_temperature_input, loss_weight_refresh_input,
             # Divergence-based early stopping parameters
             stop_on_divergence_checkbox, divergence_gap_input, divergence_ratio_input,
             divergence_patience_input, divergence_min_updates_input,
@@ -719,6 +754,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             loss_vs_samples_plot,
             loss_vs_recent_plot,
             lr_vs_samples_plot,
+            sample_weights_plot,  # Sample weights distribution (loss-weighted mode only)
             latest_eval_loss_plot,
             latest_eval_dist_plot,
             observation_samples_status,
@@ -736,6 +772,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             custom_lr_input, disable_lr_scaling_checkbox, custom_warmup_input, lr_min_ratio_input,
             resume_warmup_ratio_input,
             sampling_mode_dropdown,
+            # Loss-weighted sampling parameters
+            loss_weight_temperature_input, loss_weight_refresh_input,
             # Divergence-based early stopping parameters
             stop_on_divergence_checkbox, divergence_gap_input, divergence_ratio_input,
             divergence_patience_input, divergence_min_updates_input,
@@ -786,13 +824,13 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     # Initialize session dropdown and checkpoint dropdown on load
     def initialize_ui():
-        # Initialize sessions for default robot type (toroidal_dot)
-        sessions = session_manager.refresh_sessions_for_type("toroidal_dot")
+        # Initialize sessions for default robot type (so101)
+        sessions = session_manager.refresh_sessions_for_type("so101")
         checkpoints = checkpoint_manager.refresh_checkpoints()
-        # Initialize training info with default values
-        training_info = visualization.calculate_training_info(10000000, 64)
+        # Initialize training info with default values (Epoch-based is the default)
+        training_info = visualization.calculate_training_info(10000000, 64, "Epoch-based (shuffle each epoch)")
         # Validation dropdown with "None" option
-        val_choices = session_manager.get_validation_session_choices("toroidal_dot")
+        val_choices = session_manager.get_validation_session_choices("so101")
         return sessions, gr.Dropdown(choices=val_choices, value="None - No validation"), checkpoints, training_info
 
     demo.load(

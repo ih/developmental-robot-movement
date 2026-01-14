@@ -371,7 +371,8 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
     Extends MaskedAutoencoderViT with a method to pass a *custom* binary mask over patches.
     True in `patch_mask` means the patch is hidden from the encoder and must be inpainted.
     """
-    def train_on_canvas(self, canvas_tensor: torch.Tensor, patch_mask: torch.Tensor, optimizer):
+    def train_on_canvas(self, canvas_tensor: torch.Tensor, patch_mask: torch.Tensor, optimizer,
+                        return_per_sample_losses: bool = False):
         """
         Train the autoencoder on a canvas with targeted masking.
 
@@ -383,9 +384,11 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             canvas_tensor: [B, 3, H, W] canvas image tensor (B can be 1 or more)
             patch_mask: [B, num_patches] boolean tensor; True = masked
             optimizer: Optimizer for updating weights
+            return_per_sample_losses: If True, also return per-sample losses for loss-weighted sampling
 
         Returns:
-            tuple: (loss, grad_diagnostics) where grad_diagnostics is a dict with gradient norms
+            tuple: (loss, grad_diagnostics) or (loss, grad_diagnostics, per_sample_losses) if return_per_sample_losses=True
+                   per_sample_losses is a list of floats, one per sample in the batch
         """
         # Validation
         assert canvas_tensor.ndim == 4, f"Expected 4D tensor [B,3,H,W], got {canvas_tensor.ndim}D"
@@ -431,6 +434,26 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
         focal_weight_mean = loss_dict['focal_weight_mean']
         focal_weight_max = loss_dict['focal_weight_max']
         alpha = Config.FOCAL_LOSS_ALPHA
+
+        # --- PER-SAMPLE LOSSES (for loss-weighted sampling) ---
+        per_sample_losses = None
+        if return_per_sample_losses:
+            B = canvas_tensor.shape[0]
+            per_sample_losses = []
+            with torch.no_grad():
+                for b in range(B):
+                    # Get masked patches for this sample
+                    sample_mask = patch_mask[b]  # [num_patches]
+                    sample_pred = pred_patches[b][sample_mask]  # [num_masked, patch_dim]
+                    sample_target = target_patches[b][sample_mask]  # [num_masked, patch_dim]
+
+                    # Compute hybrid loss for this sample
+                    sample_loss_dict = compute_hybrid_loss_on_masked_patches(
+                        sample_pred, sample_target,
+                        focal_alpha=Config.FOCAL_LOSS_ALPHA,
+                        focal_beta=Config.FOCAL_BETA
+                    )
+                    per_sample_losses.append(sample_loss_dict['loss_hybrid'].item())
 
         # Backward pass
         optimizer.zero_grad()
@@ -480,6 +503,8 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
 
         optimizer.step()
 
+        if return_per_sample_losses:
+            return float(loss.detach().cpu()), grad_diagnostics, per_sample_losses
         return float(loss.detach().cpu()), grad_diagnostics
 
     def forward_with_patch_mask(self, imgs: torch.Tensor, patch_mask: torch.Tensor, return_attn: bool = False):

@@ -438,6 +438,7 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
                                 preserve_optimizer, preserve_scheduler, custom_lr, disable_lr_scaling,
                                 custom_warmup, lr_min_ratio, resume_warmup_ratio=0.01,
                                 sampling_mode="Random (with replacement)",
+                                loss_weight_temperature=0.5, loss_weight_refresh_interval=50,
                                 stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=2.5,
                                 divergence_patience=3, divergence_min_updates=5):
     """
@@ -489,7 +490,7 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
             samples_per_chunk = samples_per_epoch * epochs_per_chunk
             summary += f"**Training Parameters:**\n"
             summary += f"- Batch size: {batch_size}\n"
-            summary += f"- Sampling mode: Epoch-based (forced for divergence mode)\n"
+            summary += f"- Sampling mode: {sampling_mode}\n"
             summary += f"- Samples per epoch: {samples_per_epoch:,}\n"
             summary += f"- Epochs per chunk: {epochs_per_chunk}\n"
             summary += f"- Samples per chunk: {samples_per_chunk:,}\n"
@@ -497,7 +498,7 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
         else:
             summary += f"**Training Parameters:**\n"
             summary += f"- Batch size: {batch_size}\n"
-            summary += f"- Sampling mode: Epoch-based (forced for divergence mode)\n\n"
+            summary += f"- Sampling mode: {sampling_mode}\n\n"
 
         # Compute peak LR for display
         if custom_lr > 0:
@@ -621,6 +622,18 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
             remainder = samples_to_train % num_valid
             summary += f"  - {num_epochs} complete epoch(s) + {remainder} remainder samples\n"
             summary += f"  - {num_valid} unique frames per epoch\n"
+
+    # For loss-weighted mode, show configuration
+    if sampling_mode == "Loss-weighted":
+        summary += f"  - Temperature: {loss_weight_temperature} (lower = more focus on high-loss samples)\n"
+        summary += f"  - Weight refresh: every {loss_weight_refresh_interval} batches\n"
+        if state.session_state.get("observations"):
+            observations = state.session_state["observations"]
+            min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+            num_valid = len(observations) - (min_frames_needed - 1)
+            if num_valid > 0 and num_valid < samples_to_train:
+                summary += f"  - Note: Training for more samples than session size ({samples_to_train:,} > {num_valid})\n"
+                summary += f"    High-loss samples will be weighted after first pass through all frames\n"
     summary += "\n"
 
     # Learning rate (global schedule)
@@ -677,6 +690,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           custom_warmup=-1, lr_min_ratio=0.01, resume_warmup_ratio=0.01,
                           # Sampling mode
                           sampling_mode="Random (with replacement)",
+                          # Loss-weighted sampling parameters
+                          loss_weight_temperature=0.5, loss_weight_refresh_interval=50,
                           # Divergence-based early stopping parameters
                           stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=2.5,
                           divergence_patience=3, divergence_min_updates=5):
@@ -704,7 +719,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         custom_warmup: Override warmup steps, -1 = scaled default, 0 = none (default: -1)
         lr_min_ratio: Minimum LR as ratio of base LR (default: 0.01)
         resume_warmup_ratio: Warmup steps as ratio of session gradient updates when resuming (default: 0.01)
-        sampling_mode: "Random (with replacement)" or "Epoch-based (shuffle each epoch)" (default: "Random (with replacement)")
+        sampling_mode: "Random (with replacement)", "Epoch-based (shuffle each epoch)", or "Loss-weighted" (default: "Random (with replacement)")
+        loss_weight_temperature: Temperature for loss-weighted sampling softmax (default: 0.5, lower = more focus on high-loss samples)
+        loss_weight_refresh_interval: Batches between weight updates for loss-weighted sampling (default: 50)
         stop_on_divergence: Train until validation loss diverges from training loss (default: False).
                            When True, total_samples is ignored and requires a validation session.
         divergence_gap: Stop if (val_loss - train_loss) >= this value (default: 0.001)
@@ -720,7 +737,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     print(f"[DEBUG] run_world_model_batch called with: total_samples={total_samples}, batch_size={batch_size}, "
           f"update_interval={update_interval}, num_best_models_to_keep={num_best_models_to_keep}, "
           f"resume_mode={resume_mode}, preserve_optimizer={preserve_optimizer}, custom_lr={custom_lr}, "
-          f"sampling_mode={sampling_mode}, stop_on_divergence={stop_on_divergence}")
+          f"sampling_mode={sampling_mode}, loss_weight_temp={loss_weight_temperature}, "
+          f"loss_weight_refresh={loss_weight_refresh_interval}, stop_on_divergence={stop_on_divergence}")
 
     # Validation
     if state.world_model is None:
@@ -746,10 +764,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             yield "Train-until-divergence mode requires a validation session. Please load one first.", None, None, None, None, None, "", None
             return
         # In divergence mode, we train until divergence is detected
-        # We can't pre-generate infinite samples, so we use epoch-based mode with many epochs
-        # Force epoch-based mode for divergence training (more memory efficient for long runs)
-        sampling_mode = "Epoch-based (shuffle each epoch)"
-        print(f"[DEBUG] Divergence mode enabled: forcing epoch-based sampling")
+        # All sampling modes are supported - indices are regenerated in chunks as needed
+        print(f"[DEBUG] Divergence mode enabled: using {sampling_mode} sampling")
 
     if total_samples <= 0:
         yield "Total samples must be greater than 0", None, None, None, None, None, "", None
@@ -823,7 +839,36 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     all_valid_indices = list(range(min_frames_needed - 1, len(observations)))
     chunk_number = 0  # For divergence mode - track which chunk we're on
 
-    if sampling_mode == "Random (with replacement)":
+    # Initialize loss-weighted sampling state
+    use_loss_weighted_sampling = False
+    loss_weighted_sampler = None
+
+    if sampling_mode == "Loss-weighted":
+        # Loss-weighted sampling: samples with higher loss are more likely to be selected
+        from models.canvas_dataset import LossWeightedSampler
+
+        use_loss_weighted_sampling = True
+
+        # Reset loss tracking for fresh start
+        state.reset_sample_losses()
+
+        # Initialize sampler with uniform weights (will be updated after first batch)
+        n_valid = len(all_valid_indices)
+        initial_weights = torch.ones(n_valid) / n_valid
+        loss_weighted_sampler = LossWeightedSampler(
+            num_samples=samples_to_train,
+            initial_weights=initial_weights,
+            replacement=True,
+        )
+
+        # Pre-generate initial indices - sampler produces dataset indices (0 to N-1),
+        # need to map to frame indices
+        dataset_indices = list(loss_weighted_sampler)
+        sampled_indices = [all_valid_indices[i] for i in dataset_indices]
+        print(f"[DEBUG] Loss-weighted sampling: {len(sampled_indices)} samples, "
+              f"temperature={loss_weight_temperature}, refresh_interval={loss_weight_refresh_interval}")
+
+    elif sampling_mode == "Random (with replacement)":
         # Random sampling with replacement (allows looping through session)
         sampled_indices = random.choices(all_valid_indices, k=samples_to_train)
         print(f"[DEBUG] Random sampling: {len(sampled_indices)} samples from {len(all_valid_indices)} valid observations")
@@ -848,7 +893,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     print(f"[DEBUG] Expected batches: {len(sampled_indices) // batch_size} (with batch_size={batch_size})")
 
     # Store epoch info for debug prints (only relevant for epoch-based mode)
-    epoch_mode = (sampling_mode != "Random (with replacement)")
+    epoch_mode = (sampling_mode == "Epoch-based (shuffle each epoch)")
     samples_per_epoch = len(all_valid_indices) if epoch_mode else 0
     if epoch_mode:
         total_epochs = num_epochs + (1 if remainder > 0 else 0)
@@ -1181,9 +1226,27 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         next_batch_indices = []
 
                 # Train on current batch
-                loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
-                    canvas_tensor, patch_mask, state.world_model.ae_optimizer
-                )
+                if use_loss_weighted_sampling:
+                    loss, grad_diagnostics, per_sample_losses = state.world_model.autoencoder.train_on_canvas(
+                        canvas_tensor, patch_mask, state.world_model.ae_optimizer,
+                        return_per_sample_losses=True
+                    )
+                    # Update loss tracking for loss-weighted sampling
+                    # batch_indices are frame indices from the dataset
+                    frame_idx_list = batch_indices if isinstance(batch_indices, list) else list(batch_indices)
+                    state.update_sample_losses(frame_idx_list, per_sample_losses)
+
+                    # Refresh weights at specified interval
+                    if batch_count > 0 and batch_count % loss_weight_refresh_interval == 0:
+                        new_weights, _ = state.compute_sample_weights(loss_weight_temperature, all_valid_indices)
+                        loss_weighted_sampler.update_weights(new_weights, batch_count)
+                        stats = state.get_sample_loss_stats()
+                        print(f"[DEBUG] Loss-weighted: refreshed weights at batch {batch_count}, "
+                              f"tracked {stats['count']} samples, loss range [{stats['min']:.6f}, {stats['max']:.6f}]")
+                else:
+                    loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
+                        canvas_tensor, patch_mask, state.world_model.ae_optimizer
+                    )
                 # Step scheduler every batch only for non-plateau schedulers
                 # Plateau scheduler is stepped at update intervals with val_loss
                 if not use_plateau_scheduler:
@@ -1215,7 +1278,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                 grad_diagnostics.get('qkv_weight_norm', 0),
                             ])
 
-                        logger.log_batch({
+                        log_metrics = {
                             'batch': batch_count,
                             'samples_seen': samples_seen,
                             'timestamp': time.time(),
@@ -1228,7 +1291,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                             'focal_weight_max': grad_diagnostics.get('focal_weight_max', 0) if grad_diagnostics else 0,
                             'lr': current_lr,
                             'grad_norm_total': grad_norm,
-                        })
+                        }
+                        # Add per-sample losses for loss-weighted sampling logging
+                        if use_loss_weighted_sampling:
+                            log_metrics['per_sample_losses'] = per_sample_losses if 'per_sample_losses' in dir() else None
+                        logger.log_batch(log_metrics)
                     except Exception as e:
                         print(f"[LOGGER WARNING] Failed to log batch: {e}")
 
@@ -1338,12 +1405,26 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     status_msg += f"- Best loss: {best_loss:.6f}\n"
                     status_msg += f"- Learning rate: {current_lr:.6e}\n"
 
+                    # Prepare sample weights for visualization (loss-weighted mode only)
+                    sample_weights_data = None
+                    if use_loss_weighted_sampling and state.sample_losses:
+                        try:
+                            weights, valid_indices = state.compute_sample_weights(
+                                loss_weight_temperature, all_valid_indices
+                            )
+                            # Include sample counts from logger if available
+                            sample_counts = logger.sample_seen_counts if logger else {}
+                            sample_weights_data = (weights, valid_indices, loss_weight_temperature, sample_counts)
+                        except Exception as e:
+                            print(f"[WARNING] Failed to compute sample weights for visualization: {e}")
+
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
                     update_result = generate_batch_training_update(
                         samples_seen, final_samples_target, cumulative_metrics,
                         status_msg, None, None, current_observation_idx,
-                        window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
+                        window_size, num_random_obs, completed=False, elapsed_time=elapsed_time,
+                        sampling_mode=sampling_mode, sample_weights_data=sample_weights_data
                     )
 
                     yield update_result
@@ -1370,9 +1451,26 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     break
 
                 # Train on batch
-                loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
-                    canvas_tensor, patch_mask, state.world_model.ae_optimizer
-                )
+                if use_loss_weighted_sampling:
+                    loss, grad_diagnostics, per_sample_losses = state.world_model.autoencoder.train_on_canvas(
+                        canvas_tensor, patch_mask, state.world_model.ae_optimizer,
+                        return_per_sample_losses=True
+                    )
+                    # Update loss tracking for loss-weighted sampling
+                    frame_idx_list = batch_indices if isinstance(batch_indices, list) else list(batch_indices)
+                    state.update_sample_losses(frame_idx_list, per_sample_losses)
+
+                    # Refresh weights at specified interval
+                    if batch_count > 0 and batch_count % loss_weight_refresh_interval == 0:
+                        new_weights, _ = state.compute_sample_weights(loss_weight_temperature, all_valid_indices)
+                        loss_weighted_sampler.update_weights(new_weights, batch_count)
+                        stats = state.get_sample_loss_stats()
+                        print(f"[DEBUG] Loss-weighted: refreshed weights at batch {batch_count}, "
+                              f"tracked {stats['count']} samples, loss range [{stats['min']:.6f}, {stats['max']:.6f}]")
+                else:
+                    loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
+                        canvas_tensor, patch_mask, state.world_model.ae_optimizer
+                    )
                 # Step scheduler every batch only for non-plateau schedulers
                 # Plateau scheduler is stepped at update intervals with val_loss
                 if not use_plateau_scheduler:
@@ -1393,7 +1491,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                 grad_diagnostics.get('qkv_weight_norm', 0),
                             ])
 
-                        logger.log_batch({
+                        log_metrics = {
                             'batch': batch_count,
                             'samples_seen': samples_seen,
                             'timestamp': time.time(),
@@ -1406,7 +1504,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                             'focal_weight_max': grad_diagnostics.get('focal_weight_max', 0) if grad_diagnostics else 0,
                             'lr': current_lr,
                             'grad_norm_total': grad_norm,
-                        })
+                        }
+                        # Add per-sample losses for loss-weighted sampling logging
+                        if use_loss_weighted_sampling:
+                            log_metrics['per_sample_losses'] = per_sample_losses if 'per_sample_losses' in dir() else None
+                        logger.log_batch(log_metrics)
                     except Exception as e:
                         print(f"[LOGGER WARNING] Failed to log batch: {e}")
 
@@ -1536,12 +1638,26 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     status_msg += f"- Best loss: {best_loss:.6f}\n"
                     status_msg += f"- Learning rate: {current_lr:.6e}\n"
 
+                    # Prepare sample weights for visualization (loss-weighted mode only)
+                    sample_weights_data = None
+                    if use_loss_weighted_sampling and state.sample_losses:
+                        try:
+                            weights, valid_indices = state.compute_sample_weights(
+                                loss_weight_temperature, all_valid_indices
+                            )
+                            # Include sample counts from logger if available
+                            sample_counts = logger.sample_seen_counts if logger else {}
+                            sample_weights_data = (weights, valid_indices, loss_weight_temperature, sample_counts)
+                        except Exception as e:
+                            print(f"[WARNING] Failed to compute sample weights for visualization: {e}")
+
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
                     update_result = generate_batch_training_update(
                         samples_seen, final_samples_target, cumulative_metrics,
                         status_msg, None, None, current_observation_idx,
-                        window_size, num_random_obs, completed=False, elapsed_time=elapsed_time
+                        window_size, num_random_obs, completed=False, elapsed_time=elapsed_time,
+                        sampling_mode=sampling_mode, sample_weights_data=sample_weights_data
                     )
 
                     yield update_result
@@ -1562,13 +1678,31 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             chunk_number += 1
             print(f"[DEBUG] Divergence mode: generating chunk {chunk_number + 1} ({divergence_epochs_per_chunk} more epochs)")
 
-            # Regenerate indices for next chunk (always epoch-based in divergence mode)
+            # Regenerate indices for next chunk based on sampling mode
             new_samples = max_samples_per_epoch * divergence_epochs_per_chunk
-            sampled_indices = []
-            for _ in range(divergence_epochs_per_chunk):
-                epoch_indices = all_valid_indices.copy()
-                random.shuffle(epoch_indices)
-                sampled_indices.extend(epoch_indices)
+
+            if sampling_mode == "Loss-weighted":
+                # Loss-weighted: regenerate using current accumulated weights
+                # Sampler preserves loss history across chunks for meaningful hard-sample mining
+                loss_weighted_sampler.num_samples = new_samples
+                dataset_indices = list(loss_weighted_sampler)
+                sampled_indices = [all_valid_indices[i] for i in dataset_indices]
+                print(f"[DEBUG] Loss-weighted chunk {chunk_number + 1}: {len(sampled_indices)} samples "
+                      f"with {len(state.sample_losses)} accumulated loss entries")
+
+            elif sampling_mode == "Random (with replacement)":
+                # Random: simple random sampling with replacement
+                sampled_indices = random.choices(all_valid_indices, k=new_samples)
+                print(f"[DEBUG] Random chunk {chunk_number + 1}: {len(sampled_indices)} samples")
+
+            else:
+                # Epoch-based: shuffle each epoch
+                sampled_indices = []
+                for _ in range(divergence_epochs_per_chunk):
+                    epoch_indices = all_valid_indices.copy()
+                    random.shuffle(epoch_indices)
+                    sampled_indices.extend(epoch_indices)
+                print(f"[DEBUG] Epoch-based chunk {chunk_number + 1}: {divergence_epochs_per_chunk} epochs = {len(sampled_indices)} samples")
 
             # Update targets
             final_samples_target = samples_seen + new_samples
@@ -1717,11 +1851,25 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             except Exception as e:
                 print(f"[LOGGER WARNING] Failed to generate summary: {e}")
 
+        # Prepare sample weights for final visualization (loss-weighted mode only)
+        sample_weights_data = None
+        if use_loss_weighted_sampling and state.sample_losses:
+            try:
+                weights, valid_indices = state.compute_sample_weights(
+                    loss_weight_temperature, all_valid_indices
+                )
+                # Include sample counts from logger if available
+                sample_counts = logger.sample_seen_counts if logger else {}
+                sample_weights_data = (weights, valid_indices, loss_weight_temperature, sample_counts)
+            except Exception as e:
+                print(f"[WARNING] Failed to compute sample weights for final visualization: {e}")
+
         print(f"[DEBUG] Final yield: samples_seen={samples_seen}, final_target={final_samples_target}, elapsed_time={total_elapsed_time:.2f}s")
         yield generate_batch_training_update(
             samples_seen, final_samples_target, cumulative_metrics,
             status_msg, fig_loss, fig_dist, current_observation_idx,
-            window_size, num_random_obs, completed=True, elapsed_time=total_elapsed_time
+            window_size, num_random_obs, completed=True, elapsed_time=total_elapsed_time,
+            sampling_mode=sampling_mode, sample_weights_data=sample_weights_data
         )
         print(f"[DEBUG] Training generator complete")
 
@@ -1745,7 +1893,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             except Exception as wandb_err:
                 print(f"[WANDB WARNING] Error finishing wandb run: {str(wandb_err)}")
 
-        yield error_msg, None, None, None, None, None, "", None
+        yield error_msg, None, None, None, None, None, None, "", None
 
 
 def run_batch_comparison(batch_sizes_str, total_samples):

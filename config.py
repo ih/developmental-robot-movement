@@ -58,10 +58,10 @@ class AutoencoderConcatPredictorWorldModelConfig:
     BATCH_SIZE = 1                 # Training batch size (1=online learning, >1=mini-batch)
 
     # Optimizer parameters
-    AUTOENCODER_LR = 2e-5          # Learning rate for autoencoder training
+    AUTOENCODER_LR = 2e-4          # Learning rate for autoencoder training
     WEIGHT_DECAY = 0.01            # AdamW weight decay
     WARMUP_STEPS = 1000             # Warmup steps for learning rate scheduler
-    LR_MIN_RATIO = 0.01            # Minimum LR as ratio of base LR
+    LR_MIN_RATIO = 0.001           # Minimum LR as ratio of base LR
 
     # Focal loss parameters (for loss dilution)
     FOCAL_BETA = 5              # Temperature for exponential weighting (try 5-15)
