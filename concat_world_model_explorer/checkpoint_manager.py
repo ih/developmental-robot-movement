@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 
 import config
+import world_model_utils
 from . import state
 from .utils import format_loss
 
@@ -28,11 +29,15 @@ def list_available_checkpoints():
     return [f.name for f in checkpoint_files]
 
 
+FRESH_WEIGHTS_OPTION = "🆕 Fresh (untrained) weights"
+
+
 def refresh_checkpoints():
     """Refresh checkpoint dropdown list"""
     checkpoints = list_available_checkpoints()
-    choices = checkpoints if checkpoints else ["No checkpoints available"]
-    return gr.Dropdown(choices=choices, value=choices[0] if checkpoints else None)
+    # Always include the fresh weights option at the top
+    choices = [FRESH_WEIGHTS_OPTION] + checkpoints if checkpoints else [FRESH_WEIGHTS_OPTION]
+    return gr.Dropdown(choices=choices, value=choices[0] if choices else None)
 
 
 def save_model_weights(checkpoint_name):
@@ -58,10 +63,25 @@ def save_model_weights(checkpoint_name):
 
     try:
         # Save model state dict, optimizer state, scheduler state, and metadata
+        scheduler_type = type(state.world_model.ae_scheduler).__name__
+        scheduler = state.world_model.ae_scheduler
+
+        # Extract scheduler-specific parameters for recreation on load
+        scheduler_params = {}
+        if scheduler_type == 'ReduceLROnPlateau':
+            scheduler_params = {
+                'patience': scheduler.patience,
+                'factor': scheduler.factor,
+                'min_lrs': scheduler.min_lrs,  # List of min_lr per param group
+                'mode': scheduler.mode,
+            }
+
         checkpoint = {
             'model_state_dict': state.world_model.autoencoder.state_dict(),
             'optimizer_state_dict': state.world_model.ae_optimizer.state_dict(),
-            'scheduler_state_dict': state.world_model.ae_scheduler.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scheduler_type': scheduler_type,  # Save scheduler type for compatibility check
+            'scheduler_params': scheduler_params,  # Save params for scheduler recreation
             'timestamp': datetime.now().isoformat(),
             # Preserve original peak LR for global schedule calculation when resuming
             'original_peak_lr': state.loaded_checkpoint_metadata.get('original_peak_lr')
@@ -106,12 +126,58 @@ def save_model_weights(checkpoint_name):
 
 
 def load_model_weights(checkpoint_name):
-    """Load model weights from a checkpoint file"""
+    """Load model weights from a checkpoint file, or reset to fresh untrained weights"""
     if state.world_model is None:
         return "Error: No model loaded. Please load a session first."
 
     if not checkpoint_name or checkpoint_name == "No checkpoints available":
         return "Error: Please select a valid checkpoint."
+
+    # Handle fresh weights option - reinitialize model
+    if checkpoint_name == FRESH_WEIGHTS_OPTION:
+        try:
+            from models import TargetedMAEWrapper
+
+            # Get current autoencoder dimensions
+            old_ae = state.world_model.autoencoder
+            img_height, img_width = old_ae.image_size
+            patch_size = old_ae.patch_size
+            embed_dim = old_ae.embed_dim
+
+            # Create fresh autoencoder with same architecture
+            state.world_model.autoencoder = TargetedMAEWrapper(
+                img_height=img_height,
+                img_width=img_width,
+                patch_size=patch_size,
+                embed_dim=embed_dim,
+                decoder_embed_dim=128,
+            ).to(state.device)
+
+            # Recreate optimizer with fresh state
+            param_groups = world_model_utils.create_param_groups(
+                state.world_model.autoencoder,
+                config.AutoencoderConcatPredictorWorldModelConfig.WEIGHT_DECAY
+            )
+            state.world_model.ae_optimizer = torch.optim.AdamW(
+                param_groups,
+                lr=config.AutoencoderConcatPredictorWorldModelConfig.AUTOENCODER_LR
+            )
+
+            # Create fresh scheduler (ReduceLROnPlateau for flexibility)
+            state.world_model.ae_scheduler = world_model_utils.create_reduce_on_plateau_scheduler(
+                state.world_model.ae_optimizer,
+                patience=6,
+                factor=0.1,
+                min_lr=1e-7
+            )
+
+            # Clear loaded checkpoint metadata
+            state.loaded_checkpoint_metadata = {}
+
+            return "✅ **Reset to fresh untrained weights**\n\nModel, optimizer, and scheduler have been reinitialized."
+        except Exception as e:
+            import traceback
+            return f"❌ **Error resetting to fresh weights:**\n\n{str(e)}\n\n{traceback.format_exc()}"
 
     # Use dynamic checkpoint directory based on session's robot type
     checkpoint_dir = state.get_checkpoint_dir_for_session(state.session_state["session_dir"])
@@ -147,12 +213,73 @@ def load_model_weights(checkpoint_name):
 
         # Try to load scheduler state if available
         if 'scheduler_state_dict' in checkpoint:
-            try:
-                state.world_model.ae_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                scheduler_loaded = True
-            except (ValueError, KeyError) as e:
-                warnings.append(f"⚠️ Scheduler state not loaded: {str(e)}")
-                print(f"[LOAD WARNING] Skipping scheduler state: {str(e)}")
+            # Check scheduler type compatibility
+            current_scheduler_type = type(state.world_model.ae_scheduler).__name__
+            saved_scheduler_type = checkpoint.get('scheduler_type', 'Unknown')
+            scheduler_params = checkpoint.get('scheduler_params', {})
+            scheduler_state = checkpoint['scheduler_state_dict']
+
+            # If scheduler type is unknown, try to detect from state_dict keys
+            if saved_scheduler_type == 'Unknown':
+                # ReduceLROnPlateau has 'factor', 'patience', 'min_lrs' etc.
+                # LambdaLR has 'base_lrs' but not 'factor' or 'patience'
+                if 'factor' in scheduler_state and 'patience' in scheduler_state:
+                    saved_scheduler_type = 'ReduceLROnPlateau'
+                    print(f"[LOAD] Detected scheduler type from state_dict: {saved_scheduler_type}")
+
+            if saved_scheduler_type != 'Unknown' and saved_scheduler_type != current_scheduler_type:
+                # Scheduler types don't match - try to recreate the correct scheduler type
+                if saved_scheduler_type == 'ReduceLROnPlateau':
+                    # Recreate ReduceLROnPlateau scheduler
+                    # Try to get params from checkpoint, fallback to state_dict, then defaults
+                    try:
+                        # Get min_lr: prefer scheduler_params, fallback to state_dict, then default
+                        if scheduler_params and 'min_lrs' in scheduler_params:
+                            min_lr = scheduler_params['min_lrs'][0]
+                        elif 'min_lrs' in scheduler_state:
+                            min_lr = scheduler_state['min_lrs'][0]
+                        else:
+                            min_lr = 1e-7
+
+                        # Get patience: prefer scheduler_params, fallback to state_dict, then default
+                        if scheduler_params and 'patience' in scheduler_params:
+                            patience = scheduler_params['patience']
+                        elif 'patience' in scheduler_state:
+                            patience = scheduler_state['patience']
+                        else:
+                            patience = 5
+
+                        # Get factor: prefer scheduler_params, fallback to state_dict, then default
+                        if scheduler_params and 'factor' in scheduler_params:
+                            factor = scheduler_params['factor']
+                        elif 'factor' in scheduler_state:
+                            factor = scheduler_state['factor']
+                        else:
+                            factor = 0.5
+
+                        state.world_model.ae_scheduler = world_model_utils.create_reduce_on_plateau_scheduler(
+                            state.world_model.ae_optimizer,
+                            patience=patience,
+                            factor=factor,
+                            min_lr=min_lr,
+                        )
+                        state.world_model.ae_scheduler.load_state_dict(scheduler_state)
+                        scheduler_loaded = True
+                        print(f"[LOAD] Recreated ReduceLROnPlateau scheduler (patience={patience}, factor={factor}, min_lr={min_lr}) and loaded state")
+                    except Exception as e:
+                        warnings.append(f"⚠️ Scheduler recreation failed: {str(e)}")
+                        print(f"[LOAD WARNING] Failed to recreate scheduler: {str(e)}")
+                else:
+                    # Can't recreate - skip loading
+                    warnings.append(f"⚠️ Scheduler state not loaded: type mismatch (saved: {saved_scheduler_type}, current: {current_scheduler_type})")
+                    print(f"[LOAD WARNING] Skipping scheduler state: type mismatch ({saved_scheduler_type} vs {current_scheduler_type})")
+            else:
+                try:
+                    state.world_model.ae_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    scheduler_loaded = True
+                except (ValueError, KeyError) as e:
+                    warnings.append(f"⚠️ Scheduler state not loaded: {str(e)}")
+                    print(f"[LOAD WARNING] Skipping scheduler state: {str(e)}")
 
         state.current_checkpoint_name = checkpoint_name
 
@@ -189,7 +316,7 @@ def load_model_weights(checkpoint_name):
             status_msg += f"\n**Warnings:**\n"
             for warning in warnings:
                 status_msg += f"{warning}\n"
-            status_msg += f"\n*Note: Model weights loaded successfully. Optimizer/scheduler will be reinitialized on next training run.*\n"
+            status_msg += f"\n*Note: Model weights loaded successfully. A fresh scheduler will be created when training starts, using the checkpoint's learning rate as the starting point.*\n"
 
         if 'timestamp' in checkpoint:
             status_msg += f"\n**Saved at:** {checkpoint['timestamp']}\n"

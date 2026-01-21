@@ -359,7 +359,7 @@ def train_on_single_canvas(frame_idx, num_training_steps):
     return status_msg, training_info, grad_diag_info, fig_loss_history, fig_training_canvas, fig_training_canvas_masked, fig_training_inpainting_full, fig_training_inpainting_composite
 
 
-def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep, is_val_loss=False):
+def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_saved_checkpoints, num_best_models_to_keep, is_val_loss=False, is_continued=False):
     """
     Save a best model checkpoint and manage the list to keep only N best models.
 
@@ -370,16 +370,18 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
         auto_saved_checkpoints: List of (loss, filepath) tuples for auto-saved checkpoints
         num_best_models_to_keep: Maximum number of best models to keep
         is_val_loss: Whether the loss is validation loss (True) or training loss (False)
+        is_continued: Whether training continued from existing checkpoint (True) or started fresh (False)
 
     Returns:
         Tuple of (success: bool, message: str, updated_checkpoints_list)
     """
     checkpoint_dir = state.get_checkpoint_dir_for_session(state.session_state["session_dir"])
     loss_type = "val" if is_val_loss else "train"
+    origin = "cont" if is_continued else "fresh"
     session_name = state.session_state.get('session_name', 'unknown')
     # Include instance_id in checkpoint name to avoid collisions when running multiple instances
     instance_suffix = f"_{state.instance_id}" if state.instance_id else ""
-    checkpoint_name = f"best_model_auto_{session_name}{instance_suffix}_{samples_seen:08d}_{loss_type}_{current_loss:.6f}.pth"
+    checkpoint_name = f"best_model_auto_{session_name}{instance_suffix}_{samples_seen:08d}_{origin}_{loss_type}_{current_loss:.6f}.pth"
     checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
 
     # Ensure checkpoint directory exists
@@ -387,10 +389,25 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
 
     try:
         # Save the new checkpoint
+        scheduler_type = type(world_model.ae_scheduler).__name__
+        scheduler = world_model.ae_scheduler
+
+        # Extract scheduler-specific parameters for recreation on load
+        scheduler_params = {}
+        if scheduler_type == 'ReduceLROnPlateau':
+            scheduler_params = {
+                'patience': scheduler.patience,
+                'factor': scheduler.factor,
+                'min_lrs': scheduler.min_lrs,  # List of min_lr per param group
+                'mode': scheduler.mode,
+            }
+
         checkpoint = {
             'model_state_dict': world_model.autoencoder.state_dict(),
             'optimizer_state_dict': world_model.ae_optimizer.state_dict(),
-            'scheduler_state_dict': world_model.ae_scheduler.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scheduler_type': scheduler_type,  # Save scheduler type for compatibility check
+            'scheduler_params': scheduler_params,  # Save params for scheduler recreation
             'timestamp': datetime.now().isoformat(),
             'samples_seen': samples_seen,
             'loss': current_loss,
@@ -434,13 +451,35 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
         return False, error_msg, auto_saved_checkpoints
 
 
+def generate_weighted_sample_indices(
+    sampler,
+    num_samples: int,
+    all_valid_indices: list,
+) -> list:
+    """
+    Generate sample indices using current sampler weights.
+
+    Args:
+        sampler: LossWeightedSampler instance with current weights
+        num_samples: Number of samples to generate
+        all_valid_indices: List of valid frame indices to map to
+
+    Returns:
+        List of frame indices sampled according to weights
+    """
+    sampler.num_samples = num_samples
+    dataset_indices = list(sampler)
+    return [all_valid_indices[i] for i in dataset_indices]
+
+
 def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_mode, starting_samples,
                                 preserve_optimizer, preserve_scheduler, custom_lr, disable_lr_scaling,
                                 custom_warmup, lr_min_ratio, resume_warmup_ratio=0.01,
                                 sampling_mode="Random (with replacement)",
                                 loss_weight_temperature=0.5, loss_weight_refresh_interval=50,
                                 stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=2.5,
-                                divergence_patience=3, divergence_min_updates=5):
+                                divergence_patience=3, divergence_min_updates=5,
+                                val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75):
     """
     Generate a pre-flight summary of the training configuration.
 
@@ -479,21 +518,34 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
         summary += f"- Gap threshold: {divergence_gap} (stop if val - train >= {divergence_gap})\n"
         summary += f"- Ratio threshold: {divergence_ratio} (stop if val / train >= {divergence_ratio})\n"
         summary += f"- Patience: {divergence_patience} consecutive checks\n"
-        summary += f"- Min updates before checking: {divergence_min_updates}\n\n"
+        summary += f"- Min updates before checking: {divergence_min_updates}\n"
+        summary += f"- Val spike threshold: {val_spike_threshold}x best val loss\n"
+        summary += f"- Val spike window: {int(val_spike_window)} checks\n"
+        summary += f"- Val spike frequency: {val_spike_frequency*100:.0f}% of window triggers stop\n\n"
 
-        # Calculate epochs for divergence mode
+        # Calculate chunk size for divergence mode
         if state.session_state.get("observations"):
             observations = state.session_state["observations"]
             min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
             samples_per_epoch = len(observations) - (min_frames_needed - 1)
-            epochs_per_chunk = 100
-            samples_per_chunk = samples_per_epoch * epochs_per_chunk
+
             summary += f"**Training Parameters:**\n"
             summary += f"- Batch size: {batch_size}\n"
             summary += f"- Sampling mode: {sampling_mode}\n"
             summary += f"- Samples per epoch: {samples_per_epoch:,}\n"
-            summary += f"- Epochs per chunk: {epochs_per_chunk}\n"
-            summary += f"- Samples per chunk: {samples_per_chunk:,}\n"
+
+            if sampling_mode == "Loss-weighted":
+                # Loss-weighted uses refresh-interval-aligned chunks
+                samples_per_chunk = loss_weight_refresh_interval * batch_size
+                summary += f"- Batches per chunk: {loss_weight_refresh_interval}\n"
+                summary += f"- Samples per chunk: {samples_per_chunk:,} (aligned with weight refresh)\n"
+            else:
+                # Other modes use 100-epoch chunks
+                epochs_per_chunk = 100
+                samples_per_chunk = samples_per_epoch * epochs_per_chunk
+                summary += f"- Epochs per chunk: {epochs_per_chunk}\n"
+                summary += f"- Samples per chunk: {samples_per_chunk:,}\n"
+
             summary += f"- Training continues indefinitely until divergence detected\n\n"
         else:
             summary += f"**Training Parameters:**\n"
@@ -694,7 +746,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           loss_weight_temperature=0.5, loss_weight_refresh_interval=50,
                           # Divergence-based early stopping parameters
                           stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=2.5,
-                          divergence_patience=3, divergence_min_updates=5):
+                          divergence_patience=3, divergence_min_updates=5,
+                          # Validation spike detection parameters
+                          val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -728,6 +782,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         divergence_ratio: Stop if (val_loss / train_loss) >= this ratio (default: 2.5)
         divergence_patience: Consecutive divergence checks before stopping (default: 3)
         divergence_min_updates: Minimum update intervals before checking divergence (default: 5)
+        val_spike_threshold: Multiplier above best val loss to count as spike (default: 2.0 = 100% above best)
+        val_spike_window: Number of recent validation checks to track for spike frequency (default: 25)
+        val_spike_frequency: Fraction of window that must be spikes to trigger stop (default: 0.75 = 75%)
 
     Yields:
         Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
@@ -793,6 +850,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         yield "Canvas cache not found. Please reload the session.", None, None, None, None, None, "", None
         return
 
+    # Reset training stop flag at start
+    state.reset_training_stop()
+
     # Initialize training logger
     logger = None
     session_name = state.session_state.get("session_name", "unknown")
@@ -808,13 +868,20 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             print(f"[LOGGER WARNING] Failed to initialize logger: {e}")
             logger = None
 
-    # For divergence mode, we'll use chunked training - generate epochs in batches
+    # For divergence mode, we'll use chunked training - generate samples in batches
     # and keep looping until divergence is detected
-    divergence_epochs_per_chunk = 100  # Generate 100 epochs at a time
+    divergence_epochs_per_chunk = 100  # For non-weighted modes: 100 epochs at a time
     if stop_on_divergence:
-        # Start with one chunk, we'll regenerate as needed
-        total_samples = max_samples_per_epoch * divergence_epochs_per_chunk
-        print(f"[DEBUG] Divergence mode: starting with {divergence_epochs_per_chunk} epochs ({total_samples:,} samples), will regenerate as needed")
+        if sampling_mode == "Loss-weighted":
+            # Align chunks with weight refresh for responsive hard-example mining
+            divergence_chunk_samples = loss_weight_refresh_interval * batch_size
+            total_samples = divergence_chunk_samples
+            print(f"[DEBUG] Divergence mode (loss-weighted): chunk size = {loss_weight_refresh_interval} batches x {batch_size} = {total_samples:,} samples")
+        else:
+            # Keep 100-epoch chunks for non-weighted modes
+            divergence_chunk_samples = max_samples_per_epoch * divergence_epochs_per_chunk
+            total_samples = divergence_chunk_samples
+            print(f"[DEBUG] Divergence mode: starting with {divergence_epochs_per_chunk} epochs ({total_samples:,} samples), will regenerate as needed")
 
     # Handle resume mode: compute actual samples to train
     if resume_mode:
@@ -834,6 +901,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         samples_to_train = total_samples
         starting_samples = 0  # Fresh start
         final_samples_target = total_samples
+
+    # Track whether this is continued training (for checkpoint naming)
+    # If resume_mode is enabled, user explicitly chose to continue from checkpoint
+    is_continued = resume_mode
 
     # Sample indices based on sampling mode
     all_valid_indices = list(range(min_frames_needed - 1, len(observations)))
@@ -861,10 +932,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             replacement=True,
         )
 
-        # Pre-generate initial indices - sampler produces dataset indices (0 to N-1),
-        # need to map to frame indices
-        dataset_indices = list(loss_weighted_sampler)
-        sampled_indices = [all_valid_indices[i] for i in dataset_indices]
+        # Generate initial indices using helper function
+        # Note: samples_to_train is already set based on divergence mode (refresh-aligned chunks)
+        sampled_indices = generate_weighted_sample_indices(
+            loss_weighted_sampler, samples_to_train, all_valid_indices
+        )
         print(f"[DEBUG] Loss-weighted sampling: {len(sampled_indices)} samples, "
               f"temperature={loss_weight_temperature}, refresh_interval={loss_weight_refresh_interval}")
 
@@ -1004,7 +1076,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         state.world_model.ae_scheduler = world_model_utils.create_reduce_on_plateau_scheduler(
             state.world_model.ae_optimizer,
             patience=divergence_patience * 2,  # More patient than divergence check
-            factor=0.5,
+            factor=0.1,
             min_lr=global_min_lr,
         )
         use_plateau_scheduler = True
@@ -1103,6 +1175,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     update_count = 0
     stop_early = False
     stop_reason = ""
+
+    # Validation spike tracking for spike frequency divergence detection
+    val_spike_history = []  # Track recent spike/no-spike results (True/False)
+    best_val_loss = float('inf')  # Track best validation loss seen
+    val_spike_window = int(val_spike_window)  # Ensure integer for window size
 
     # Track total training time
     training_start_time = time.time()
@@ -1333,22 +1410,49 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Divergence checking for early stopping
                     update_count += 1
                     if stop_on_divergence and val_loss is not None:
+                        # Track best validation loss and spike frequency
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+
+                        # Check if this is a spike (above threshold * best)
+                        is_spike = val_loss > best_val_loss * val_spike_threshold
+                        val_spike_history.append(is_spike)
+                        if len(val_spike_history) > val_spike_window:
+                            val_spike_history.pop(0)
+
+                        # Check spike frequency
+                        spike_freq_diverged = False
+                        current_spike_freq = 0.0
+                        if len(val_spike_history) >= val_spike_window:
+                            current_spike_freq = sum(val_spike_history) / len(val_spike_history)
+                            spike_freq_diverged = current_spike_freq >= val_spike_frequency
+
                         if update_count >= divergence_min_updates:
                             gap = val_loss - loss
                             ratio = val_loss / max(loss, 1e-8)
-                            diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio)
+                            # Combined divergence check: gap OR ratio OR spike frequency
+                            diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio) or spike_freq_diverged
                             if diverged:
                                 divergence_count += 1
+                                spike_info = f", spike_freq={current_spike_freq*100:.0f}%" if spike_freq_diverged else ""
                                 print(f"[DIVERGENCE] Check {divergence_count}/{divergence_patience}: "
-                                      f"gap={gap:.6f} (thresh={divergence_gap}), ratio={ratio:.2f} (thresh={divergence_ratio})")
+                                      f"gap={gap:.6f} (thresh={divergence_gap}), ratio={ratio:.2f} (thresh={divergence_ratio}){spike_info}")
                             else:
                                 divergence_count = 0  # Reset on non-divergent check
 
                             if divergence_count >= divergence_patience:
                                 stop_early = True
-                                stop_reason = (f"Divergence detected after {update_count} updates: "
-                                              f"val={val_loss:.6f} vs train={loss:.6f} "
-                                              f"(gap={gap:.6f}, ratio={ratio:.2f})")
+                                # Identify which condition(s) triggered divergence
+                                triggers = []
+                                if gap >= divergence_gap:
+                                    triggers.append(f"gap {gap:.4f} >= {divergence_gap}")
+                                if ratio >= divergence_ratio:
+                                    triggers.append(f"ratio {ratio:.2f} >= {divergence_ratio}")
+                                if spike_freq_diverged:
+                                    triggers.append(f"spike frequency {current_spike_freq*100:.0f}% >= {val_spike_frequency*100:.0f}%")
+                                trigger_reason = " AND ".join(triggers) if triggers else "unknown"
+                                stop_reason = (f"Divergence detected ({trigger_reason}) after {update_count} updates: "
+                                              f"val={val_loss:.6f} vs train={loss:.6f}")
                                 print(f"[DIVERGENCE] {stop_reason}")
 
                     # Debug logging to diagnose periodic loss spikes
@@ -1361,7 +1465,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         best_loss = checkpoint_loss
                         success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
                             checkpoint_loss, samples_seen, state.world_model, auto_saved_checkpoints, num_best_models_to_keep,
-                            is_val_loss=(val_loss is not None)
+                            is_val_loss=(val_loss is not None), is_continued=is_continued
                         )
                         if success:
                             print(f"[AUTO-SAVE] {save_msg}")
@@ -1401,6 +1505,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     if stop_on_divergence:
                         status_msg += f"- Mode: Train until divergence\n"
                         status_msg += f"- Divergence checks: {divergence_count}/{divergence_patience}\n"
+                        if len(val_spike_history) >= val_spike_window:
+                            current_spike_freq = sum(val_spike_history) / len(val_spike_history)
+                            status_msg += f"- Spike frequency: {current_spike_freq*100:.0f}% (threshold: {val_spike_frequency*100:.0f}%)\n"
+                        status_msg += f"- Best val loss: {best_val_loss:.6f}\n"
                     status_msg += f"- Current batch loss: {loss:.6f}\n"
                     status_msg += f"- Best loss: {best_loss:.6f}\n"
                     status_msg += f"- Learning rate: {current_lr:.6e}\n"
@@ -1417,6 +1525,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                             sample_weights_data = (weights, valid_indices, loss_weight_temperature, sample_counts)
                         except Exception as e:
                             print(f"[WARNING] Failed to compute sample weights for visualization: {e}")
+
+                    # Check for user-requested stop BEFORE yield
+                    if state.training_stop_requested:
+                        stop_early = True
+                        stop_reason = "Training stopped by user request"
+                        state.reset_training_stop()
 
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
@@ -1566,22 +1680,49 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Divergence checking for early stopping
                     update_count += 1
                     if stop_on_divergence and val_loss is not None:
+                        # Track best validation loss and spike frequency
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+
+                        # Check if this is a spike (above threshold * best)
+                        is_spike = val_loss > best_val_loss * val_spike_threshold
+                        val_spike_history.append(is_spike)
+                        if len(val_spike_history) > val_spike_window:
+                            val_spike_history.pop(0)
+
+                        # Check spike frequency
+                        spike_freq_diverged = False
+                        current_spike_freq = 0.0
+                        if len(val_spike_history) >= val_spike_window:
+                            current_spike_freq = sum(val_spike_history) / len(val_spike_history)
+                            spike_freq_diverged = current_spike_freq >= val_spike_frequency
+
                         if update_count >= divergence_min_updates:
                             gap = val_loss - loss
                             ratio = val_loss / max(loss, 1e-8)
-                            diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio)
+                            # Combined divergence check: gap OR ratio OR spike frequency
+                            diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio) or spike_freq_diverged
                             if diverged:
                                 divergence_count += 1
+                                spike_info = f", spike_freq={current_spike_freq*100:.0f}%" if spike_freq_diverged else ""
                                 print(f"[DIVERGENCE] Check {divergence_count}/{divergence_patience}: "
-                                      f"gap={gap:.6f} (thresh={divergence_gap}), ratio={ratio:.2f} (thresh={divergence_ratio})")
+                                      f"gap={gap:.6f} (thresh={divergence_gap}), ratio={ratio:.2f} (thresh={divergence_ratio}){spike_info}")
                             else:
                                 divergence_count = 0  # Reset on non-divergent check
 
                             if divergence_count >= divergence_patience:
                                 stop_early = True
-                                stop_reason = (f"Divergence detected after {update_count} updates: "
-                                              f"val={val_loss:.6f} vs train={loss:.6f} "
-                                              f"(gap={gap:.6f}, ratio={ratio:.2f})")
+                                # Identify which condition(s) triggered divergence
+                                triggers = []
+                                if gap >= divergence_gap:
+                                    triggers.append(f"gap {gap:.4f} >= {divergence_gap}")
+                                if ratio >= divergence_ratio:
+                                    triggers.append(f"ratio {ratio:.2f} >= {divergence_ratio}")
+                                if spike_freq_diverged:
+                                    triggers.append(f"spike frequency {current_spike_freq*100:.0f}% >= {val_spike_frequency*100:.0f}%")
+                                trigger_reason = " AND ".join(triggers) if triggers else "unknown"
+                                stop_reason = (f"Divergence detected ({trigger_reason}) after {update_count} updates: "
+                                              f"val={val_loss:.6f} vs train={loss:.6f}")
                                 print(f"[DIVERGENCE] {stop_reason}")
 
                     # Debug logging to diagnose periodic loss spikes
@@ -1594,7 +1735,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         best_loss = checkpoint_loss
                         success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
                             checkpoint_loss, samples_seen, state.world_model, auto_saved_checkpoints, num_best_models_to_keep,
-                            is_val_loss=(val_loss is not None)
+                            is_val_loss=(val_loss is not None), is_continued=is_continued
                         )
                         if success:
                             print(f"[AUTO-SAVE] {save_msg}")
@@ -1634,6 +1775,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     if stop_on_divergence:
                         status_msg += f"- Mode: Train until divergence\n"
                         status_msg += f"- Divergence checks: {divergence_count}/{divergence_patience}\n"
+                        if len(val_spike_history) >= val_spike_window:
+                            current_spike_freq = sum(val_spike_history) / len(val_spike_history)
+                            status_msg += f"- Spike frequency: {current_spike_freq*100:.0f}% (threshold: {val_spike_frequency*100:.0f}%)\n"
+                        status_msg += f"- Best val loss: {best_val_loss:.6f}\n"
                     status_msg += f"- Current batch loss: {loss:.6f}\n"
                     status_msg += f"- Best loss: {best_loss:.6f}\n"
                     status_msg += f"- Learning rate: {current_lr:.6e}\n"
@@ -1650,6 +1795,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                             sample_weights_data = (weights, valid_indices, loss_weight_temperature, sample_counts)
                         except Exception as e:
                             print(f"[WARNING] Failed to compute sample weights for visualization: {e}")
+
+                    # Check for user-requested stop BEFORE yield
+                    if state.training_stop_requested:
+                        stop_early = True
+                        stop_reason = "Training stopped by user request"
+                        state.reset_training_stop()
 
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
@@ -1676,27 +1827,26 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
           # For divergence mode: if not stopped early, regenerate indices and continue
           if stop_on_divergence and not stop_early:
             chunk_number += 1
-            print(f"[DEBUG] Divergence mode: generating chunk {chunk_number + 1} ({divergence_epochs_per_chunk} more epochs)")
 
             # Regenerate indices for next chunk based on sampling mode
-            new_samples = max_samples_per_epoch * divergence_epochs_per_chunk
-
             if sampling_mode == "Loss-weighted":
-                # Loss-weighted: regenerate using current accumulated weights
-                # Sampler preserves loss history across chunks for meaningful hard-sample mining
-                loss_weighted_sampler.num_samples = new_samples
-                dataset_indices = list(loss_weighted_sampler)
-                sampled_indices = [all_valid_indices[i] for i in dataset_indices]
+                # Loss-weighted: use refresh-interval-aligned chunks for responsive hard-example mining
+                new_samples = loss_weight_refresh_interval * batch_size
+                sampled_indices = generate_weighted_sample_indices(
+                    loss_weighted_sampler, new_samples, all_valid_indices
+                )
                 print(f"[DEBUG] Loss-weighted chunk {chunk_number + 1}: {len(sampled_indices)} samples "
-                      f"with {len(state.sample_losses)} accumulated loss entries")
+                      f"({loss_weight_refresh_interval} batches), {len(state.sample_losses)} tracked samples")
 
             elif sampling_mode == "Random (with replacement)":
-                # Random: simple random sampling with replacement
+                # Random: 100-epoch chunks
+                new_samples = max_samples_per_epoch * divergence_epochs_per_chunk
                 sampled_indices = random.choices(all_valid_indices, k=new_samples)
-                print(f"[DEBUG] Random chunk {chunk_number + 1}: {len(sampled_indices)} samples")
+                print(f"[DEBUG] Random chunk {chunk_number + 1}: {len(sampled_indices)} samples ({divergence_epochs_per_chunk} epochs)")
 
             else:
-                # Epoch-based: shuffle each epoch
+                # Epoch-based: shuffle each epoch, 100-epoch chunks
+                new_samples = max_samples_per_epoch * divergence_epochs_per_chunk
                 sampled_indices = []
                 for _ in range(divergence_epochs_per_chunk):
                     epoch_indices = all_valid_indices.copy()
@@ -1734,6 +1884,15 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
           # Exit the training loop (either stopped early or not in divergence mode)
           break
+
+        # Set completion reason if not stopped early
+        if not stop_early:
+            if stop_on_divergence:
+                # This shouldn't happen in divergence mode, but handle it
+                stop_reason = f"Training completed: processed all available samples ({samples_seen:,})"
+            else:
+                stop_reason = f"Training completed: reached target of {final_samples_target:,} samples"
+            print(f"[DEBUG] Set stop_reason for normal completion: {stop_reason}")
 
         # Final evaluation after training complete (outside while loop, inside try block)
         print(f"[DEBUG] Running final evaluation...")
@@ -1796,14 +1955,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             best_loss = final_checkpoint_loss
             success, save_msg, auto_saved_checkpoints = save_best_model_checkpoint(
                 final_checkpoint_loss, samples_seen, state.world_model, auto_saved_checkpoints, num_best_models_to_keep,
-                is_val_loss=is_val
+                is_val_loss=is_val, is_continued=is_continued
             )
             if success:
                 status_msg += f"\n\n{save_msg}"
-
-        # Add early stop reason if applicable
-        if stop_early:
-            status_msg = f"**Training Stopped Early**\n{stop_reason}\n\n" + status_msg
 
         # Add final learning rate to status
         final_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
@@ -1836,6 +1991,22 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
         # Calculate total elapsed time
         total_elapsed_time = time.time() - training_start_time
+
+        # Add completion reason to status message (after elapsed time is calculated)
+        print(f"[DEBUG] Building final status: stop_reason='{stop_reason}', stop_early={stop_early}")
+        if stop_reason:
+            header = "**Training Stopped Early**" if stop_early else "**Training Complete**"
+            # Format elapsed time nicely
+            hours, remainder = divmod(total_elapsed_time, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            if hours > 0:
+                time_str = f"{int(hours)}h {int(minutes)}m {seconds:.1f}s"
+            elif minutes > 0:
+                time_str = f"{int(minutes)}m {seconds:.1f}s"
+            else:
+                time_str = f"{seconds:.1f}s"
+            status_msg = f"{header}\n{stop_reason}\n⏱️ Total time: {time_str}\n\n" + status_msg
+            print(f"[DEBUG] Added completion header to status_msg")
 
         # Generate LLM summary at training completion
         if logger:

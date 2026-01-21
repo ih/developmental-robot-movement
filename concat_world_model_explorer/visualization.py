@@ -303,10 +303,14 @@ def generate_batch_training_update(samples_seen, total_samples, cumulative_metri
     """Generate all UI outputs for batch training update"""
     # Status message
     if completed:
-        status = f"✅ **Training Complete: {samples_seen} samples**"
-        if elapsed_time is not None:
-            td = timedelta(seconds=int(elapsed_time))
-            status += f"\n\n⏱️ **Time elapsed:** {td}"
+        # Use eval_status if it contains completion info (starts with **Training)
+        if eval_status and eval_status.startswith("**Training"):
+            status = eval_status
+        else:
+            status = f"✅ **Training Complete: {samples_seen} samples**"
+            if elapsed_time is not None:
+                td = timedelta(seconds=int(elapsed_time))
+                status += f"\n\n⏱️ **Time elapsed:** {td}"
     else:
         progress_pct = (samples_seen / total_samples) * 100
         status = f"🔄 **Training... {samples_seen}/{total_samples} samples ({progress_pct:.1f}%)**"

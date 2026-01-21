@@ -18,6 +18,21 @@ current_checkpoint_name = None
 selected_robot_type = "toroidal_dot"  # Default robot type for session selection
 instance_id = None  # Unique identifier for this instance (set by __main__.py based on port)
 
+# Training control flag
+training_stop_requested = False
+
+
+def request_training_stop():
+    """Request training to stop at the next checkpoint."""
+    global training_stop_requested
+    training_stop_requested = True
+
+
+def reset_training_stop():
+    """Reset the stop flag (call before starting training)."""
+    global training_stop_requested
+    training_stop_requested = False
+
 # Checkpoint metadata (populated when loading a checkpoint)
 # Used for resume functionality
 loaded_checkpoint_metadata = {

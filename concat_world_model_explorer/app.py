@@ -185,7 +185,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Number of training samples (loops through session if needed)"
         )
         batch_size_input = gr.Number(
-            value=2,
+            value=1,
             label="Batch Size",
             precision=0,
             minimum=1,
@@ -223,7 +223,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     with gr.Row():
         update_interval_input = gr.Number(
-            value=1000,
+            value=100,
             label="Update Interval",
             precision=0,
             minimum=10,
@@ -231,7 +231,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             info="Evaluate every N samples (lower = more frequent updates)"
         )
         window_size_input = gr.Number(
-            value=100,
+            value=50,
             label="Rolling Window Size",
             precision=0,
             minimum=1,
@@ -312,6 +312,31 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             minimum=1.0,
             interactive=True,
             info="Stop if (val_loss / train_loss) >= this ratio"
+        )
+
+    with gr.Row():
+        val_spike_threshold_input = gr.Number(
+            value=2.0,
+            label="Val Spike Threshold",
+            minimum=1.0,
+            interactive=True,
+            info="Spike if val_loss > best_val * this multiplier (2.0 = 100% above best)"
+        )
+        val_spike_window_input = gr.Number(
+            value=25,
+            label="Spike Window",
+            precision=0,
+            minimum=3,
+            interactive=True,
+            info="Number of recent checks to track for spike frequency"
+        )
+        val_spike_frequency_input = gr.Number(
+            value=0.75,
+            label="Spike Frequency",
+            minimum=0.1,
+            maximum=1.0,
+            interactive=True,
+            info="Trigger if this fraction of window are spikes (0.75 = 75%)"
         )
 
     # Resume Mode Controls
@@ -411,6 +436,7 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
 
     with gr.Row():
         run_batch_btn = gr.Button("🚀 Run Batch Training", variant="primary")
+        stop_training_btn = gr.Button("🛑 Stop Training", variant="stop")
         show_preflight_btn = gr.Button("📋 Show Config", variant="secondary")
 
     batch_training_status = gr.Markdown("")
@@ -748,6 +774,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             # Divergence-based early stopping parameters
             stop_on_divergence_checkbox, divergence_gap_input, divergence_ratio_input,
             divergence_patience_input, divergence_min_updates_input,
+            # Validation spike detection parameters
+            val_spike_threshold_input, val_spike_window_input, val_spike_frequency_input,
         ],
         outputs=[
             batch_training_status,
@@ -760,6 +788,13 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             observation_samples_status,
             observation_samples_plot,
         ]
+    )
+
+    # Stop training button - sets flag that training loop checks
+    stop_training_btn.click(
+        fn=state.request_training_stop,
+        inputs=[],
+        outputs=[]
     )
 
     # Pre-flight summary button
@@ -777,6 +812,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             # Divergence-based early stopping parameters
             stop_on_divergence_checkbox, divergence_gap_input, divergence_ratio_input,
             divergence_patience_input, divergence_min_updates_input,
+            # Validation spike detection parameters
+            val_spike_threshold_input, val_spike_window_input, val_spike_frequency_input,
         ],
         outputs=[preflight_summary]
     )
