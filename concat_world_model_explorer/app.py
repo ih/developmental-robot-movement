@@ -413,6 +413,14 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             interactive=True,
             info="Warmup steps as ratio of session steps when resuming (0=instant jump, 0.01=1%)"
         )
+        plateau_factor_input = gr.Number(
+            value=0.1,
+            label="Plateau Factor",
+            minimum=0.01,
+            maximum=1.0,
+            interactive=True,
+            info="ReduceLROnPlateau: multiply LR by this factor when loss plateaus"
+        )
 
     # Weights & Biases logging controls
     gr.Markdown("### Logging")
@@ -776,6 +784,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             divergence_patience_input, divergence_min_updates_input,
             # Validation spike detection parameters
             val_spike_threshold_input, val_spike_window_input, val_spike_frequency_input,
+            # ReduceLROnPlateau parameters
+            plateau_factor_input,
         ],
         outputs=[
             batch_training_status,
@@ -814,6 +824,8 @@ with gr.Blocks(title="Concat World Model Explorer", theme=gr.themes.Soft()) as d
             divergence_patience_input, divergence_min_updates_input,
             # Validation spike detection parameters
             val_spike_threshold_input, val_spike_window_input, val_spike_frequency_input,
+            # ReduceLROnPlateau parameters
+            plateau_factor_input,
         ],
         outputs=[preflight_summary]
     )

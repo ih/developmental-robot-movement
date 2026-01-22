@@ -415,13 +415,13 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
             'original_peak_lr': state.loaded_checkpoint_metadata.get('original_peak_lr')
                                 or world_model.ae_optimizer.param_groups[0]['lr'],
             'config': {
-                'frame_size': config.AutoencoderConcatPredictorWorldModelConfig.FRAME_SIZE,
+                'frame_size': world_model.frame_size,  # Use actual frame_size from model, not global config
                 'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
                 'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
             }
         }
         torch.save(checkpoint, checkpoint_path)
-        print(f"[AUTO-SAVE] New best loss {current_loss:.6f} at {samples_seen} samples → saved to {checkpoint_name}")
+        print(f"[AUTO-SAVE] New best loss {current_loss:.6f} at {samples_seen} samples -> saved to {checkpoint_name}")
 
         # Add to tracking list
         auto_saved_checkpoints.append((current_loss, checkpoint_path))
@@ -440,6 +440,8 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
                 worst_filename = os.path.basename(worst_path)
                 print(f"[AUTO-SAVE] Deleted worse checkpoint: {worst_filename} (loss: {worst_loss:.6f})")
                 message += f"\n- Deleted worse checkpoint: {worst_filename} (loss: {worst_loss:.6f})"
+            else:
+                print(f"[AUTO-SAVE WARNING] File not found for deletion: {worst_path}")
 
         message += f"\n- Keeping {len(auto_saved_checkpoints)}/{num_best_models_to_keep} best models"
 
@@ -479,7 +481,8 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
                                 loss_weight_temperature=0.5, loss_weight_refresh_interval=50,
                                 stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=2.5,
                                 divergence_patience=3, divergence_min_updates=5,
-                                val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75):
+                                val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75,
+                                plateau_factor=0.1):
     """
     Generate a pre-flight summary of the training configuration.
 
@@ -576,7 +579,7 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
         summary += f"- Min LR: {global_min_lr:.2e}\n"
         summary += f"- Scheduler: ReduceLROnPlateau (stepped at update intervals with val_loss)\n"
         summary += f"- Plateau patience: {divergence_patience * 2} updates\n"
-        summary += f"- Reduction factor: 0.5\n"
+        summary += f"- Reduction factor: {plateau_factor}\n"
 
         return summary
 
@@ -700,7 +703,7 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
             summary += f"- Checkpoint LR: {checkpoint_lr:.2e}\n"
         if resume_warmup_steps > 0:
             summary += f"- Resume warmup: {resume_warmup_steps} steps ({resume_warmup_ratio:.0%} of {num_gradient_updates} steps)\n"
-            summary += f"  ({checkpoint_lr:.2e} → {target_lr:.2e})\n"
+            summary += f"  ({checkpoint_lr:.2e} -> {target_lr:.2e})\n"
     else:
         summary += f"- Starting LR: {target_lr:.2e}\n"
     summary += "\n"
@@ -748,7 +751,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=2.5,
                           divergence_patience=3, divergence_min_updates=5,
                           # Validation spike detection parameters
-                          val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75):
+                          val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75,
+                          # ReduceLROnPlateau parameters
+                          plateau_factor=0.1):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -785,6 +790,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         val_spike_threshold: Multiplier above best val loss to count as spike (default: 2.0 = 100% above best)
         val_spike_window: Number of recent validation checks to track for spike frequency (default: 25)
         val_spike_frequency: Fraction of window that must be spikes to trigger stop (default: 0.75 = 75%)
+        plateau_factor: ReduceLROnPlateau reduction factor (new_lr = lr * factor) (default: 0.1)
 
     Yields:
         Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
@@ -1076,11 +1082,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         state.world_model.ae_scheduler = world_model_utils.create_reduce_on_plateau_scheduler(
             state.world_model.ae_optimizer,
             patience=divergence_patience * 2,  # More patient than divergence check
-            factor=0.1,
+            factor=plateau_factor,
             min_lr=global_min_lr,
         )
         use_plateau_scheduler = True
-        print(f"[DEBUG] Created ReduceLROnPlateau scheduler (divergence mode): patience={divergence_patience * 2}, min_lr={global_min_lr:.6e}")
+        print(f"[DEBUG] Created ReduceLROnPlateau scheduler (divergence mode): patience={divergence_patience * 2}, factor={plateau_factor}, min_lr={global_min_lr:.6e}")
     elif resume_mode and preserve_scheduler and starting_samples == 0:
         # Keep existing scheduler only if not using global schedule
         print(f"[DEBUG] Preserved scheduler state (step {state.world_model.ae_scheduler.last_epoch})")
@@ -1175,6 +1181,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     update_count = 0
     stop_early = False
     stop_reason = ""
+
+    # Track smoothed training loss for divergence detection
+    # Using EMA instead of instantaneous batch loss prevents spurious resets
+    # when training loss spikes coincide with divergence check intervals
+    train_loss_ema = None
+    train_loss_ema_alpha = 0.1  # Smoothing factor (lower = more smoothing)
 
     # Validation spike tracking for spike frequency divergence detection
     val_spike_history = []  # Track recent spike/no-spike results (True/False)
@@ -1330,6 +1342,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     state.world_model.ae_scheduler.step()
                 samples_seen += canvas_tensor.shape[0]
 
+                # Update EMA of training loss for divergence detection
+                if train_loss_ema is None:
+                    train_loss_ema = loss
+                else:
+                    train_loss_ema = train_loss_ema_alpha * loss + (1 - train_loss_ema_alpha) * train_loss_ema
+
                 # Log per-batch metrics to wandb
                 if enable_wandb:
                     try:
@@ -1428,8 +1446,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                             spike_freq_diverged = current_spike_freq >= val_spike_frequency
 
                         if update_count >= divergence_min_updates:
-                            gap = val_loss - loss
-                            ratio = val_loss / max(loss, 1e-8)
+                            # Use smoothed training loss (EMA) instead of instantaneous batch loss
+                            # This prevents spurious resets when training spikes coincide with check intervals
+                            smoothed_train_loss = train_loss_ema if train_loss_ema is not None else loss
+                            gap = val_loss - smoothed_train_loss
+                            ratio = val_loss / max(smoothed_train_loss, 1e-8)
                             # Combined divergence check: gap OR ratio OR spike frequency
                             diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio) or spike_freq_diverged
                             if diverged:
@@ -1452,7 +1473,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                     triggers.append(f"spike frequency {current_spike_freq*100:.0f}% >= {val_spike_frequency*100:.0f}%")
                                 trigger_reason = " AND ".join(triggers) if triggers else "unknown"
                                 stop_reason = (f"Divergence detected ({trigger_reason}) after {update_count} updates: "
-                                              f"val={val_loss:.6f} vs train={loss:.6f}")
+                                              f"val={val_loss:.6f} vs train_ema={smoothed_train_loss:.6f}")
                                 print(f"[DIVERGENCE] {stop_reason}")
 
                     # Debug logging to diagnose periodic loss spikes
@@ -1591,6 +1612,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     state.world_model.ae_scheduler.step()
                 samples_seen += canvas_tensor.shape[0]
 
+                # Update EMA of training loss for divergence detection
+                if train_loss_ema is None:
+                    train_loss_ema = loss
+                else:
+                    train_loss_ema = train_loss_ema_alpha * loss + (1 - train_loss_ema_alpha) * train_loss_ema
+
                 # Log per-batch metrics to local logger
                 if logger:
                     try:
@@ -1698,8 +1725,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                             spike_freq_diverged = current_spike_freq >= val_spike_frequency
 
                         if update_count >= divergence_min_updates:
-                            gap = val_loss - loss
-                            ratio = val_loss / max(loss, 1e-8)
+                            # Use smoothed training loss (EMA) instead of instantaneous batch loss
+                            # This prevents spurious resets when training spikes coincide with check intervals
+                            smoothed_train_loss = train_loss_ema if train_loss_ema is not None else loss
+                            gap = val_loss - smoothed_train_loss
+                            ratio = val_loss / max(smoothed_train_loss, 1e-8)
                             # Combined divergence check: gap OR ratio OR spike frequency
                             diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio) or spike_freq_diverged
                             if diverged:
@@ -1722,7 +1752,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                     triggers.append(f"spike frequency {current_spike_freq*100:.0f}% >= {val_spike_frequency*100:.0f}%")
                                 trigger_reason = " AND ".join(triggers) if triggers else "unknown"
                                 stop_reason = (f"Divergence detected ({trigger_reason}) after {update_count} updates: "
-                                              f"val={val_loss:.6f} vs train={loss:.6f}")
+                                              f"val={val_loss:.6f} vs train_ema={smoothed_train_loss:.6f}")
                                 print(f"[DIVERGENCE] {stop_reason}")
 
                     # Debug logging to diagnose periodic loss spikes
@@ -2034,6 +2064,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 sample_weights_data = (weights, valid_indices, loss_weight_temperature, sample_counts)
             except Exception as e:
                 print(f"[WARNING] Failed to compute sample weights for final visualization: {e}")
+
+        # Store cumulative metrics in state for external access (e.g., staged_training.py)
+        state.cumulative_metrics = cumulative_metrics.copy()
 
         print(f"[DEBUG] Final yield: samples_seen={samples_seen}, final_target={final_samples_target}, elapsed_time={total_elapsed_time:.2f}s")
         yield generate_batch_training_update(

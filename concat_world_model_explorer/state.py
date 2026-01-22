@@ -18,6 +18,14 @@ current_checkpoint_name = None
 selected_robot_type = "toroidal_dot"  # Default robot type for session selection
 instance_id = None  # Unique identifier for this instance (set by __main__.py based on port)
 
+# Training metrics from last run (populated by run_world_model_batch)
+cumulative_metrics = {
+    'samples_seen': [],
+    'loss_at_sample': [],
+    'val_loss_at_sample': [],
+    'lr_at_sample': [],
+}
+
 # Training control flag
 training_stop_requested = False
 
@@ -68,20 +76,25 @@ def clear_validation_session():
 
 def get_checkpoint_dir_for_session(session_path: str) -> str:
     """
-    Return appropriate checkpoint directory based on session's robot type.
+    Return appropriate checkpoint directory based on session's parent directory.
+
+    Uses the parent directory name of the session to create a corresponding
+    checkpoint subdirectory. For example:
+        saved/sessions/test/my_session -> saved/checkpoints/test/
+        saved/sessions/so101/my_session -> saved/checkpoints/so101/
 
     Args:
         session_path: Path to the session directory
 
     Returns:
-        Path to robot-specific checkpoint directory
+        Path to checkpoint directory matching session's parent folder
     """
-    session_lower = session_path.lower()
-    if "jetbot" in session_lower:
-        return config.JETBOT_CHECKPOINT_DIR
-    elif "so101" in session_lower:
-        return config.SO101_CHECKPOINT_DIR
-    return config.TOROIDAL_DOT_CHECKPOINT_DIR
+    from pathlib import Path
+    session_parent = Path(session_path).parent.name
+    checkpoint_dir = f"{config.AUX_DIR}/checkpoints/{session_parent}"
+    # Ensure directory exists
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    return checkpoint_dir
 
 
 # =============================================================================

@@ -13,6 +13,7 @@ This repository contains research code for a canvas-based world model that learn
 4. **SO-101 Robot Arm** (`lerobot_policy_simple_joint/`, `convert_lerobot_to_explorer.py`) - LeRobot integration for SO-101 follower arm
 5. **Autoencoder Concat Predictor World Model** (`autoencoder_concat_predictor_world_model.py`) - Canvas-based world model
 6. **Concat World Model Explorer** (`concat_world_model_explorer/`) - Interactive web-based interface for exploring sessions
+7. **Staged Training** (`staged_training.py`, `staged_training_config.py`, `create_staged_splits.py`) - Automated progressive training pipeline with HTML reports
 
 ## Architecture
 
@@ -207,6 +208,53 @@ jupyter notebook test_toroidal_dot_actions.ipynb
 
 These notebooks provide interactive environments for testing robot interfaces and action spaces.
 
+### Staged Training
+
+Automated training pipeline that progressively trains on increasing data sizes with comprehensive HTML reports.
+
+**1. Create Staged Splits:**
+```bash
+# Create progressive train/validation splits from a session
+python create_staged_splits.py --session-path saved/sessions/so101/my_session
+
+# Customize initial size and train ratio
+python create_staged_splits.py --session-path saved/sessions/so101/my_session --initial-size 20 --train-ratio 0.8
+```
+- Creates progressively larger training/validation splits (10, 20, 40, 80, ... observations)
+- Default 70/30 train/validate split at each stage
+- Output: `{session}_stage{N}_train_{size}` and `{session}_stage{N}_validate_{size}`
+
+**2. Run Staged Training:**
+```bash
+# Basic usage
+python staged_training.py --root-session saved/sessions/so101/my_session
+
+# Multiple runs per stage for robustness
+python staged_training.py --root-session saved/sessions/so101/my_session --runs-per-stage 3
+
+# Custom configuration via YAML
+python staged_training.py --root-session saved/sessions/so101/my_session --config my_config.yaml
+```
+
+**Features:**
+- **Progressive training**: Trains on each stage's data until divergence, then moves to next stage
+- **Divergence-based early stopping**: Automatically stops when validation loss diverges from training
+- **EMA-smoothed divergence detection**: Uses exponential moving average of training loss for robust detection
+- **Loss-weighted sampling**: Focuses on high-loss samples for efficient learning
+- **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, and inference visualizations
+- **Best checkpoint selection**: Selects best checkpoint based on hybrid loss over original (full) session
+- **W&B integration**: Optional Weights & Biases logging for experiment tracking
+
+**Configuration** (`staged_training_config.py`):
+- All parameters match Gradio app defaults
+- Key parameters: `batch_size`, `divergence_patience`, `plateau_factor`, `loss_weight_temperature`
+- Supports YAML config files for reproducible experiments
+
+**Reports:**
+- Per-stage reports: `saved/staged_training_reports/{session}/stage{N}_run{M}/report.html`
+- Final summary: `saved/staged_training_reports/{session}/final_report.html`
+- Includes: training progress graphs, hybrid loss over session graphs per stage, inference visualizations, evaluation statistics
+
 ## Dependencies
 
 Install dependencies with:
@@ -243,6 +291,19 @@ Required Python packages:
   - `utils.py`: Shared helper functions
 - `config.py`: Configuration for world model, robots, and recording
 - `world_model_utils.py`: Utility functions for training and tensor operations
+
+### Staged Training
+- `staged_training.py`: Automated staged training pipeline with HTML report generation
+  - Progressive training on increasing data sizes
+  - Divergence-based early stopping with EMA-smoothed training loss
+  - Best checkpoint selection based on original session loss
+  - Comprehensive HTML reports with training progress and inference visualizations
+- `staged_training_config.py`: Dataclass configuration for staged training runs
+  - All parameters match Gradio app defaults
+  - YAML serialization support for reproducible experiments
+- `create_staged_splits.py`: Utility to create progressive train/validation splits from a session
+  - Doubling data size at each stage (10, 20, 40, 80, ...)
+  - Configurable train/validation ratio (default 70/30)
 
 ### Robot Interfaces
 - `robot_interface.py`: Abstract base class for robot interaction
