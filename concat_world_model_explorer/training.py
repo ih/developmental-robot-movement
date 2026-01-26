@@ -8,6 +8,7 @@ This module contains all training-related functionality including:
 - Batch size comparison experiments
 """
 
+import math
 import os
 import random
 import time
@@ -37,6 +38,21 @@ from .visualization import (
     create_loss_vs_recent_checkpoints_plot,
 )
 from .training_logger import TrainingLogger
+
+
+def is_loss_invalid(loss):
+    """
+    Check if loss value is NaN or infinite.
+
+    Args:
+        loss: Loss value (float or tensor)
+
+    Returns:
+        True if loss is NaN or infinite, False otherwise
+    """
+    if isinstance(loss, torch.Tensor):
+        return torch.isnan(loss).any() or torch.isinf(loss).any()
+    return math.isnan(loss) or math.isinf(loss)
 
 
 def calculate_validation_loss(batch_size):
@@ -482,7 +498,7 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
                                 stop_on_divergence=False, divergence_gap=0.001, divergence_ratio=2.5,
                                 divergence_patience=3, divergence_min_updates=5,
                                 val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75,
-                                plateau_factor=0.1):
+                                plateau_factor=0.1, plateau_patience=0):
     """
     Generate a pre-flight summary of the training configuration.
 
@@ -574,11 +590,12 @@ def generate_preflight_summary(total_samples, batch_size, resume_mode, samples_m
 
         global_min_lr = peak_lr * lr_min_ratio
 
+        effective_plateau_patience = plateau_patience if plateau_patience > 0 else divergence_patience * 2
         summary += f"**Learning Rate (ReduceLROnPlateau):**\n"
         summary += f"- Starting LR: {peak_lr:.2e} ({lr_source})\n"
         summary += f"- Min LR: {global_min_lr:.2e}\n"
         summary += f"- Scheduler: ReduceLROnPlateau (stepped at update intervals with val_loss)\n"
-        summary += f"- Plateau patience: {divergence_patience * 2} updates\n"
+        summary += f"- Plateau patience: {effective_plateau_patience} updates\n"
         summary += f"- Reduction factor: {plateau_factor}\n"
 
         return summary
@@ -753,7 +770,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           # Validation spike detection parameters
                           val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75,
                           # ReduceLROnPlateau parameters
-                          plateau_factor=0.1):
+                          plateau_factor=0.1, plateau_patience=0):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -791,6 +808,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         val_spike_window: Number of recent validation checks to track for spike frequency (default: 25)
         val_spike_frequency: Fraction of window that must be spikes to trigger stop (default: 0.75 = 75%)
         plateau_factor: ReduceLROnPlateau reduction factor (new_lr = lr * factor) (default: 0.1)
+        plateau_patience: ReduceLROnPlateau patience (updates without improvement before LR reduction).
+                         0 = use divergence_patience * 2 (default: 0)
 
     Yields:
         Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
@@ -1079,14 +1098,16 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     if stop_on_divergence:
         # Divergence mode: use ReduceLROnPlateau since total steps are unknown
         # This scheduler adapts based on validation loss
+        # Use explicit plateau_patience if set, otherwise default to divergence_patience * 2
+        effective_plateau_patience = plateau_patience if plateau_patience > 0 else divergence_patience * 2
         state.world_model.ae_scheduler = world_model_utils.create_reduce_on_plateau_scheduler(
             state.world_model.ae_optimizer,
-            patience=divergence_patience * 2,  # More patient than divergence check
+            patience=effective_plateau_patience,
             factor=plateau_factor,
             min_lr=global_min_lr,
         )
         use_plateau_scheduler = True
-        print(f"[DEBUG] Created ReduceLROnPlateau scheduler (divergence mode): patience={divergence_patience * 2}, factor={plateau_factor}, min_lr={global_min_lr:.6e}")
+        print(f"[DEBUG] Created ReduceLROnPlateau scheduler (divergence mode): patience={effective_plateau_patience}, factor={plateau_factor}, min_lr={global_min_lr:.6e}")
     elif resume_mode and preserve_scheduler and starting_samples == 0:
         # Keep existing scheduler only if not using global schedule
         print(f"[DEBUG] Preserved scheduler state (step {state.world_model.ae_scheduler.last_epoch})")
@@ -1264,6 +1285,19 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         "preserve_scheduler": preserve_scheduler,
                         "custom_lr": custom_lr,
                         "disable_lr_scaling": disable_lr_scaling,
+                        # Divergence detection config
+                        "stop_on_divergence": stop_on_divergence,
+                        "divergence_gap": divergence_gap,
+                        "divergence_ratio": divergence_ratio,
+                        "divergence_patience": divergence_patience,
+                        "divergence_min_updates": divergence_min_updates,
+                        "val_spike_threshold": val_spike_threshold,
+                        "val_spike_window": val_spike_window,
+                        "val_spike_frequency": val_spike_frequency,
+                        # Sampling config
+                        "sampling_mode": sampling_mode,
+                        "loss_weight_temperature": loss_weight_temperature,
+                        "loss_weight_refresh_interval": loss_weight_refresh_interval,
                     }
                 )
                 print(f"[WANDB] Initialized run: {wandb.run.name}")
@@ -1336,6 +1370,17 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
                         canvas_tensor, patch_mask, state.world_model.ae_optimizer
                     )
+
+                # Check for NaN/inf loss - stop gracefully if detected
+                if is_loss_invalid(loss):
+                    current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
+                    stop_reason = (f"NaN/Inf loss detected at batch {batch_count} (samples: {samples_seen}). "
+                                   f"Learning rate was {current_lr:.2e}. Try lowering the learning rate or "
+                                   f"checking input data for issues.")
+                    print(f"[NaN DETECTED] {stop_reason}")
+                    stop_early = True
+                    break
+
                 # Step scheduler every batch only for non-plateau schedulers
                 # Plateau scheduler is stepped at update intervals with val_loss
                 if not use_plateau_scheduler:
@@ -1455,9 +1500,23 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                             diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio) or spike_freq_diverged
                             if diverged:
                                 divergence_count += 1
-                                spike_info = f", spike_freq={current_spike_freq*100:.0f}%" if spike_freq_diverged else ""
+                                spike_info = f", spike_freq={current_spike_freq*100:.0f}%/{val_spike_frequency*100:.0f}% ({len(val_spike_history)}/{val_spike_window})"
                                 print(f"[DIVERGENCE] Check {divergence_count}/{divergence_patience}: "
                                       f"gap={gap:.6f} (thresh={divergence_gap}), ratio={ratio:.2f} (thresh={divergence_ratio}){spike_info}")
+                                # Log divergence metrics to wandb
+                                if enable_wandb:
+                                    try:
+                                        wandb.log({
+                                            "divergence/gap": gap,
+                                            "divergence/ratio": ratio,
+                                            "divergence/spike_freq": current_spike_freq,
+                                            "divergence/count": divergence_count,
+                                            "divergence/val_loss": val_loss,
+                                            "divergence/train_loss_ema": smoothed_train_loss,
+                                            "divergence/best_val_loss": best_val_loss,
+                                        }, step=samples_seen)
+                                    except Exception:
+                                        pass  # Silently ignore wandb errors
                             else:
                                 divergence_count = 0  # Reset on non-divergent check
 
@@ -1606,6 +1665,17 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     loss, grad_diagnostics = state.world_model.autoencoder.train_on_canvas(
                         canvas_tensor, patch_mask, state.world_model.ae_optimizer
                     )
+
+                # Check for NaN/inf loss - stop gracefully if detected
+                if is_loss_invalid(loss):
+                    current_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
+                    stop_reason = (f"NaN/Inf loss detected at batch {batch_count} (samples: {samples_seen}). "
+                                   f"Learning rate was {current_lr:.2e}. Try lowering the learning rate or "
+                                   f"checking input data for issues.")
+                    print(f"[NaN DETECTED] {stop_reason}")
+                    stop_early = True
+                    break
+
                 # Step scheduler every batch only for non-plateau schedulers
                 # Plateau scheduler is stepped at update intervals with val_loss
                 if not use_plateau_scheduler:
@@ -1734,9 +1804,23 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                             diverged = (gap >= divergence_gap) or (ratio >= divergence_ratio) or spike_freq_diverged
                             if diverged:
                                 divergence_count += 1
-                                spike_info = f", spike_freq={current_spike_freq*100:.0f}%" if spike_freq_diverged else ""
+                                spike_info = f", spike_freq={current_spike_freq*100:.0f}%/{val_spike_frequency*100:.0f}% ({len(val_spike_history)}/{val_spike_window})"
                                 print(f"[DIVERGENCE] Check {divergence_count}/{divergence_patience}: "
                                       f"gap={gap:.6f} (thresh={divergence_gap}), ratio={ratio:.2f} (thresh={divergence_ratio}){spike_info}")
+                                # Log divergence metrics to wandb
+                                if enable_wandb:
+                                    try:
+                                        wandb.log({
+                                            "divergence/gap": gap,
+                                            "divergence/ratio": ratio,
+                                            "divergence/spike_freq": current_spike_freq,
+                                            "divergence/count": divergence_count,
+                                            "divergence/val_loss": val_loss,
+                                            "divergence/train_loss_ema": smoothed_train_loss,
+                                            "divergence/best_val_loss": best_val_loss,
+                                        }, step=samples_seen)
+                                    except Exception:
+                                        pass  # Silently ignore wandb errors
                             else:
                                 divergence_count = 0  # Reset on non-divergent check
 
@@ -2066,6 +2150,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                 print(f"[WARNING] Failed to compute sample weights for final visualization: {e}")
 
         # Store cumulative metrics in state for external access (e.g., staged_training.py)
+        # Include sample seen counts from the training logger for report generation
+        cumulative_metrics['sample_seen_counts'] = logger.sample_seen_counts.copy() if logger else {}
+        # Include auto-saved checkpoints list so staged_training can use it instead of globbing
+        cumulative_metrics['auto_saved_checkpoints'] = auto_saved_checkpoints.copy()
         state.cumulative_metrics = cumulative_metrics.copy()
 
         print(f"[DEBUG] Final yield: samples_seen={samples_seen}, final_target={final_samples_target}, elapsed_time={total_elapsed_time:.2f}s")

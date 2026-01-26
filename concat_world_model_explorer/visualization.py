@@ -209,6 +209,79 @@ def create_sample_weights_plot(weights, frame_indices, temperature=None, sample_
     return fig
 
 
+def create_sample_counts_plot(sample_counts, title=None):
+    """
+    Create bar chart showing how many times each sample/frame was seen during training.
+
+    Args:
+        sample_counts: Dict mapping frame_idx -> times sampled
+        title: Optional custom title for the plot
+
+    Returns:
+        matplotlib.figure.Figure or None if no valid data
+    """
+    import numpy as np
+
+    # Validate inputs
+    if sample_counts is None or len(sample_counts) == 0:
+        return None
+
+    # Extract frame indices and counts
+    frame_indices = np.array(sorted(sample_counts.keys()))
+    counts = np.array([sample_counts[idx] for idx in frame_indices])
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Adaptive visualization based on data size
+    num_frames = len(frame_indices)
+    if num_frames > 200:
+        # Line plot for many frames (cleaner visualization)
+        ax.fill_between(frame_indices, counts, alpha=0.3, color='green')
+        ax.plot(frame_indices, counts, color='green', linewidth=1, alpha=0.8)
+    else:
+        # Bar chart for fewer frames
+        ax.bar(frame_indices, counts, color='green', alpha=0.7, edgecolor='darkgreen', width=0.8)
+
+    # Styling
+    if title:
+        ax.set_title(title, fontsize=14, fontweight='bold')
+    else:
+        ax.set_title('Sample Counts (Times Seen During Training)', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Frame Number', fontsize=12)
+    ax.set_ylabel('Times Sampled', fontsize=12)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Set y-axis range
+    if np.max(counts) > 0:
+        ax.set_ylim([0, np.max(counts) * 1.1])
+
+    # Calculate statistics
+    total_samples = int(np.sum(counts))
+    max_count = int(np.max(counts))
+    min_count = int(np.min(counts))
+    mean_count = np.mean(counts)
+    frames_seen = int(np.sum(counts > 0))
+    total_frames = len(frame_indices)
+    coverage_pct = (frames_seen / total_frames * 100) if total_frames > 0 else 0
+
+    # Add statistics text box
+    stats_text = f"Total frames: {total_frames}\n"
+    stats_text += f"Total samples: {total_samples:,}\n"
+    stats_text += f"Coverage: {frames_seen}/{total_frames} ({coverage_pct:.1f}%)\n"
+    stats_text += f"Max count: {max_count}\n"
+    stats_text += f"Min count: {min_count}\n"
+    stats_text += f"Mean count: {mean_count:.2f}"
+
+    ax.text(0.98, 0.98, stats_text, transform=ax.transAxes,
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.5),
+            fontsize=9)
+
+    plt.tight_layout()
+    return fig
+
+
 def generate_multiple_observation_canvases(observation_indices):
     """Generate grid of canvas visualizations for multiple observations"""
     if state.world_model is None:

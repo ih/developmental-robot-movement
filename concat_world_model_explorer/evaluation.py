@@ -297,53 +297,33 @@ def evaluate_full_session():
     stats_text += f"| Min | {format_loss(stats['standard']['min'])} |\n"
     stats_text += f"| Max | {format_loss(stats['standard']['max'])} |\n"
 
-    # Create line plot: Loss over observations
-    fig_loss_over_time, axes = plt.subplots(2, 1, figsize=(12, 8))
+    # Create line plot: Hybrid loss over observations (single plot, no standard loss)
+    fig_loss_over_time, ax = plt.subplots(figsize=(12, 5))
 
     # Plot hybrid loss
-    axes[0].plot(results['observation_indices'], results['loss_hybrid'], 'b-', linewidth=1, alpha=0.7, label='Hybrid Loss')
-    axes[0].axhline(y=stats['hybrid']['mean'], color='r', linestyle='--', linewidth=1.5, label=f"Mean: {format_loss(stats['hybrid']['mean'])}")
-    axes[0].axhline(y=stats['hybrid']['median'], color='g', linestyle='--', linewidth=1.5, label=f"Median: {format_loss(stats['hybrid']['median'])}")
-    axes[0].set_xlabel('Observation Index')
-    axes[0].set_ylabel('Hybrid Loss')
-    axes[0].set_title('Hybrid Loss Over Session')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    # Plot standard loss
-    axes[1].plot(results['observation_indices'], results['loss_standard'], 'purple', linewidth=1, alpha=0.7, label='Standard Loss')
-    axes[1].axhline(y=stats['standard']['mean'], color='r', linestyle='--', linewidth=1.5, label=f"Mean: {format_loss(stats['standard']['mean'])}")
-    axes[1].axhline(y=stats['standard']['median'], color='g', linestyle='--', linewidth=1.5, label=f"Median: {format_loss(stats['standard']['median'])}")
-    axes[1].set_xlabel('Observation Index')
-    axes[1].set_ylabel('Standard Loss (MSE)')
-    axes[1].set_title('Standard Loss Over Session')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+    ax.plot(results['observation_indices'], results['loss_hybrid'], 'b-', linewidth=1, alpha=0.7, label='Hybrid Loss')
+    ax.axhline(y=stats['hybrid']['mean'], color='r', linestyle='--', linewidth=1.5, label=f"Mean: {format_loss(stats['hybrid']['mean'])}")
+    ax.axhline(y=stats['hybrid']['median'], color='g', linestyle='--', linewidth=1.5, label=f"Median: {format_loss(stats['hybrid']['median'])}")
+    ax.set_xlabel('Observation Index')
+    ax.set_ylabel('Hybrid Loss')
+    ax.set_title('Hybrid Loss Over Session')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
 
-    # Create distribution histogram
-    fig_distribution, axes = plt.subplots(1, 2, figsize=(12, 4))
+    # Create distribution histogram (hybrid loss only)
+    fig_distribution, ax = plt.subplots(figsize=(8, 4))
 
     # Hybrid loss distribution
-    axes[0].hist(results['loss_hybrid'], bins=30, color='blue', alpha=0.7, edgecolor='black')
-    axes[0].axvline(x=stats['hybrid']['mean'], color='r', linestyle='--', linewidth=2, label=f"Mean: {format_loss(stats['hybrid']['mean'])}")
-    axes[0].axvline(x=stats['hybrid']['median'], color='g', linestyle='--', linewidth=2, label=f"Median: {format_loss(stats['hybrid']['median'])}")
-    axes[0].set_xlabel('Hybrid Loss')
-    axes[0].set_ylabel('Frequency')
-    axes[0].set_title('Hybrid Loss Distribution')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3, axis='y')
-
-    # Standard loss distribution
-    axes[1].hist(results['loss_standard'], bins=30, color='purple', alpha=0.7, edgecolor='black')
-    axes[1].axvline(x=stats['standard']['mean'], color='r', linestyle='--', linewidth=2, label=f"Mean: {format_loss(stats['standard']['mean'])}")
-    axes[1].axvline(x=stats['standard']['median'], color='g', linestyle='--', linewidth=2, label=f"Median: {format_loss(stats['standard']['median'])}")
-    axes[1].set_xlabel('Standard Loss (MSE)')
-    axes[1].set_ylabel('Frequency')
-    axes[1].set_title('Standard Loss Distribution')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3, axis='y')
+    ax.hist(results['loss_hybrid'], bins=30, color='blue', alpha=0.7, edgecolor='black')
+    ax.axvline(x=stats['hybrid']['mean'], color='r', linestyle='--', linewidth=2, label=f"Mean: {format_loss(stats['hybrid']['mean'])}")
+    ax.axvline(x=stats['hybrid']['median'], color='g', linestyle='--', linewidth=2, label=f"Median: {format_loss(stats['hybrid']['median'])}")
+    ax.set_xlabel('Hybrid Loss')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Hybrid Loss Distribution')
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
 

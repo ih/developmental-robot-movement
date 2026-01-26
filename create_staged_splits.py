@@ -2,12 +2,24 @@
 Create Staged Training/Validation Splits
 
 Creates progressively larger training and validation subsessions from an original session.
-Starts with an initial size (default 10), doubles each stage until the original session
-size is reached. Each stage creates a 70/30 train/validate split (configurable).
+Supports two modes:
+
+1. Doubling mode (default): Starts with an initial size (default 10), doubles each stage
+   until the original session size is reached.
+
+2. Fixed stages mode: Creates a specified number of stages with evenly divided sizes.
+   For example, 100 samples with 10 stages creates stages of 10, 20, 30, ..., 100 samples.
+
+Each stage creates a train/validate split (default 70/30, configurable).
 
 Usage:
+    # Doubling mode (default)
     python create_staged_splits.py --session-path saved/sessions/so101/my_session
     python create_staged_splits.py --session-path saved/sessions/so101/my_session --initial-size 20 --train-ratio 0.8
+
+    # Fixed stages mode
+    python create_staged_splits.py --session-path saved/sessions/so101/my_session --num-stages 10
+    python create_staged_splits.py --session-path saved/sessions/so101/my_session --num-stages 5 --train-ratio 0.8
 
 Output naming convention:
     {session}_stage{N}_train_{train_size}
@@ -144,14 +156,21 @@ def create_staged_splits(
     session_path: str,
     initial_size: int = 10,
     train_ratio: float = 0.7,
+    num_stages: int | None = None,
 ) -> list[tuple[str, str]]:
     """
     Create staged training/validation splits from a session.
 
+    Supports two modes:
+    - Doubling mode (default): Uses initial_size and doubles each stage
+    - Fixed stages mode: Uses num_stages to create evenly divided stages
+
     Args:
         session_path: Path to the source session directory
-        initial_size: Starting size for the first stage (default 10)
+        initial_size: Starting size for the first stage in doubling mode (default 10)
         train_ratio: Fraction of observations for training (default 0.7)
+        num_stages: If set, creates this many stages with evenly divided sizes.
+                   If None, uses doubling mode with initial_size.
 
     Returns:
         List of (train_path, validate_path) tuples for each stage
@@ -175,31 +194,47 @@ def create_staged_splits(
 
     print(f"Original session: {session_name}")
     print(f"Total observations: {total_observations}")
-    print(f"Initial size: {initial_size}, Train ratio: {train_ratio}")
+
+    # Calculate stage sizes based on mode
+    if num_stages is not None:
+        # Fixed stages mode: evenly divided sizes
+        if num_stages < 1:
+            raise ValueError("num_stages must be at least 1")
+        if num_stages > total_observations:
+            raise ValueError(
+                f"num_stages ({num_stages}) exceeds total observations ({total_observations})"
+            )
+        increment = total_observations // num_stages
+        stage_sizes = [increment * (i + 1) for i in range(num_stages)]
+        # Ensure last stage includes all observations (handles remainder)
+        stage_sizes[-1] = total_observations
+        print(f"Mode: Fixed stages ({num_stages} stages), Train ratio: {train_ratio}")
+    else:
+        # Doubling mode: compute sizes by doubling from initial_size
+        if initial_size > total_observations:
+            raise ValueError(
+                f"Initial size ({initial_size}) exceeds total observations ({total_observations})"
+            )
+        stage_sizes = []
+        current = initial_size
+        while current < total_observations:
+            stage_sizes.append(current)
+            current *= 2
+        stage_sizes.append(total_observations)
+        print(f"Mode: Doubling (initial size {initial_size}), Train ratio: {train_ratio}")
+
+    print(f"Stage sizes: {stage_sizes}")
     print()
 
-    if initial_size > total_observations:
-        raise ValueError(
-            f"Initial size ({initial_size}) exceeds total observations ({total_observations})"
-        )
-
     created_splits = []
-    stage = 1
-    current_size = initial_size
 
-    # Process stages until we've handled the full session
-    while True:
-        # Determine the size for this stage
-        if current_size >= total_observations:
-            stage_size = total_observations
-        else:
-            stage_size = current_size
-
+    # Process each stage
+    for stage_num, stage_size in enumerate(stage_sizes, start=1):
         # Calculate train/validate sizes (round train up)
         train_size = math.ceil(stage_size * train_ratio)
         validate_size = stage_size - train_size
 
-        print(f"Stage {stage} (size {stage_size}):")
+        print(f"Stage {stage_num} (size {stage_size}):")
 
         # Calculate step boundaries
         # observations are at steps 0, 2, 4, ... and actions at 1, 3, 5, ...
@@ -212,8 +247,8 @@ def create_staged_splits(
         validate_events = [e for e in events if train_end_step <= e["step"] < stage_end_step]
 
         # Create output paths
-        train_name = f"{session_name}_stage{stage}_train_{train_size}"
-        validate_name = f"{session_name}_stage{stage}_validate_{validate_size}"
+        train_name = f"{session_name}_stage{stage_num}_train_{train_size}"
+        validate_name = f"{session_name}_stage{stage_num}_validate_{validate_size}"
 
         train_path = parent_dir / train_name
         validate_path = parent_dir / validate_name
@@ -247,14 +282,6 @@ def create_staged_splits(
         created_splits.append((str(train_path), str(validate_path)))
         print()
 
-        # Check if we've reached the full session
-        if stage_size >= total_observations:
-            break
-
-        # Double the size for next stage
-        stage += 1
-        current_size *= 2
-
     return created_splits
 
 
@@ -271,7 +298,13 @@ def main():
         "--initial-size",
         type=int,
         default=10,
-        help="Starting size for the first stage (default: 10)",
+        help="Starting size for the first stage in doubling mode (default: 10)",
+    )
+    parser.add_argument(
+        "--num-stages",
+        type=int,
+        default=None,
+        help="Number of stages with evenly divided sizes. If set, uses fixed stages mode instead of doubling mode.",
     )
     parser.add_argument(
         "--train-ratio",
@@ -286,8 +319,12 @@ def main():
         print("Error: train-ratio must be between 0 and 1 (exclusive)")
         return 1
 
-    if args.initial_size < 2:
+    if args.num_stages is None and args.initial_size < 2:
         print("Error: initial-size must be at least 2")
+        return 1
+
+    if args.num_stages is not None and args.num_stages < 1:
+        print("Error: num-stages must be at least 1")
         return 1
 
     try:
@@ -295,6 +332,7 @@ def main():
             args.session_path,
             args.initial_size,
             args.train_ratio,
+            args.num_stages,
         )
         print(f"Successfully created {len(splits)} staged splits:")
         for i, (train_path, validate_path) in enumerate(splits, 1):

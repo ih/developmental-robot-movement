@@ -340,6 +340,7 @@ def run_stage_training(
             val_spike_frequency=cfg.val_spike_frequency,
             # ReduceLROnPlateau
             plateau_factor=cfg.plateau_factor,
+            plateau_patience=cfg.plateau_patience,
         )
 
         # Consume generator and collect results
@@ -358,12 +359,14 @@ def run_stage_training(
                 if match:
                     samples_seen = int(match.group(1))
 
-            # Check for stop reason in status
-            if "divergence" in status_msg.lower():
+            # Check for stop reason in status (use specific phrases to avoid false positives)
+            status_lower = status_msg.lower()
+            if "nan" in status_lower or "inf loss" in status_lower:
+                stop_reason = "nan_loss"
+            elif "divergence detected" in status_lower:
+                # Extract the detailed divergence message for the report
                 stop_reason = "divergence"
-            elif "spike" in status_msg.lower():
-                stop_reason = "spike_frequency"
-            elif "complete" in status_msg.lower() or "finished" in status_msg.lower():
+            elif "training complete" in status_lower or "training finished" in status_lower:
                 stop_reason = "completed"
 
             # Close figures to free memory
@@ -378,25 +381,26 @@ def run_stage_training(
 
     elapsed_time = time.time() - start_time
 
-    # Find best checkpoint from this run
+    # Extract total_samples_trained from cumulative_metrics
+    if state.cumulative_metrics and state.cumulative_metrics.get("samples_seen"):
+        total_samples_trained = state.cumulative_metrics["samples_seen"][-1] - starting_samples
+    else:
+        total_samples_trained = 0
+
+    # Find best checkpoint from this run (use tracked checkpoints, not glob to avoid old checkpoint pollution)
     checkpoint_dir = state.get_checkpoint_dir_for_session(train_session["session_dir"])
     session_name = train_session["session_name"]
 
-    # Look for auto-saved checkpoints
-    checkpoint_pattern = f"best_model_auto_{session_name}_*"
-    checkpoints = list(Path(checkpoint_dir).glob(checkpoint_pattern))
+    # Use auto_saved_checkpoints from cumulative_metrics (only checkpoints from this run)
+    auto_saved_checkpoints = []
+    if state.cumulative_metrics and state.cumulative_metrics.get("auto_saved_checkpoints"):
+        auto_saved_checkpoints = state.cumulative_metrics["auto_saved_checkpoints"]
 
-    if checkpoints:
-        # Sort by loss (extract from filename)
-        def get_loss_from_name(cp):
-            # Pattern: best_model_auto_{session}_{instance}_{samples}_{origin}_{type}_{loss}.pth
-            match = re.search(r"_(\d+\.\d+)\.pth$", cp.name)
-            return float(match.group(1)) if match else float("inf")
-
-        checkpoints.sort(key=get_loss_from_name)
-        best_checkpoint_path = str(checkpoints[0])
-        best_loss = get_loss_from_name(checkpoints[0])
-        print(f"Best checkpoint: {checkpoints[0].name} (loss: {best_loss:.6f})")
+    if auto_saved_checkpoints:
+        # Sort by loss (ascending) - list contains (loss, filepath) tuples
+        auto_saved_checkpoints.sort(key=lambda x: x[0])
+        best_loss, best_checkpoint_path = auto_saved_checkpoints[0]
+        print(f"Best checkpoint from this run: {Path(best_checkpoint_path).name} (loss: {best_loss:.6f})")
     else:
         # Save current model as checkpoint
         checkpoint_name = f"stage{stage_num}_run{run_num}_final.pth"
@@ -572,6 +576,14 @@ def generate_stage_report(
                 )
             )
 
+        # Generate learning rate graph
+        fig_lr = visualization.create_lr_vs_samples_plot(result.cumulative_metrics)
+        if fig_lr:
+            save_fig_to_file(fig_lr, assets_dir / "learning_rate.png")
+            images["learning_rate"] = fig_to_base64(
+                visualization.create_lr_vs_samples_plot(result.cumulative_metrics)
+            )
+
     # Load best checkpoint for evaluations
     setup_world_model(train_session, result.best_checkpoint_path, cfg)
     state.validation_session_state = val_session
@@ -593,6 +605,14 @@ def generate_stage_report(
                 if fig_weights:
                     save_fig_to_file(fig_weights, assets_dir / "sample_weights.png")
                     images["sample_weights"] = fig_to_base64(fig_weights)
+
+    # Generate sample counts plot from cumulative metrics
+    sample_seen_counts = result.cumulative_metrics.get("sample_seen_counts", {})
+    if sample_seen_counts:
+        fig_counts = visualization.create_sample_counts_plot(sample_seen_counts)
+        if fig_counts:
+            save_fig_to_file(fig_counts, assets_dir / "sample_counts.png")
+            images["sample_counts"] = fig_to_base64(fig_counts)
 
     # Generate inference images for selected frame
     selected_frame = cfg.selected_frame_offset
@@ -755,11 +775,18 @@ def generate_stage_html(
         <h2>Training Progress</h2>
         {'<img src="data:image/png;base64,' + images.get("training_progress", "") + '" />' if images.get("training_progress") else "<p>No training progress data available</p>"}
         {'<img src="data:image/png;base64,' + images.get("training_rolling", "") + '" />' if images.get("training_rolling") else ""}
+        <h3>Learning Rate Schedule</h3>
+        {'<img src="data:image/png;base64,' + images.get("learning_rate", "") + '" />' if images.get("learning_rate") else "<p>No learning rate data available</p>"}
     </section>
 
     <section id="sample-weights">
         <h2>Sample Weight Distribution</h2>
         {'<img src="data:image/png;base64,' + images.get("sample_weights", "") + '" />' if images.get("sample_weights") else "<p>No sample weight data available</p>"}
+    </section>
+
+    <section id="sample-counts">
+        <h2>Sample Counts</h2>
+        {'<img src="data:image/png;base64,' + images.get("sample_counts", "") + '" />' if images.get("sample_counts") else "<p>No sample count data available</p>"}
     </section>
 
     <section id="inference-selected">
@@ -877,6 +904,14 @@ def generate_final_report(
     ax.legend()
     progression_b64 = fig_to_base64(fig_progression)
 
+    # Generate learning rate graph for best stage
+    lr_b64 = ""
+    if best_run_result.cumulative_metrics.get("lr_at_sample"):
+        fig_lr = visualization.create_lr_vs_samples_plot(best_run_result.cumulative_metrics)
+        if fig_lr:
+            lr_b64 = fig_to_base64(fig_lr)
+            plt.close(fig_lr)
+
     # Generate inference for best checkpoint
     print("Generating inference for best checkpoint...")
     inference_dir = output_dir / "best_inference"
@@ -922,6 +957,43 @@ def generate_final_report(
             <div class="stage-loss-graph">
                 <h4>Stage {stage_num}{best_label} - Hybrid Loss: {orig_loss:.6f}</h4>
                 <img src="data:image/png;base64,{loss_fig_b64}" />
+            </div>"""
+
+    # Build cumulative sample counts across all stages
+    cumulative_sample_counts: dict[int, int] = {}
+    for stage_num, result, orig_loss, _ in stage_original_evals:
+        stage_counts = result.cumulative_metrics.get("sample_seen_counts", {})
+        for frame_idx, count in stage_counts.items():
+            cumulative_sample_counts[frame_idx] = cumulative_sample_counts.get(frame_idx, 0) + count
+
+    # Generate cumulative sample counts plot
+    cumulative_counts_b64 = ""
+    if cumulative_sample_counts:
+        fig_cumulative = visualization.create_sample_counts_plot(
+            cumulative_sample_counts, title="Cumulative Sample Counts (All Stages)"
+        )
+        if fig_cumulative:
+            cumulative_counts_b64 = fig_to_base64(fig_cumulative)
+            plt.close(fig_cumulative)
+
+    # Build per-stage sample counts graphs section
+    stage_counts_graphs_html = ""
+    for stage_num, result, orig_loss, _ in stage_original_evals:
+        stage_counts = result.cumulative_metrics.get("sample_seen_counts", {})
+        if stage_counts:
+            is_best = stage_num == best_stage
+            best_label = " (Best)" if is_best else ""
+            fig_stage_counts = visualization.create_sample_counts_plot(
+                stage_counts, title=f"Stage {stage_num}{best_label} Sample Counts"
+            )
+            if fig_stage_counts:
+                counts_b64 = fig_to_base64(fig_stage_counts)
+                plt.close(fig_stage_counts)
+                total_samples = sum(stage_counts.values())
+                stage_counts_graphs_html += f"""
+            <div class="stage-loss-graph">
+                <h4>Stage {stage_num}{best_label} - Total Samples: {total_samples:,}</h4>
+                <img src="data:image/png;base64,{counts_b64}" />
             </div>"""
 
     # Build inference HTML
@@ -991,6 +1063,11 @@ def generate_final_report(
         </div>
     </section>
 
+    <section id="learning-rate">
+        <h2>Learning Rate Schedule (Best Stage)</h2>
+        {'<img src="data:image/png;base64,' + lr_b64 + '" />' if lr_b64 else "<p>No learning rate data available</p>"}
+    </section>
+
     <section id="stage-progression">
         <h2>Stage Progression</h2>
         <img src="data:image/png;base64,{progression_b64}" />
@@ -1008,6 +1085,16 @@ def generate_final_report(
         <h3>Hybrid Loss Over Original Session (per Stage)</h3>
         <div class="stage-loss-graphs">
             {stage_loss_graphs_html if stage_loss_graphs_html else "<p>No loss graphs available</p>"}
+        </div>
+    </section>
+
+    <section id="sample-counts">
+        <h2>Sample Counts</h2>
+        <h3>Cumulative Across All Stages</h3>
+        {'<img src="data:image/png;base64,' + cumulative_counts_b64 + '" />' if cumulative_counts_b64 else "<p>No cumulative sample count data available</p>"}
+        <h3>Per Stage</h3>
+        <div class="stage-loss-graphs">
+            {stage_counts_graphs_html if stage_counts_graphs_html else "<p>No per-stage sample count graphs available</p>"}
         </div>
     </section>
 
@@ -1104,6 +1191,31 @@ def run_staged_training(
     print("\nLoading original session...")
     original_session = load_session_for_training(root_session_path)
 
+    # Clean old checkpoints if enabled (prevents checkpoint pollution from previous runs)
+    if cfg.clean_old_checkpoints:
+        root_session_name = Path(root_session_path).name
+        # Get checkpoint directory for SO-101 (this is the robot type for these sessions)
+        checkpoint_dir = Path(config.SO101_CHECKPOINT_DIR)
+        if checkpoint_dir.exists():
+            # Find all auto-saved checkpoints matching the root session name pattern
+            # Pattern: best_model_auto_{session_name}_*
+            old_checkpoints = list(checkpoint_dir.glob(f"best_model_auto_{root_session_name}_*"))
+            # Also clean up stage-specific checkpoints
+            for stage_num, train_path, _ in stages:
+                train_session_name = Path(train_path).name
+                old_checkpoints.extend(checkpoint_dir.glob(f"best_model_auto_{train_session_name}_*"))
+
+            if old_checkpoints:
+                print(f"\nCleaning {len(old_checkpoints)} old checkpoints from previous runs...")
+                for cp in old_checkpoints:
+                    try:
+                        cp.unlink()
+                        print(f"  Deleted: {cp.name}")
+                    except Exception as e:
+                        print(f"  Failed to delete {cp.name}: {e}")
+            else:
+                print("\nNo old checkpoints to clean up.")
+
     # Run training for each stage
     all_results = []
     current_checkpoint = None  # Fresh weights for stage 1
@@ -1192,8 +1304,8 @@ def main():
     parser.add_argument(
         "--runs-per-stage",
         type=int,
-        default=1,
-        help="Number of training runs per stage (default: 1)",
+        default=None,
+        help="Number of training runs per stage (default: from config)",
     )
 
     args = parser.parse_args()
@@ -1204,8 +1316,9 @@ def main():
     else:
         cfg = StagedTrainingConfig()
 
-    # Override runs_per_stage from CLI
-    cfg.runs_per_stage = args.runs_per_stage
+    # Override runs_per_stage from CLI only if explicitly provided
+    if args.runs_per_stage is not None:
+        cfg.runs_per_stage = args.runs_per_stage
 
     # Determine output directory
     if args.output_dir:
