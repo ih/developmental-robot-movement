@@ -16,9 +16,13 @@ class StagedTrainingConfig:
     """Configuration for staged training runs."""
 
     # Core training (app defaults)
-    total_samples: int = 10000000  # App default
+    total_samples: int = 10000000  # App default (used when stage_samples_multiplier=0)
     batch_size: int = 12  # App default
-    update_interval: int = 100  # App default
+
+    # Dynamic sample budget for staged training
+    stage_samples_multiplier: int = 1000  # total_samples = num_valid_frames * multiplier
+                                           # 0 = use fixed total_samples instead
+    update_interval: int = 500  # App default
     window_size: int = 50  # App default
     num_best_models_to_keep: int = 1  # App default
 
@@ -29,25 +33,29 @@ class StagedTrainingConfig:
 
     # Divergence stopping (app defaults)
     stop_on_divergence: bool = True  # App default
-    divergence_gap: float = 0.01  # App default
-    divergence_ratio: float = 2  # App default
-    divergence_patience: int = 15  # App default
+    divergence_gap: float = 0.002  # App default
+    divergence_ratio: float = 1.3  # App default
+    divergence_patience: int = 5  # App default
     divergence_min_updates: int = 5  # App default
     val_spike_threshold: float = 2.0  # App default
     val_spike_window: int = 15  # App default
     val_spike_frequency: float = 0.75  # App default
 
+    # Validation plateau early stopping
+    val_plateau_patience: int = 100  # Stop if val loss hasn't improved in N updates (0 = disabled)
+    val_plateau_min_delta: float = 0.0001  # Minimum improvement to count as "better"
+
     # Learning rate (app defaults)
-    custom_lr: float = 0  # App default (0 = use config default)
+    custom_lr: float = 0.0001  # App default (0 = use config default)
     disable_lr_scaling: bool = True  # App default
     custom_warmup: int = -1  # App default (-1 = scaled default)
     lr_min_ratio: float = 0.001  # App default
-    resume_warmup_ratio: float = 0.01  # App default
+    resume_warmup_ratio: float = 0.05  # App default
     plateau_factor: float = 0.8  # ReduceLROnPlateau reduction factor (new_lr = lr * factor)
-    plateau_patience: int = 50  # ReduceLROnPlateau patience (0 = use divergence_patience * 2)
+    plateau_patience: int = 20  # ReduceLROnPlateau patience (0 = use divergence_patience * 2)
 
     # Resume mode settings (app defaults)
-    preserve_optimizer: bool = True  # App default
+    preserve_optimizer: bool = False  # App default
     preserve_scheduler: bool = True  # App default
     samples_mode: str = "Train additional samples"  # App default
 
@@ -58,6 +66,9 @@ class StagedTrainingConfig:
     # Stage settings
     runs_per_stage: int = 2  # CLI parameter
     clean_old_checkpoints: bool = True  # Clean old auto-saved checkpoints before starting
+
+    # Run identification (set at runtime, saved for reference/reproducibility)
+    run_id: Optional[str] = None  # Unique identifier for concurrent execution
 
     # W&B (user override: enabled)
     enable_wandb: bool = True  # User specified (app default is False)

@@ -769,6 +769,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           divergence_patience=3, divergence_min_updates=5,
                           # Validation spike detection parameters
                           val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75,
+                          # Validation plateau early stopping parameters
+                          val_plateau_patience=0, val_plateau_min_delta=0.0001,
                           # ReduceLROnPlateau parameters
                           plateau_factor=0.1, plateau_patience=0):
     """
@@ -807,6 +809,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         val_spike_threshold: Multiplier above best val loss to count as spike (default: 2.0 = 100% above best)
         val_spike_window: Number of recent validation checks to track for spike frequency (default: 25)
         val_spike_frequency: Fraction of window that must be spikes to trigger stop (default: 0.75 = 75%)
+        val_plateau_patience: Stop if val loss hasn't improved in N updates (default: 0 = disabled)
+        val_plateau_min_delta: Minimum improvement to count as "better" (default: 0.0001)
         plateau_factor: ReduceLROnPlateau reduction factor (new_lr = lr * factor) (default: 0.1)
         plateau_patience: ReduceLROnPlateau patience (updates without improvement before LR reduction).
                          0 = use divergence_patience * 2 (default: 0)
@@ -1214,6 +1218,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     best_val_loss = float('inf')  # Track best validation loss seen
     val_spike_window = int(val_spike_window)  # Ensure integer for window size
 
+    # Validation plateau tracking for early stopping (uses smoothed val loss to handle spikes)
+    val_plateau_counter = 0  # Updates since last improvement
+    best_val_loss_for_plateau = float('inf')  # Best smoothed val loss for plateau detection
+    val_loss_ema_for_plateau = None  # EMA of validation loss for plateau detection
+    val_loss_ema_alpha_plateau = 0.3  # Smoothing factor (higher = more responsive, lower = more smoothing)
+
     # Track total training time
     training_start_time = time.time()
 
@@ -1535,6 +1545,30 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                               f"val={val_loss:.6f} vs train_ema={smoothed_train_loss:.6f}")
                                 print(f"[DIVERGENCE] {stop_reason}")
 
+                    # Validation plateau detection (separate from divergence)
+                    # Uses smoothed validation loss (EMA) to handle spiky validation loss
+                    if val_loss is not None and val_plateau_patience > 0 and not stop_early:
+                        # Update EMA of validation loss
+                        if val_loss_ema_for_plateau is None:
+                            val_loss_ema_for_plateau = val_loss
+                        else:
+                            val_loss_ema_for_plateau = (val_loss_ema_alpha_plateau * val_loss +
+                                                        (1 - val_loss_ema_alpha_plateau) * val_loss_ema_for_plateau)
+
+                        # Check improvement against smoothed value
+                        if val_loss_ema_for_plateau < best_val_loss_for_plateau - val_plateau_min_delta:
+                            best_val_loss_for_plateau = val_loss_ema_for_plateau
+                            val_plateau_counter = 0
+                        else:
+                            val_plateau_counter += 1
+
+                        if val_plateau_counter >= val_plateau_patience:
+                            stop_early = True
+                            stop_reason = (f"Validation plateau: no improvement in {val_plateau_patience} updates "
+                                          f"(best_ema: {best_val_loss_for_plateau:.6f}, current_ema: {val_loss_ema_for_plateau:.6f}, "
+                                          f"current_raw: {val_loss:.6f}, min_delta: {val_plateau_min_delta})")
+                            print(f"[PLATEAU] {stop_reason}")
+
                     # Debug logging to diagnose periodic loss spikes
                     log_training_debug_state(state.world_model, batch_count, samples_seen, loss, enable_wandb)
 
@@ -1838,6 +1872,30 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                 stop_reason = (f"Divergence detected ({trigger_reason}) after {update_count} updates: "
                                               f"val={val_loss:.6f} vs train_ema={smoothed_train_loss:.6f}")
                                 print(f"[DIVERGENCE] {stop_reason}")
+
+                    # Validation plateau detection (separate from divergence)
+                    # Uses smoothed validation loss (EMA) to handle spiky validation loss
+                    if val_loss is not None and val_plateau_patience > 0 and not stop_early:
+                        # Update EMA of validation loss
+                        if val_loss_ema_for_plateau is None:
+                            val_loss_ema_for_plateau = val_loss
+                        else:
+                            val_loss_ema_for_plateau = (val_loss_ema_alpha_plateau * val_loss +
+                                                        (1 - val_loss_ema_alpha_plateau) * val_loss_ema_for_plateau)
+
+                        # Check improvement against smoothed value
+                        if val_loss_ema_for_plateau < best_val_loss_for_plateau - val_plateau_min_delta:
+                            best_val_loss_for_plateau = val_loss_ema_for_plateau
+                            val_plateau_counter = 0
+                        else:
+                            val_plateau_counter += 1
+
+                        if val_plateau_counter >= val_plateau_patience:
+                            stop_early = True
+                            stop_reason = (f"Validation plateau: no improvement in {val_plateau_patience} updates "
+                                          f"(best_ema: {best_val_loss_for_plateau:.6f}, current_ema: {val_loss_ema_for_plateau:.6f}, "
+                                          f"current_raw: {val_loss:.6f}, min_delta: {val_plateau_min_delta})")
+                            print(f"[PLATEAU] {stop_reason}")
 
                     # Debug logging to diagnose periodic loss spikes
                     log_training_debug_state(state.world_model, batch_count, samples_seen, loss, enable_wandb)

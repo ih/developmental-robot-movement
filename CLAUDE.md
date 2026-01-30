@@ -345,16 +345,19 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 ```
 
 **Features:**
-- **Progressive training**: Trains on each stage's data until divergence, then moves to next stage
+- **Progressive training**: Trains on each stage's data until early stopping triggers, then moves to next stage
+- **Dynamic sample budget**: `stage_samples_multiplier` scales training samples based on stage size (e.g., 61 frames × 1000 = 61,000 samples) to prevent overfitting on small stages
 - **Divergence-based early stopping**: Automatically stops when validation loss diverges from training
+- **Validation plateau detection**: Stops when smoothed validation loss (EMA) stops improving for N consecutive updates
 - **Loss-weighted sampling**: Focuses on high-loss samples for efficient learning
 - **HTML reports**: Generates comprehensive reports with training progress, inference visualizations, and evaluation metrics
 - **Best checkpoint selection**: Selects best checkpoint based on hybrid loss over original (full) session
 - **W&B integration**: Optional Weights & Biases logging for experiment tracking
+- **Concurrent execution**: Multiple instances can run with isolated checkpoints using `--run-id`
 
 **Configuration** (`staged_training_config.py`):
 - All parameters match Gradio app defaults
-- Key parameters: `batch_size`, `divergence_patience`, `plateau_factor`, `loss_weight_temperature`
+- Key parameters: `stage_samples_multiplier`, `val_plateau_patience`, `divergence_patience`, `loss_weight_temperature`
 - Supports YAML config files for reproducible experiments
 
 **Reports:**

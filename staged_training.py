@@ -8,6 +8,19 @@ Usage:
     python staged_training.py --root-session saved/sessions/so101/my_session
     python staged_training.py --root-session saved/sessions/so101/my_session --runs-per-stage 3
     python staged_training.py --root-session saved/sessions/so101/my_session --config my_config.yaml
+
+Concurrent Execution:
+    Multiple instances can run concurrently with isolated checkpoints and reports:
+
+    # Terminal 1
+    python staged_training.py --root-session saved/sessions/so101/my_session --run-id exp_a
+
+    # Terminal 2 (simultaneously)
+    python staged_training.py --root-session saved/sessions/so101/my_session --run-id exp_b
+
+    If --run-id is not specified, a unique timestamp-based ID is auto-generated.
+    Reports are saved to: saved/staged_training_reports/{session_name}/{run_id}/
+    Checkpoints include run_id to prevent naming conflicts.
 """
 
 import argparse
@@ -300,10 +313,22 @@ def run_stage_training(
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Calculate dynamic sample budget based on training set size
+    num_train_observations = len(train_session.get("observations", []))
+    min_frames_needed = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+    num_valid_frames = num_train_observations - (min_frames_needed - 1)
+
+    if cfg.stage_samples_multiplier > 0:
+        effective_total_samples = num_valid_frames * cfg.stage_samples_multiplier
+        print(f"Dynamic sample budget: {num_valid_frames} valid frames x {cfg.stage_samples_multiplier} = {effective_total_samples:,} samples")
+    else:
+        effective_total_samples = cfg.total_samples
+        print(f"Fixed sample budget: {effective_total_samples:,} samples")
+
     # Run batch training generator
     try:
         generator = training.run_world_model_batch(
-            total_samples=cfg.total_samples,
+            total_samples=effective_total_samples,
             batch_size=cfg.batch_size,
             current_observation_idx=cfg.selected_frame_offset,
             update_interval=cfg.update_interval,
@@ -338,6 +363,9 @@ def run_stage_training(
             val_spike_threshold=cfg.val_spike_threshold,
             val_spike_window=cfg.val_spike_window,
             val_spike_frequency=cfg.val_spike_frequency,
+            # Validation plateau early stopping
+            val_plateau_patience=cfg.val_plateau_patience,
+            val_plateau_min_delta=cfg.val_plateau_min_delta,
             # ReduceLROnPlateau
             plateau_factor=cfg.plateau_factor,
             plateau_patience=cfg.plateau_patience,
@@ -364,8 +392,9 @@ def run_stage_training(
             if "nan" in status_lower or "inf loss" in status_lower:
                 stop_reason = "nan_loss"
             elif "divergence detected" in status_lower:
-                # Extract the detailed divergence message for the report
                 stop_reason = "divergence"
+            elif "validation plateau" in status_lower:
+                stop_reason = "val_plateau"
             elif "training complete" in status_lower or "training finished" in status_lower:
                 stop_reason = "completed"
 
@@ -380,6 +409,13 @@ def run_stage_training(
         stop_reason = f"error: {str(e)}"
 
     elapsed_time = time.time() - start_time
+
+    # Make stop_reason more informative for sample budget completion
+    if stop_reason in ("completed", "max_samples"):
+        if cfg.stage_samples_multiplier > 0:
+            stop_reason = f"sample_budget ({num_valid_frames} frames x {cfg.stage_samples_multiplier} = {effective_total_samples:,})"
+        else:
+            stop_reason = f"sample_budget ({effective_total_samples:,} fixed)"
 
     # Extract total_samples_trained from cumulative_metrics
     if state.cumulative_metrics and state.cumulative_metrics.get("samples_seen"):
@@ -1162,6 +1198,7 @@ def run_staged_training(
     root_session_path: str,
     cfg: StagedTrainingConfig,
     output_dir: str,
+    run_id: str,
 ) -> None:
     """
     Main function to run staged training.
@@ -1170,9 +1207,17 @@ def run_staged_training(
         root_session_path: Path to root session with staged splits
         cfg: Training configuration
         output_dir: Output directory for reports
+        run_id: Unique identifier for this run (used in checkpoint names to avoid collisions)
     """
+    # Set instance_id for checkpoint naming (prevents collisions with concurrent runs)
+    state.instance_id = run_id
+    print(f"Run ID: {run_id}")
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    # Save run_id to config for reference/reproducibility
+    cfg.run_id = run_id
 
     # Save config
     cfg.to_yaml(str(output_path / "config.yaml"))
@@ -1191,22 +1236,24 @@ def run_staged_training(
     print("\nLoading original session...")
     original_session = load_session_for_training(root_session_path)
 
-    # Clean old checkpoints if enabled (prevents checkpoint pollution from previous runs)
+    # Clean old checkpoints if enabled (only cleans checkpoints from THIS run_id to avoid
+    # interfering with concurrent runs using different run_ids)
     if cfg.clean_old_checkpoints:
         root_session_name = Path(root_session_path).name
-        # Get checkpoint directory for SO-101 (this is the robot type for these sessions)
-        checkpoint_dir = Path(config.SO101_CHECKPOINT_DIR)
+        # Get checkpoint directory based on session type
+        checkpoint_dir = state.get_checkpoint_dir_for_session(root_session_path)
+        checkpoint_dir = Path(checkpoint_dir)
         if checkpoint_dir.exists():
-            # Find all auto-saved checkpoints matching the root session name pattern
-            # Pattern: best_model_auto_{session_name}_*
-            old_checkpoints = list(checkpoint_dir.glob(f"best_model_auto_{root_session_name}_*"))
-            # Also clean up stage-specific checkpoints
+            # Only clean checkpoints matching THIS run's pattern (includes run_id)
+            # Pattern: best_model_auto_{session_name}_{run_id}_*
+            old_checkpoints = list(checkpoint_dir.glob(f"best_model_auto_{root_session_name}_{run_id}_*"))
+            # Also clean up stage-specific checkpoints for this run
             for stage_num, train_path, _ in stages:
                 train_session_name = Path(train_path).name
-                old_checkpoints.extend(checkpoint_dir.glob(f"best_model_auto_{train_session_name}_*"))
+                old_checkpoints.extend(checkpoint_dir.glob(f"best_model_auto_{train_session_name}_{run_id}_*"))
 
             if old_checkpoints:
-                print(f"\nCleaning {len(old_checkpoints)} old checkpoints from previous runs...")
+                print(f"\nCleaning {len(old_checkpoints)} old checkpoints from this run_id...")
                 for cp in old_checkpoints:
                     try:
                         cp.unlink()
@@ -1214,7 +1261,7 @@ def run_staged_training(
                     except Exception as e:
                         print(f"  Failed to delete {cp.name}: {e}")
             else:
-                print("\nNo old checkpoints to clean up.")
+                print("\nNo old checkpoints to clean up for this run_id.")
 
     # Run training for each stage
     all_results = []
@@ -1307,8 +1354,15 @@ def main():
         default=None,
         help="Number of training runs per stage (default: from config)",
     )
+    parser.add_argument(
+        "--run-id",
+        help="Unique run identifier for concurrent execution (default: auto-generated timestamp)",
+    )
 
     args = parser.parse_args()
+
+    # Generate run_id if not provided (enables concurrent execution without conflicts)
+    run_id = args.run_id or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
     # Load config
     if args.config:
@@ -1320,15 +1374,15 @@ def main():
     if args.runs_per_stage is not None:
         cfg.runs_per_stage = args.runs_per_stage
 
-    # Determine output directory
+    # Determine output directory (include run_id to prevent conflicts between concurrent runs)
     if args.output_dir:
         output_dir = args.output_dir
     else:
         session_name = Path(args.root_session).name
-        output_dir = f"saved/staged_training_reports/{session_name}"
+        output_dir = f"saved/staged_training_reports/{session_name}/{run_id}"
 
     # Run training
-    run_staged_training(args.root_session, cfg, output_dir)
+    run_staged_training(args.root_session, cfg, output_dir, run_id)
 
 
 if __name__ == "__main__":
