@@ -772,7 +772,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           # Validation plateau early stopping parameters
                           val_plateau_patience=0, val_plateau_min_delta=0.0001,
                           # ReduceLROnPlateau parameters
-                          plateau_factor=0.1, plateau_patience=0):
+                          plateau_factor=0.1, plateau_patience=0,
+                          # Baseline comparison parameters (for W&B logging)
+                          is_baseline_run=False, enable_baseline=False, baseline_runs_per_stage=1):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -1308,6 +1310,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         "sampling_mode": sampling_mode,
                         "loss_weight_temperature": loss_weight_temperature,
                         "loss_weight_refresh_interval": loss_weight_refresh_interval,
+                        # Baseline comparison config
+                        "is_baseline_run": is_baseline_run,
+                        "enable_baseline": enable_baseline,
+                        "baseline_runs_per_stage": baseline_runs_per_stage,
                     }
                 )
                 print(f"[WANDB] Initialized run: {wandb.run.name}")

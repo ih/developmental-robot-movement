@@ -241,19 +241,22 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - **Divergence-based early stopping**: Automatically stops when validation loss diverges from training
 - **EMA-smoothed divergence detection**: Uses exponential moving average of training loss for robust detection
 - **Loss-weighted sampling**: Focuses on high-loss samples for efficient learning
-- **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, and inference visualizations
+- **Baseline comparison**: Optionally run parallel baseline training (fresh weights each stage) to compare against staged training (weight carryover)
+- **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, staged vs baseline comparison, and inference visualizations
 - **Best checkpoint selection**: Selects best checkpoint based on hybrid loss over original (full) session
-- **W&B integration**: Optional Weights & Biases logging for experiment tracking
+- **W&B integration**: Optional Weights & Biases logging with run_id in run names and baseline config tracking
 
 **Configuration** (`staged_training_config.py`):
 - All parameters match Gradio app defaults
 - Key parameters: `batch_size`, `divergence_patience`, `plateau_factor`, `loss_weight_temperature`
+- Baseline config: `enable_baseline` (default True), `baseline_runs_per_stage` (default 2)
 - Supports YAML config files for reproducible experiments
 
 **Reports:**
 - Per-stage reports: `saved/staged_training_reports/{session}/stage{N}_run{M}/report.html`
+- Baseline reports: `saved/staged_training_reports/{session}/stage{N}_baseline_run{M}/report.html`
 - Final summary: `saved/staged_training_reports/{session}/final_report.html`
-- Includes: training progress graphs, hybrid loss over session graphs per stage, inference visualizations, evaluation statistics
+- Includes: training progress graphs, hybrid loss over session graphs, staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
 
 ## Dependencies
 
@@ -297,9 +300,11 @@ Required Python packages:
   - Progressive training on increasing data sizes
   - Divergence-based early stopping with EMA-smoothed training loss
   - Best checkpoint selection based on original session loss
-  - Comprehensive HTML reports with training progress and inference visualizations
+  - Baseline comparison training (fresh weights each stage) for comparing against staged (weight carryover)
+  - Comprehensive HTML reports with training progress, staged vs baseline comparison, and inference visualizations
 - `staged_training_config.py`: Dataclass configuration for staged training runs
   - All parameters match Gradio app defaults
+  - Baseline config: `enable_baseline`, `baseline_runs_per_stage`
   - YAML serialization support for reproducible experiments
 - `create_staged_splits.py`: Utility to create progressive train/validation splits from a session
   - Doubling data size at each stage (10, 20, 40, 80, ...)

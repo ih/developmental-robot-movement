@@ -67,6 +67,10 @@ class StagedTrainingConfig:
     runs_per_stage: int = 2  # CLI parameter
     clean_old_checkpoints: bool = True  # Clean old auto-saved checkpoints before starting
 
+    # Baseline comparison
+    enable_baseline: bool = True  # Enable baseline (from-scratch) runs for comparison
+    baseline_runs_per_stage: int = 2  # Number of baseline runs per stage
+
     # Run identification (set at runtime, saved for reference/reproducibility)
     run_id: Optional[str] = None  # Unique identifier for concurrent execution
 
