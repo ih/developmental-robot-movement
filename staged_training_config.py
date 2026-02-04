@@ -42,7 +42,7 @@ class StagedTrainingConfig:
     val_spike_frequency: float = 0.75  # App default
 
     # Validation plateau early stopping
-    val_plateau_patience: int = 100  # Stop if val loss hasn't improved in N updates (0 = disabled)
+    val_plateau_patience: int = 500  # Stop if val loss hasn't improved in N updates (0 = disabled)
     val_plateau_min_delta: float = 0.0001  # Minimum improvement to count as "better"
 
     # Learning rate (app defaults)
@@ -64,12 +64,12 @@ class StagedTrainingConfig:
     selected_frame_offset: int = 3  # App default for frame selection
 
     # Stage settings
-    runs_per_stage: int = 2  # CLI parameter
+    runs_per_stage: int = 5  # CLI parameter
     clean_old_checkpoints: bool = True  # Clean old auto-saved checkpoints before starting
 
     # Baseline comparison
     enable_baseline: bool = True  # Enable baseline (from-scratch) runs for comparison
-    baseline_runs_per_stage: int = 2  # Number of baseline runs per stage
+    baseline_runs_per_stage: int = 5  # Number of baseline runs per stage
 
     # Run identification (set at runtime, saved for reference/reproducibility)
     run_id: Optional[str] = None  # Unique identifier for concurrent execution
