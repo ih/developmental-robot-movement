@@ -480,6 +480,8 @@ def run_stage_training(
                 stop_reason = "divergence"
             elif "validation plateau" in status_lower:
                 stop_reason = "val_plateau"
+            elif "time budget" in status_lower:
+                stop_reason = "time_budget"
             elif "training complete" in status_lower or "training finished" in status_lower:
                 stop_reason = "completed"
 
@@ -495,12 +497,14 @@ def run_stage_training(
 
     elapsed_time = time.time() - start_time
 
-    # Make stop_reason more informative for sample budget completion
+    # Make stop_reason more informative for sample budget or time budget completion
     if stop_reason in ("completed", "max_samples"):
         if cfg.stage_samples_multiplier > 0:
             stop_reason = f"sample_budget ({num_valid_frames} frames x {cfg.stage_samples_multiplier} = {effective_total_samples:,})"
         else:
             stop_reason = f"sample_budget ({effective_total_samples:,} fixed)"
+    elif stop_reason == "time_budget":
+        stop_reason = f"time_budget ({time_budget_min:.1f} min limit)"
 
     # Extract total_samples_trained from cumulative_metrics
     if state.cumulative_metrics and state.cumulative_metrics.get("samples_seen"):
