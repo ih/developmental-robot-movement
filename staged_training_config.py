@@ -23,21 +23,21 @@ class LRSweepConfig:
     lr_max: float = 1e-2
 
     # Phase A: Broad exploration (many LRs, 1 seed, short budget)
-    phase_a_num_candidates: int = 3
+    phase_a_num_candidates: int = 10
     phase_a_seeds: int = 1
-    phase_a_time_budget_min: float = 1.0  # 3 minutes per trial
-    phase_a_survivor_count: int = 2
+    phase_a_time_budget_min: float = 5.0  # 3 minutes per trial
+    phase_a_survivor_count: int = 5
 
     # Phase B: Deep validation (few LRs, multiple seeds, longer budget)
-    phase_b_seeds: int = 2
-    phase_b_time_budget_min: float = 1.0  # 10 minutes per trial
+    phase_b_seeds: int = 3
+    phase_b_time_budget_min: float = 10.0  # 10 minutes per trial
 
     # Ranking metric for selecting best LR
     ranking_metric: str = "median_best_val"  # "median_best_val", "mean_best_val", "min_best_val"
 
     # Early termination thresholds
-    min_samples_before_timeout: int = 10  # Minimum samples before allowing timeout
-    min_evals_before_stop: int = 2  # Minimum eval intervals before early stop
+    min_samples_before_timeout: int = 1000  # Minimum samples before allowing timeout
+    min_evals_before_stop: int = 10  # Minimum eval intervals before early stop
 
     # Resume support
     save_sweep_state: bool = True  # Save intermediate state for resume
@@ -72,10 +72,10 @@ class StagedTrainingConfig:
 
     # Core training (app defaults)
     total_samples: int = 10000000  # App default (used when stage_samples_multiplier=0)
-    batch_size: int = 12  # App default
+    batch_size: int = 1  # App default
 
     # Dynamic sample budget for staged training
-    stage_samples_multiplier: int = 1000  # total_samples = num_valid_frames * multiplier
+    stage_samples_multiplier: int = 100000  # total_samples = num_valid_frames * multiplier
                                            # 0 = use fixed total_samples instead
     update_interval: int = 500  # App default
     window_size: int = 50  # App default
@@ -124,7 +124,7 @@ class StagedTrainingConfig:
 
     # Baseline comparison
     enable_baseline: bool = False  # Enable baseline (from-scratch) runs for comparison
-    baseline_runs_per_stage: int = 2  # Number of baseline runs per stage
+    baseline_runs_per_stage: int = 3  # Number of baseline runs per stage
 
     # Run identification (set at runtime, saved for reference/reproducibility)
     run_id: Optional[str] = None  # Unique identifier for concurrent execution
@@ -138,7 +138,7 @@ class StagedTrainingConfig:
 
     # Stage-level time budget in minutes (0 = unlimited)
     # Includes both LR sweep and main training time
-    stage_time_budget_min: float = 5
+    stage_time_budget_min: float = 60
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "StagedTrainingConfig":
