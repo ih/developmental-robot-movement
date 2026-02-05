@@ -14,6 +14,7 @@ This repository contains research code for a canvas-based world model that learn
 5. **Autoencoder Concat Predictor World Model** (`autoencoder_concat_predictor_world_model.py`) - Canvas-based world model
 6. **Concat World Model Explorer** (`concat_world_model_explorer/`) - Interactive web-based interface for exploring sessions
 7. **Staged Training** (`staged_training.py`, `staged_training_config.py`, `create_staged_splits.py`) - Automated progressive training pipeline with HTML reports
+8. **Learning Rate Sweep** (`lr_sweep.py`) - Time-budgeted LR optimization with two-phase search (broad exploration + deep validation)
 
 ## Architecture
 
@@ -226,11 +227,24 @@ python create_staged_splits.py --session-path saved/sessions/so101/my_session --
 
 **2. Run Staged Training:**
 ```bash
-# Basic usage
+# Basic usage (LR sweep enabled by default)
 python staged_training.py --root-session saved/sessions/so101/my_session
 
 # Multiple runs per stage for robustness
 python staged_training.py --root-session saved/sessions/so101/my_session --runs-per-stage 3
+
+# With time budget per stage (includes LR sweep + main training)
+python staged_training.py --root-session saved/sessions/so101/my_session --stage-time-budget-min 10
+
+# Custom LR sweep configuration
+python staged_training.py --root-session saved/sessions/so101/my_session \
+    --lr-sweep-phase-a-candidates 5 \
+    --lr-sweep-phase-a-budget-min 2.0 \
+    --lr-sweep-phase-b-seeds 3 \
+    --lr-sweep-phase-b-budget-min 5.0
+
+# Disable baseline comparison
+python staged_training.py --root-session saved/sessions/so101/my_session --disable-baseline
 
 # Custom configuration via YAML
 python staged_training.py --root-session saved/sessions/so101/my_session --config my_config.yaml
@@ -238,18 +252,27 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 
 **Features:**
 - **Progressive training**: Trains on each stage's data until divergence, then moves to next stage
+- **Learning rate sweep**: Automatic LR optimization before each stage with two-phase search
+  - **Phase A**: Broad exploration with many LR candidates, short time budgets
+  - **Phase B**: Deep validation with top survivors, multiple seeds for robust selection
+  - Ranking by median/mean/min best validation loss across seeds
 - **Divergence-based early stopping**: Automatically stops when validation loss diverges from training
 - **EMA-smoothed divergence detection**: Uses exponential moving average of training loss for robust detection
 - **Loss-weighted sampling**: Focuses on high-loss samples for efficient learning
+- **Parallel execution**: Multiple training runs can execute in parallel within a stage
+- **Time budget control**: Optional per-stage time budget including LR sweep and main training
 - **Baseline comparison**: Optionally run parallel baseline training (fresh weights each stage) to compare against staged training (weight carryover)
-- **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, staged vs baseline comparison, and inference visualizations
+- **Progressive reporting**: Final report updated after each stage for real-time progress visibility
+- **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, LR sweep results, staged vs baseline comparison, and inference visualizations
 - **Best checkpoint selection**: Selects best checkpoint based on hybrid loss over original (full) session
 - **W&B integration**: Optional Weights & Biases logging with run_id in run names and baseline config tracking
 
 **Configuration** (`staged_training_config.py`):
 - All parameters match Gradio app defaults
 - Key parameters: `batch_size`, `divergence_patience`, `plateau_factor`, `loss_weight_temperature`
-- Baseline config: `enable_baseline` (default True), `baseline_runs_per_stage` (default 2)
+- LR Sweep config: `lr_sweep.enabled`, `lr_sweep.lr_min`, `lr_sweep.lr_max`, `lr_sweep.phase_a_num_candidates`, `lr_sweep.phase_a_time_budget_min`, `lr_sweep.phase_b_seeds`, `lr_sweep.phase_b_time_budget_min`
+- Baseline config: `enable_baseline` (default False), `baseline_runs_per_stage` (default 2)
+- Stage time budget: `stage_time_budget_min` (0 = unlimited)
 - Supports YAML config files for reproducible experiments
 
 **Reports:**
@@ -301,11 +324,18 @@ Required Python packages:
   - Divergence-based early stopping with EMA-smoothed training loss
   - Best checkpoint selection based on original session loss
   - Baseline comparison training (fresh weights each stage) for comparing against staged (weight carryover)
+  - Integrated LR sweep before each stage with parallel execution support
   - Comprehensive HTML reports with training progress, staged vs baseline comparison, and inference visualizations
 - `staged_training_config.py`: Dataclass configuration for staged training runs
   - All parameters match Gradio app defaults
   - Baseline config: `enable_baseline`, `baseline_runs_per_stage`
+  - LRSweepConfig nested config for LR sweep parameters
   - YAML serialization support for reproducible experiments
+- `lr_sweep.py`: Time-budgeted learning rate optimization module
+  - Two-phase search: Phase A (broad exploration) and Phase B (deep validation)
+  - Parallel trial execution with multiprocessing
+  - Data structures: `LRTrialResult`, `LRAggregatedResult`, `LRSweepPhaseResult`, `LRSweepStageResult`, `StageTiming`
+  - Resume support for interrupted sweeps
 - `create_staged_splits.py`: Utility to create progressive train/validation splits from a session
   - Doubling data size at each stage (10, 20, 40, 80, ...)
   - Configurable train/validation ratio (default 70/30)

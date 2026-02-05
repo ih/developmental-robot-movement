@@ -70,6 +70,16 @@ from models.autoencoder_concat_predictor import (
     compute_randomized_patch_mask_for_last_slot_gpu,
     compute_hybrid_loss_on_masked_patches,
 )
+from lr_sweep import (
+    LRTrialResult,
+    LRAggregatedResult,
+    LRSweepPhaseResult,
+    LRSweepStageResult,
+    StageTiming,
+    format_duration,
+    run_lr_sweep_for_stage,
+    run_main_training_parallel,
+)
 
 
 @dataclass
@@ -320,6 +330,7 @@ def run_stage_training(
     output_dir: Path,
     is_baseline: bool = False,
     run_id: str = "",
+    time_budget_min: float = 0,
 ) -> StageResult:
     """
     Run training for a single stage.
@@ -334,6 +345,7 @@ def run_stage_training(
         output_dir: Output directory for this run
         is_baseline: True for baseline runs (fresh weights), False for staged
         run_id: Unique identifier for this training run (used in W&B run name)
+        time_budget_min: Time budget in minutes (0 = unlimited)
 
     Returns:
         StageResult with training outcomes
@@ -439,6 +451,9 @@ def run_stage_training(
             is_baseline_run=is_baseline,
             enable_baseline=cfg.enable_baseline,
             baseline_runs_per_stage=cfg.baseline_runs_per_stage,
+            # Time budget for LR sweep
+            time_budget_min=time_budget_min,
+            min_samples_for_timeout=cfg.lr_sweep.min_samples_before_timeout if hasattr(cfg, 'lr_sweep') else 1000,
         )
 
         # Consume generator and collect results
@@ -655,6 +670,12 @@ def generate_stage_report(
 ) -> None:
     """Generate HTML report for a stage run."""
     print(f"\nGenerating stage {result.stage_num} run {result.run_num} report...")
+
+    # Check for valid checkpoint path
+    if not result.best_checkpoint_path:
+        print(f"  WARNING: No checkpoint available for run {result.run_num} (stop_reason: {result.stop_reason})")
+        print(f"  Skipping report generation for this run.")
+        return
 
     # Create assets directory
     assets_dir = output_dir / "assets"
@@ -874,7 +895,7 @@ def generate_stage_html(
         <h2>Best Checkpoint</h2>
         <div class="metric">
             <strong>Name:</strong> {Path(result.best_checkpoint_path).name}<br>
-            <strong>Hybrid Loss:</strong> {result.best_loss:.6f}
+            <strong>Hybrid Loss:</strong> {format_loss_safe(result.best_loss)}
         </div>
     </section>
 
@@ -960,57 +981,189 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def format_loss_safe(value: float, default: str = "N/A", signed: bool = False) -> str:
+    """Format loss value, handling inf/nan gracefully.
+
+    Args:
+        value: The loss value to format
+        default: Default string to return for inf/nan/None values
+        signed: If True, prefix positive values with '+'
+    """
+    import math
+    if value is None or math.isinf(value) or math.isnan(value):
+        return default
+    if signed and value >= 0:
+        return f"+{value:.6f}"
+    return f"{value:.6f}"
+
+
 def generate_final_report(
-    staged_results: list[tuple[int, StageResult]],
-    baseline_results: Optional[list[tuple[int, StageResult]]],
-    original_session: dict,
+    completed_stages: list[tuple[int, StageResult, Optional[StageResult]]],
+    all_sweep_results: list,
+    all_timings: list,
     output_dir: Path,
+    run_id: str,
+    overall_start_time: float,
+    original_session: Optional[dict],
     cfg: StagedTrainingConfig,
-) -> None:
-    """Generate final summary HTML report."""
-    print("\n" + "=" * 60)
-    print("Generating Final Summary Report")
-    print("=" * 60)
+    is_final: bool = False,
+) -> str:
+    """
+    Generate unified final report (updated progressively after each stage).
 
-    # Calculate totals
-    total_time = sum(r.elapsed_time for _, r in staged_results)
-    if baseline_results:
-        total_time += sum(r.elapsed_time for _, r in baseline_results)
+    This function combines timing/LR sweep info (available immediately) with
+    evaluation/inference data (available only at the end).
 
-    # Evaluate each stage's STAGED checkpoint on the original session
-    # This determines the true best checkpoint and provides loss graphs
-    print("Evaluating staged checkpoints on original session...")
-    stage_original_evals = []  # List of (stage_num, result, orig_loss, loss_fig_b64)
+    Args:
+        completed_stages: List of (stage_num, staged_result, baseline_result) tuples
+        all_sweep_results: List of LRSweepStageResult
+        all_timings: List of StageTiming
+        output_dir: Output directory
+        run_id: Run identifier
+        overall_start_time: Start time of entire training run
+        original_session: Original session for evaluation (optional until final)
+        cfg: Training configuration
+        is_final: True if this is the final call (triggers inference generation)
 
-    for stage_num, result in staged_results:
-        print(f"  Evaluating stage {stage_num}...")
-        setup_world_model(original_session, result.best_checkpoint_path, cfg)
-        fig_loss, fig_dist, stats = evaluate_session_with_checkpoint(
-            result.best_checkpoint_path, original_session
-        )
-        orig_loss = stats.get("hybrid", {}).get("mean", float("inf"))
-        loss_fig_b64 = fig_to_base64(fig_loss) if fig_loss else ""
-        if fig_loss:
-            plt.close(fig_loss)
-        if fig_dist:
-            plt.close(fig_dist)
-        stage_original_evals.append((stage_num, result, orig_loss, loss_fig_b64))
-        print(f"    Original session hybrid loss: {orig_loss:.6f}")
+    Returns:
+        Path to generated report
+    """
+    report_path = output_dir / "final_report.html"
 
-    # Find best staged checkpoint based on original session loss (not training loss)
-    best_eval = min(stage_original_evals, key=lambda x: x[2])
-    best_stage, best_run_result, best_orig_loss, _ = best_eval
-    print(f"Best staged checkpoint: Stage {best_stage} with original session loss {best_orig_loss:.6f}")
+    # Calculate total elapsed time
+    total_elapsed = time.time() - overall_start_time
 
-    # Evaluate BASELINE checkpoints on original session (if baseline was run)
-    baseline_original_evals = []  # List of (stage_num, result, orig_loss, loss_fig_b64)
-    comparisons = []  # List of StageComparison
-    comparison_plot_b64 = ""
+    # Build timing summary table
+    timing_rows = ""
+    for timing in all_timings:
+        timing_rows += f"""
+        <tr>
+            <td>Stage {timing.stage_num}</td>
+            <td>{format_duration(timing.lr_sweep_phase_a_sec)}</td>
+            <td>{format_duration(timing.lr_sweep_phase_b_sec)}</td>
+            <td>{format_duration(timing.lr_sweep_total_sec)}</td>
+            <td>{format_duration(timing.main_training_sec)}</td>
+            <td>{format_duration(timing.total_stage_sec)}</td>
+        </tr>
+        """
 
-    if baseline_results:
-        print("\nEvaluating baseline checkpoints on original session...")
-        for stage_num, result in baseline_results:
-            print(f"  Evaluating baseline stage {stage_num}...")
+    # Total row
+    total_phase_a = sum(t.lr_sweep_phase_a_sec for t in all_timings)
+    total_phase_b = sum(t.lr_sweep_phase_b_sec for t in all_timings)
+    total_sweep = sum(t.lr_sweep_total_sec for t in all_timings)
+    total_main = sum(t.main_training_sec for t in all_timings)
+    total_stage = sum(t.total_stage_sec for t in all_timings)
+
+    timing_rows += f"""
+    <tr style="background: #e0e0e0; font-weight: bold;">
+        <td>TOTAL</td>
+        <td>{format_duration(total_phase_a)}</td>
+        <td>{format_duration(total_phase_b)}</td>
+        <td>{format_duration(total_sweep)}</td>
+        <td>{format_duration(total_main)}</td>
+        <td>{format_duration(total_stage)}</td>
+    </tr>
+    """
+
+    # Build detailed LR sweep tables
+    lr_details_html = ""
+    for sweep in all_sweep_results:
+        # Phase A table
+        phase_a_rows = ""
+        for agg in sorted(sweep.phase_a.lr_results, key=lambda r: r.median_best_val):
+            survivor = "✓" if agg.lr in sweep.phase_a.survivors else ""
+            phase_a_rows += f"""
+            <tr>
+                <td>{agg.lr:.2e}</td>
+                <td>{format_loss_safe(agg.median_best_val)}</td>
+                <td>{format_loss_safe(agg.mean_best_val)}</td>
+                <td>±{format_loss_safe(agg.std_best_val)}</td>
+                <td>{agg.num_seeds}</td>
+                <td style="text-align: center;">{survivor}</td>
+            </tr>
+            """
+
+        # Phase B table
+        phase_b_rows = ""
+        for agg in sorted(sweep.phase_b.lr_results, key=lambda r: r.median_best_val):
+            winner = "★" if agg.lr == sweep.selected_lr else ""
+            phase_b_rows += f"""
+            <tr>
+                <td>{agg.lr:.2e}</td>
+                <td>{format_loss_safe(agg.median_best_val)}</td>
+                <td>{format_loss_safe(agg.mean_best_val)}</td>
+                <td>±{format_loss_safe(agg.std_best_val)}</td>
+                <td>{agg.num_seeds}</td>
+                <td style="text-align: center;">{winner}</td>
+            </tr>
+            """
+
+        lr_details_html += f"""
+        <h3>Stage {sweep.stage_num} LR Sweep</h3>
+        <p><strong>Selected LR:</strong> {sweep.selected_lr:.2e}</p>
+        <h4>Phase A: {len(sweep.phase_a.lr_results)} candidates → {len(sweep.phase_a.survivors)} survivors</h4>
+        <table>
+            <tr>
+                <th>Learning Rate</th>
+                <th>Median Loss</th>
+                <th>Mean Loss</th>
+                <th>Std Dev</th>
+                <th>Seeds</th>
+                <th>Survivor</th>
+            </tr>
+            {phase_a_rows}
+        </table>
+        <h4>Phase B: {len(sweep.phase_b.lr_results)} candidates</h4>
+        <table>
+            <tr>
+                <th>Learning Rate</th>
+                <th>Median Loss</th>
+                <th>Mean Loss</th>
+                <th>Std Dev</th>
+                <th>Seeds</th>
+                <th>Winner</th>
+            </tr>
+            {phase_b_rows}
+        </table>
+        """
+
+    # Build basic stage results table (always available)
+    stage_results_rows = ""
+    for stage_num, staged, baseline in completed_stages:
+        stage_results_rows += f"""
+        <tr>
+            <td>Stage {stage_num}</td>
+            <td>{format_loss_safe(staged.best_loss)}</td>
+            <td>{staged.stop_reason}</td>
+            <td>{staged.total_samples_trained:,}</td>
+            <td>{format_duration(staged.elapsed_time)}</td>
+        </tr>
+        """
+
+    # === Sections that require original_session evaluation (only on final call) ===
+    best_checkpoint_html = ""
+    stage_progression_html = ""
+    comparison_html = ""
+    sample_counts_html = ""
+    hybrid_loss_html = ""
+    inference_html = ""
+    stage_links_html = ""
+
+    if is_final and original_session:
+        print("\n" + "=" * 60)
+        print("Generating Final Summary Report")
+        print("=" * 60)
+
+        # Convert completed_stages to list of tuples for evaluation
+        staged_results = [(stage_num, staged) for stage_num, staged, _ in completed_stages]
+        baseline_results = [(stage_num, baseline) for stage_num, _, baseline in completed_stages if baseline]
+
+        # Evaluate each stage's STAGED checkpoint on the original session
+        print("Evaluating staged checkpoints on original session...")
+        stage_original_evals = []  # List of (stage_num, result, orig_loss, loss_fig_b64)
+
+        for stage_num, result in staged_results:
+            print(f"  Evaluating stage {stage_num}...")
             setup_world_model(original_session, result.best_checkpoint_path, cfg)
             fig_loss, fig_dist, stats = evaluate_session_with_checkpoint(
                 result.best_checkpoint_path, original_session
@@ -1021,224 +1174,202 @@ def generate_final_report(
                 plt.close(fig_loss)
             if fig_dist:
                 plt.close(fig_dist)
-            baseline_original_evals.append((stage_num, result, orig_loss, loss_fig_b64))
+            stage_original_evals.append((stage_num, result, orig_loss, loss_fig_b64))
             print(f"    Original session hybrid loss: {orig_loss:.6f}")
 
-        # Find best baseline checkpoint
-        best_baseline_eval = min(baseline_original_evals, key=lambda x: x[2])
-        best_baseline_stage, best_baseline_result, best_baseline_orig_loss, _ = best_baseline_eval
-        print(f"Best baseline checkpoint: Stage {best_baseline_stage} with original session loss {best_baseline_orig_loss:.6f}")
+        # Find best staged checkpoint based on original session loss
+        best_eval = min(stage_original_evals, key=lambda x: x[2])
+        best_stage, best_run_result, best_orig_loss, _ = best_eval
+        print(f"Best staged checkpoint: Stage {best_stage} with original session loss {best_orig_loss:.6f}")
 
-        # Compute comparisons for each stage
-        for (staged_stage, staged_result, staged_loss, _), (baseline_stage, baseline_result, baseline_loss, _) in zip(
-            stage_original_evals, baseline_original_evals
-        ):
-            comparison = compute_stage_comparison(
-                staged_result, baseline_result, staged_loss, baseline_loss
-            )
-            comparisons.append(comparison)
+        # Evaluate BASELINE checkpoints on original session (if baseline was run)
+        baseline_original_evals = []
+        comparisons = []
+        comparison_plot_b64 = ""
 
-        # Create comparison progression plot
-        fig_comparison = create_staged_vs_baseline_plot(stage_original_evals, baseline_original_evals)
-        comparison_plot_b64 = fig_to_base64(fig_comparison)
-        plt.close(fig_comparison)
+        if baseline_results:
+            print("\nEvaluating baseline checkpoints on original session...")
+            for stage_num, result in baseline_results:
+                print(f"  Evaluating baseline stage {stage_num}...")
+                setup_world_model(original_session, result.best_checkpoint_path, cfg)
+                fig_loss, fig_dist, stats = evaluate_session_with_checkpoint(
+                    result.best_checkpoint_path, original_session
+                )
+                orig_loss = stats.get("hybrid", {}).get("mean", float("inf"))
+                loss_fig_b64 = fig_to_base64(fig_loss) if fig_loss else ""
+                if fig_loss:
+                    plt.close(fig_loss)
+                if fig_dist:
+                    plt.close(fig_dist)
+                baseline_original_evals.append((stage_num, result, orig_loss, loss_fig_b64))
+                print(f"    Original session hybrid loss: {orig_loss:.6f}")
 
-    # Create stage progression plot using original session losses
-    fig_progression, ax = plt.subplots(figsize=(10, 6))
-    stages = [s for s, _, _, _ in stage_original_evals]
-    orig_losses = [loss for _, _, loss, _ in stage_original_evals]
-    ax.plot(stages, orig_losses, "o-", linewidth=2, markersize=8, label="Staged (weight carryover)")
-    if baseline_original_evals:
-        baseline_losses = [loss for _, _, loss, _ in baseline_original_evals]
-        ax.plot(stages, baseline_losses, "s--", linewidth=2, markersize=8, label="Baseline (fresh each stage)")
-    ax.set_xlabel("Stage")
-    ax.set_ylabel("Hybrid Loss (Original Session)")
-    ax.set_title("Stage Progression: Loss on Original Session")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    progression_b64 = fig_to_base64(fig_progression)
+            # Find best baseline checkpoint
+            best_baseline_eval = min(baseline_original_evals, key=lambda x: x[2])
+            best_baseline_stage, best_baseline_result, best_baseline_orig_loss, _ = best_baseline_eval
+            print(f"Best baseline checkpoint: Stage {best_baseline_stage} with original session loss {best_baseline_orig_loss:.6f}")
 
-    # Generate learning rate graph for best stage
-    lr_b64 = ""
-    if best_run_result.cumulative_metrics.get("lr_at_sample"):
-        fig_lr = visualization.create_lr_vs_samples_plot(best_run_result.cumulative_metrics)
-        if fig_lr:
-            lr_b64 = fig_to_base64(fig_lr)
-            plt.close(fig_lr)
+            # Compute comparisons for each stage
+            for (staged_stage, staged_result, staged_loss, _), (baseline_stage, baseline_result, baseline_loss, _) in zip(
+                stage_original_evals, baseline_original_evals
+            ):
+                comparison = compute_stage_comparison(
+                    staged_result, baseline_result, staged_loss, baseline_loss
+                )
+                comparisons.append(comparison)
 
-    # Generate inference for best checkpoint
-    print("Generating inference for best checkpoint...")
-    inference_dir = output_dir / "best_inference"
-    inference_dir.mkdir(exist_ok=True)
+            # Create comparison progression plot
+            fig_comparison = create_staged_vs_baseline_plot(stage_original_evals, baseline_original_evals)
+            comparison_plot_b64 = fig_to_base64(fig_comparison)
+            plt.close(fig_comparison)
 
-    selected_frame = cfg.selected_frame_offset
-    selected_images = generate_counterfactual_images(
-        original_session, selected_frame, inference_dir, "best_selected"
-    )
+        # Best checkpoint section
+        best_checkpoint_html = f"""
+    <section id="best-checkpoint">
+        <h2>Best Checkpoint</h2>
+        <div class="metric">
+            <strong>Name:</strong> {Path(best_run_result.best_checkpoint_path).name}<br>
+            <strong>Stage:</strong> {best_stage}<br>
+            <strong>Hybrid Loss (full session):</strong> {format_loss_safe(best_orig_loss)}
+        </div>
+    </section>
+"""
 
-    min_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
-    valid_indices = list(range(min_frames - 1, len(original_session["observations"])))
-    random_indices = random.sample(valid_indices, min(cfg.num_random_obs_to_visualize, len(valid_indices)))
+        # Learning rate graph for best stage
+        lr_b64 = ""
+        if best_run_result.cumulative_metrics.get("lr_at_sample"):
+            fig_lr = visualization.create_lr_vs_samples_plot(best_run_result.cumulative_metrics)
+            if fig_lr:
+                lr_b64 = fig_to_base64(fig_lr)
+                plt.close(fig_lr)
 
-    random_images = {}
-    for idx in random_indices:
-        imgs = generate_counterfactual_images(original_session, idx, inference_dir, f"best_obs_{idx}")
-        random_images[idx] = imgs
+        lr_schedule_html = f"""
+    <section id="learning-rate">
+        <h2>Learning Rate Schedule (Best Stage)</h2>
+        {'<img src="data:image/png;base64,' + lr_b64 + '" />' if lr_b64 else "<p>No learning rate data available</p>"}
+    </section>
+""" if lr_b64 else ""
 
-    # Build stage table with original session loss
-    stage_rows = ""
-    for stage_num, result, orig_loss, _ in stage_original_evals:
-        is_best = stage_num == best_stage
-        row_style = ' style="background: #e8f5e9; font-weight: bold;"' if is_best else ''
-        best_marker = " ⭐" if is_best else ""
-        stage_rows += f"""
+        # Stage progression with original session losses
+        fig_progression, ax = plt.subplots(figsize=(10, 6))
+        stages = [s for s, _, _, _ in stage_original_evals]
+        orig_losses = [loss for _, _, loss, _ in stage_original_evals]
+        ax.plot(stages, orig_losses, "o-", linewidth=2, markersize=8, label="Staged (weight carryover)")
+        if baseline_original_evals:
+            baseline_losses = [loss for _, _, loss, _ in baseline_original_evals]
+            ax.plot(stages, baseline_losses, "s--", linewidth=2, markersize=8, label="Baseline (fresh each stage)")
+        ax.set_xlabel("Stage")
+        ax.set_ylabel("Hybrid Loss (Original Session)")
+        ax.set_title("Stage Progression: Loss on Original Session")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        progression_b64 = fig_to_base64(fig_progression)
+
+        # Build stage table with original session loss
+        stage_progression_rows = ""
+        for stage_num, result, orig_loss, _ in stage_original_evals:
+            is_best = stage_num == best_stage
+            row_style = ' style="background: #e8f5e9; font-weight: bold;"' if is_best else ''
+            best_marker = " ⭐" if is_best else ""
+            stage_progression_rows += f"""
         <tr{row_style}>
             <td>{stage_num}{best_marker}</td>
-            <td>{orig_loss:.6f}</td>
-            <td>{result.best_loss:.6f}</td>
+            <td>{format_loss_safe(orig_loss)}</td>
+            <td>{format_loss_safe(result.best_loss)}</td>
             <td>{format_duration(result.elapsed_time)}</td>
             <td>{result.total_samples_trained}</td>
             <td>{result.stop_reason}</td>
         </tr>"""
 
-    # Build stage loss graphs section
-    stage_loss_graphs_html = ""
-    for stage_num, result, orig_loss, loss_fig_b64 in stage_original_evals:
-        if loss_fig_b64:
-            is_best = stage_num == best_stage
-            best_label = " (Best)" if is_best else ""
-            stage_loss_graphs_html += f"""
+        # Build stage loss graphs section
+        stage_loss_graphs_html = ""
+        for stage_num, result, orig_loss, loss_fig_b64 in stage_original_evals:
+            if loss_fig_b64:
+                is_best = stage_num == best_stage
+                best_label = " (Best)" if is_best else ""
+                stage_loss_graphs_html += f"""
             <div class="stage-loss-graph">
-                <h4>Stage {stage_num}{best_label} - Hybrid Loss: {orig_loss:.6f}</h4>
+                <h4>Stage {stage_num}{best_label} - Hybrid Loss: {format_loss_safe(orig_loss)}</h4>
                 <img src="data:image/png;base64,{loss_fig_b64}" />
             </div>"""
 
-    # Build cumulative sample counts across all stages
-    cumulative_sample_counts: dict[int, int] = {}
-    for stage_num, result, orig_loss, _ in stage_original_evals:
-        stage_counts = result.cumulative_metrics.get("sample_seen_counts", {})
-        for frame_idx, count in stage_counts.items():
-            cumulative_sample_counts[frame_idx] = cumulative_sample_counts.get(frame_idx, 0) + count
+        stage_progression_html = f"""
+    <section id="stage-progression">
+        <h2>Stage Progression</h2>
+        <img src="data:image/png;base64,{progression_b64}" />
+        <table>
+            <tr>
+                <th>Stage</th>
+                <th>Orig Loss</th>
+                <th>Train Loss</th>
+                <th>Time</th>
+                <th>Samples</th>
+                <th>Stop Reason</th>
+            </tr>
+            {stage_progression_rows}
+        </table>
+        <h3>Hybrid Loss Over Original Session (per Stage)</h3>
+        <div class="stage-loss-graphs">
+            {stage_loss_graphs_html if stage_loss_graphs_html else "<p>No loss graphs available</p>"}
+        </div>
+    </section>
+"""
 
-    # Generate cumulative sample counts plot
-    cumulative_counts_b64 = ""
-    if cumulative_sample_counts:
-        fig_cumulative = visualization.create_sample_counts_plot(
-            cumulative_sample_counts, title="Cumulative Sample Counts (All Stages)"
-        )
-        if fig_cumulative:
-            cumulative_counts_b64 = fig_to_base64(fig_cumulative)
-            plt.close(fig_cumulative)
+        # Comparison section (if baseline)
+        if comparisons:
+            stages_won_staged = sum(1 for c in comparisons if c.improvement_absolute > 0)
+            stages_won_baseline = sum(1 for c in comparisons if c.improvement_absolute < 0)
+            avg_improvement_ratio = sum(c.improvement_ratio for c in comparisons) / len(comparisons)
+            avg_improvement_absolute = sum(c.improvement_absolute for c in comparisons) / len(comparisons)
 
-    # Build per-stage sample counts graphs section
-    stage_counts_graphs_html = ""
-    for stage_num, result, orig_loss, _ in stage_original_evals:
-        stage_counts = result.cumulative_metrics.get("sample_seen_counts", {})
-        if stage_counts:
-            is_best = stage_num == best_stage
-            best_label = " (Best)" if is_best else ""
-            fig_stage_counts = visualization.create_sample_counts_plot(
-                stage_counts, title=f"Stage {stage_num}{best_label} Sample Counts"
-            )
-            if fig_stage_counts:
-                counts_b64 = fig_to_base64(fig_stage_counts)
-                plt.close(fig_stage_counts)
-                total_samples = sum(stage_counts.values())
-                stage_counts_graphs_html += f"""
-            <div class="stage-loss-graph">
-                <h4>Stage {stage_num}{best_label} - Total Samples: {total_samples:,}</h4>
-                <img src="data:image/png;base64,{counts_b64}" />
-            </div>"""
-
-    # Build inference HTML
-    selected_html = ""
-    for action, b64 in selected_images:
-        if b64:
-            selected_html += f'<div class="inference-item"><h4>Action {action}</h4><img src="data:image/png;base64,{b64}" /></div>'
-
-    random_html = ""
-    for idx, imgs in random_images.items():
-        random_html += f'<div class="obs-group"><h4>Observation {idx}</h4><div class="inference-row">'
-        for action, b64 in imgs:
-            if b64:
-                random_html += f'<div class="inference-item"><span>Action {action}</span><img src="data:image/png;base64,{b64}" /></div>'
-        random_html += '</div></div>'
-
-    # Stage report links
-    stage_links = ""
-    for stage_num, result, orig_loss, _ in stage_original_evals:
-        stage_dir = f"stage{stage_num}_run{result.run_num}"
-        is_best = stage_num == best_stage
-        best_marker = " ⭐" if is_best else ""
-        stage_links += f'<li><a href="{stage_dir}/report.html">Stage {stage_num} Run {result.run_num} (Staged)</a> (orig loss: {orig_loss:.6f}){best_marker}</li>'
-
-    # Add baseline report links if available
-    if baseline_original_evals:
-        stage_links += '<li style="margin-top: 10px;"><strong>Baseline Reports:</strong></li>'
-        for stage_num, result, orig_loss, _ in baseline_original_evals:
-            stage_dir = f"stage{stage_num}_baseline_run{result.run_num}"
-            stage_links += f'<li style="margin-left: 20px;"><a href="{stage_dir}/report.html">Stage {stage_num} Run {result.run_num} (Baseline)</a> (orig loss: {orig_loss:.6f})</li>'
-
-    # Build comparison section HTML
-    comparison_html = ""
-    if comparisons:
-        # Calculate summary statistics
-        stages_won_staged = sum(1 for c in comparisons if c.improvement_absolute > 0)
-        stages_won_baseline = sum(1 for c in comparisons if c.improvement_absolute < 0)
-        stages_tied = sum(1 for c in comparisons if c.improvement_absolute == 0)
-        avg_improvement_ratio = sum(c.improvement_ratio for c in comparisons) / len(comparisons)
-        avg_improvement_absolute = sum(c.improvement_absolute for c in comparisons) / len(comparisons)
-
-        if stages_won_staged > stages_won_baseline:
-            winner = "Staged Training"
-            winner_color = "#4CAF50"
-        elif stages_won_baseline > stages_won_staged:
-            winner = "Baseline Training"
-            winner_color = "#2196F3"
-        else:
-            winner = "Tie"
-            winner_color = "#9E9E9E"
-
-        # Build comparison table rows
-        comparison_rows = ""
-        for c in comparisons:
-            if c.improvement_absolute > 0:
-                stage_winner = "Staged"
-                winner_style = 'style="color: #4CAF50; font-weight: bold;"'
-            elif c.improvement_absolute < 0:
-                stage_winner = "Baseline"
-                winner_style = 'style="color: #2196F3; font-weight: bold;"'
+            if stages_won_staged > stages_won_baseline:
+                winner = "Staged Training"
+                winner_color = "#4CAF50"
+            elif stages_won_baseline > stages_won_staged:
+                winner = "Baseline Training"
+                winner_color = "#2196F3"
             else:
-                stage_winner = "Tie"
-                winner_style = 'style="color: #9E9E9E;"'
+                winner = "Tie"
+                winner_color = "#9E9E9E"
 
-            comparison_rows += f"""
+            comparison_rows = ""
+            for c in comparisons:
+                if c.improvement_absolute > 0:
+                    stage_winner = "Staged"
+                    winner_style = 'style="color: #4CAF50; font-weight: bold;"'
+                elif c.improvement_absolute < 0:
+                    stage_winner = "Baseline"
+                    winner_style = 'style="color: #2196F3; font-weight: bold;"'
+                else:
+                    stage_winner = "Tie"
+                    winner_style = 'style="color: #9E9E9E;"'
+
+                comparison_rows += f"""
             <tr>
                 <td>{c.stage_num}</td>
-                <td>{c.staged_orig_loss:.6f}</td>
-                <td>{c.baseline_orig_loss:.6f}</td>
-                <td>{c.improvement_absolute:+.6f}</td>
+                <td>{format_loss_safe(c.staged_orig_loss)}</td>
+                <td>{format_loss_safe(c.baseline_orig_loss)}</td>
+                <td>{format_loss_safe(c.improvement_absolute, "N/A", signed=True)}</td>
                 <td>{c.improvement_ratio:.3f}</td>
                 <td>{c.staged_samples_trained:,}</td>
                 <td>{c.baseline_samples_trained:,}</td>
                 <td {winner_style}>{stage_winner}</td>
             </tr>"""
 
-        comparison_html = f"""
+            avg_improvement_abs_str = format_loss_safe(avg_improvement_absolute, "N/A", signed=True)
+
+            comparison_html = f"""
     <section id="staged-vs-baseline">
         <h2>Staged vs Baseline Comparison</h2>
-
         <div class="metric" style="background: #f0f7ff;">
             <strong>Overall Winner:</strong> <span style="color: {winner_color}; font-weight: bold;">{winner}</span><br>
             <strong>Stages Won (Staged):</strong> {stages_won_staged}<br>
             <strong>Stages Won (Baseline):</strong> {stages_won_baseline}<br>
             <strong>Average Improvement Ratio:</strong> {avg_improvement_ratio:.3f} (>1 = staged better)<br>
-            <strong>Average Improvement:</strong> {avg_improvement_absolute:+.6f} (positive = staged better)
+            <strong>Average Improvement:</strong> {avg_improvement_abs_str} (positive = staged better)
         </div>
-
         <h3>Progression Comparison</h3>
         <img src="data:image/png;base64,{comparison_plot_b64}" />
-
         <h3>Per-Stage Comparison</h3>
         <table>
             <tr>
@@ -1256,15 +1387,217 @@ def generate_final_report(
     </section>
 """
 
-    html = f"""<!DOCTYPE html>
+        # Sample counts section
+        cumulative_sample_counts: dict[int, int] = {}
+        for stage_num, result, orig_loss, _ in stage_original_evals:
+            stage_counts = result.cumulative_metrics.get("sample_seen_counts", {})
+            for frame_idx, count in stage_counts.items():
+                cumulative_sample_counts[frame_idx] = cumulative_sample_counts.get(frame_idx, 0) + count
+
+        cumulative_counts_b64 = ""
+        if cumulative_sample_counts:
+            fig_cumulative = visualization.create_sample_counts_plot(
+                cumulative_sample_counts, title="Cumulative Sample Counts (All Stages)"
+            )
+            if fig_cumulative:
+                cumulative_counts_b64 = fig_to_base64(fig_cumulative)
+                plt.close(fig_cumulative)
+
+        stage_counts_graphs_html = ""
+        for stage_num, result, orig_loss, _ in stage_original_evals:
+            stage_counts = result.cumulative_metrics.get("sample_seen_counts", {})
+            if stage_counts:
+                is_best = stage_num == best_stage
+                best_label = " (Best)" if is_best else ""
+                fig_stage_counts = visualization.create_sample_counts_plot(
+                    stage_counts, title=f"Stage {stage_num}{best_label} Sample Counts"
+                )
+                if fig_stage_counts:
+                    counts_b64 = fig_to_base64(fig_stage_counts)
+                    plt.close(fig_stage_counts)
+                    total_samples = sum(stage_counts.values())
+                    stage_counts_graphs_html += f"""
+            <div class="stage-loss-graph">
+                <h4>Stage {stage_num}{best_label} - Total Samples: {total_samples:,}</h4>
+                <img src="data:image/png;base64,{counts_b64}" />
+            </div>"""
+
+        sample_counts_html = f"""
+    <section id="sample-counts">
+        <h2>Sample Counts</h2>
+        <h3>Cumulative Across All Stages</h3>
+        {'<img src="data:image/png;base64,' + cumulative_counts_b64 + '" />' if cumulative_counts_b64 else "<p>No cumulative sample count data available</p>"}
+        <h3>Per Stage</h3>
+        <div class="stage-loss-graphs">
+            {stage_counts_graphs_html if stage_counts_graphs_html else "<p>No per-stage sample count graphs available</p>"}
+        </div>
+    </section>
+"""
+
+        # Inference section
+        print("Generating inference for best checkpoint...")
+        inference_dir = output_dir / "best_inference"
+        inference_dir.mkdir(exist_ok=True)
+
+        selected_frame = cfg.selected_frame_offset
+        selected_images = generate_counterfactual_images(
+            original_session, selected_frame, inference_dir, "best_selected"
+        )
+
+        min_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+        valid_indices = list(range(min_frames - 1, len(original_session["observations"])))
+        random_indices = random.sample(valid_indices, min(cfg.num_random_obs_to_visualize, len(valid_indices)))
+
+        random_images = {}
+        for idx in random_indices:
+            imgs = generate_counterfactual_images(original_session, idx, inference_dir, f"best_obs_{idx}")
+            random_images[idx] = imgs
+
+        selected_html = ""
+        for action, b64 in selected_images:
+            if b64:
+                selected_html += f'<div class="inference-item"><h4>Action {action}</h4><img src="data:image/png;base64,{b64}" /></div>'
+
+        random_html = ""
+        for idx, imgs in random_images.items():
+            random_html += f'<div class="obs-group"><h4>Observation {idx}</h4><div class="inference-row">'
+            for action, b64 in imgs:
+                if b64:
+                    random_html += f'<div class="inference-item"><span>Action {action}</span><img src="data:image/png;base64,{b64}" /></div>'
+            random_html += '</div></div>'
+
+        inference_html = f"""
+    <section id="best-inference">
+        <h2>Best Checkpoint Inference</h2>
+        <h3>Selected Frame {selected_frame}</h3>
+        <div class="inference-row">
+            {selected_html if selected_html else "<p>No inference images available</p>"}
+        </div>
+        <h3>Random Observations</h3>
+        {random_html if random_html else "<p>No random observation images available</p>"}
+    </section>
+"""
+
+        # Stage report links
+        stage_links = ""
+        for stage_num, result, orig_loss, _ in stage_original_evals:
+            stage_dir = f"stage{stage_num}_run{result.run_num}"
+            is_best = stage_num == best_stage
+            best_marker = " ⭐" if is_best else ""
+            stage_links += f'<li><a href="{stage_dir}/report.html">Stage {stage_num} Run {result.run_num} (Staged)</a> (orig loss: {format_loss_safe(orig_loss)}){best_marker}</li>'
+
+        if baseline_original_evals:
+            stage_links += '<li style="margin-top: 10px;"><strong>Baseline Reports:</strong></li>'
+            for stage_num, result, orig_loss, _ in baseline_original_evals:
+                stage_dir = f"stage{stage_num}_baseline_run{result.run_num}"
+                stage_links += f'<li style="margin-left: 20px;"><a href="{stage_dir}/report.html">Stage {stage_num} Run {result.run_num} (Baseline)</a> (orig loss: {format_loss_safe(orig_loss)})</li>'
+
+        stage_links_html = f"""
+    <section id="stage-links">
+        <h2>Individual Stage Reports</h2>
+        <ul>
+            {stage_links}
+        </ul>
+    </section>
+"""
+
+        # Save summary JSON
+        summary = {
+            "total_time_seconds": total_elapsed,
+            "staged": {
+                "best_checkpoint": best_run_result.best_checkpoint_path,
+                "best_stage": best_stage,
+                "best_loss_original": best_orig_loss,
+                "stages": [
+                    {
+                        "stage": stage_num,
+                        "original_loss": orig_loss,
+                        "train_loss": result.best_loss,
+                        "time": result.elapsed_time,
+                        "samples": result.total_samples_trained,
+                        "stop_reason": result.stop_reason,
+                        "checkpoint": result.best_checkpoint_path,
+                    }
+                    for stage_num, result, orig_loss, _ in stage_original_evals
+                ],
+            },
+        }
+
+        if baseline_original_evals:
+            best_baseline_eval = min(baseline_original_evals, key=lambda x: x[2])
+            best_baseline_stage, best_baseline_result, best_baseline_orig_loss, _ = best_baseline_eval
+
+            summary["baseline"] = {
+                "best_checkpoint": best_baseline_result.best_checkpoint_path,
+                "best_stage": best_baseline_stage,
+                "best_loss_original": best_baseline_orig_loss,
+                "stages": [
+                    {
+                        "stage": stage_num,
+                        "original_loss": orig_loss,
+                        "train_loss": result.best_loss,
+                        "time": result.elapsed_time,
+                        "samples": result.total_samples_trained,
+                        "stop_reason": result.stop_reason,
+                        "checkpoint": result.best_checkpoint_path,
+                    }
+                    for stage_num, result, orig_loss, _ in baseline_original_evals
+                ],
+            }
+
+            stages_won_staged = sum(1 for c in comparisons if c.improvement_absolute > 0)
+            stages_won_baseline = sum(1 for c in comparisons if c.improvement_absolute < 0)
+            avg_improvement_ratio = sum(c.improvement_ratio for c in comparisons) / len(comparisons)
+
+            if stages_won_staged > stages_won_baseline:
+                winner = "staged"
+            elif stages_won_baseline > stages_won_staged:
+                winner = "baseline"
+            else:
+                winner = "tie"
+
+            summary["comparison"] = {
+                "winner": winner,
+                "stages_won_staged": stages_won_staged,
+                "stages_won_baseline": stages_won_baseline,
+                "improvement_ratio_mean": avg_improvement_ratio,
+                "per_stage": [
+                    {
+                        "stage": c.stage_num,
+                        "staged_loss": c.staged_orig_loss,
+                        "baseline_loss": c.baseline_orig_loss,
+                        "improvement_absolute": c.improvement_absolute,
+                        "improvement_ratio": c.improvement_ratio,
+                        "staged_samples": c.staged_samples_trained,
+                        "baseline_samples": c.baseline_samples_trained,
+                        "winner": "staged" if c.improvement_absolute > 0 else ("baseline" if c.improvement_absolute < 0 else "tie"),
+                    }
+                    for c in comparisons
+                ],
+            }
+
+        with open(output_dir / "summary.json", "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+
+        # Assemble final-only sections
+        best_checkpoint_html = best_checkpoint_html
+        stage_progression_html = lr_schedule_html + stage_progression_html
+
+    # Build HTML
+    status_indicator = "✓ Complete" if is_final else "⏳ In Progress"
+    status_color = "#4CAF50" if is_final else "#FF9800"
+
+    html_content = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Staged Training Final Report</title>
+    <meta charset="UTF-8">
+    <title>Staged Training Report - {run_id}</title>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f5; }}
         .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
         h1 {{ color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }}
         h2 {{ color: #555; margin-top: 30px; }}
+        h3, h4 {{ color: #666; }}
         .metric {{ background: #e8f5e9; padding: 20px; border-radius: 4px; margin: 10px 0; font-size: 1.1em; }}
         .metric strong {{ color: #2E7D32; }}
         img {{ max-width: 100%; height: auto; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; }}
@@ -1281,167 +1614,68 @@ def generate_final_report(
         .stage-loss-graphs {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); gap: 20px; }}
         ul {{ line-height: 2; }}
         a {{ color: #1976D2; }}
+        .status-badge {{ display: inline-block; padding: 4px 12px; border-radius: 4px; font-weight: bold; color: white; }}
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>Staged Training Final Summary</h1>
+    <h1>Staged Training Report <span class="status-badge" style="background: {status_color};">{status_indicator}</span></h1>
 
-    <section id="total-time">
-        <h2>Total Training Time</h2>
-        <div class="metric"><strong>Duration:</strong> {format_duration(total_time)}</div>
-    </section>
-
-    <section id="best-checkpoint">
-        <h2>Best Checkpoint</h2>
+    <section id="summary">
         <div class="metric">
-            <strong>Name:</strong> {Path(best_run_result.best_checkpoint_path).name}<br>
-            <strong>Stage:</strong> {best_stage}<br>
-            <strong>Hybrid Loss (full session):</strong> {best_orig_loss:.6f}
+            <strong>Run ID:</strong> {run_id}<br>
+            <strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}<br>
+            <strong>Stages Completed:</strong> {len(completed_stages)}<br>
+            <strong>Total Elapsed Time:</strong> {format_duration(total_elapsed)}
         </div>
     </section>
 
-    <section id="learning-rate">
-        <h2>Learning Rate Schedule (Best Stage)</h2>
-        {'<img src="data:image/png;base64,' + lr_b64 + '" />' if lr_b64 else "<p>No learning rate data available</p>"}
-    </section>
-
-    <section id="stage-progression">
-        <h2>Stage Progression</h2>
-        <img src="data:image/png;base64,{progression_b64}" />
+    <section id="timing">
+        <h2>Timing Summary</h2>
         <table>
             <tr>
                 <th>Stage</th>
-                <th>Orig Loss</th>
-                <th>Train Loss</th>
-                <th>Time</th>
-                <th>Samples</th>
-                <th>Stop Reason</th>
+                <th>Phase A</th>
+                <th>Phase B</th>
+                <th>LR Sweep Total</th>
+                <th>Main Training</th>
+                <th>Stage Total</th>
             </tr>
-            {stage_rows}
+            {timing_rows}
         </table>
-        <h3>Hybrid Loss Over Original Session (per Stage)</h3>
-        <div class="stage-loss-graphs">
-            {stage_loss_graphs_html if stage_loss_graphs_html else "<p>No loss graphs available</p>"}
-        </div>
     </section>
 
+    {f'<section id="lr-sweep"><h2>LR Sweep Details</h2>{lr_details_html}</section>' if all_sweep_results else ""}
+
+    <section id="stage-results">
+        <h2>Stage Results</h2>
+        <table>
+            <tr>
+                <th>Stage</th>
+                <th>Best Loss</th>
+                <th>Stop Reason</th>
+                <th>Samples Trained</th>
+                <th>Time</th>
+            </tr>
+            {stage_results_rows}
+        </table>
+    </section>
+
+    {best_checkpoint_html}
+    {stage_progression_html}
     {comparison_html}
-
-    <section id="sample-counts">
-        <h2>Sample Counts</h2>
-        <h3>Cumulative Across All Stages</h3>
-        {'<img src="data:image/png;base64,' + cumulative_counts_b64 + '" />' if cumulative_counts_b64 else "<p>No cumulative sample count data available</p>"}
-        <h3>Per Stage</h3>
-        <div class="stage-loss-graphs">
-            {stage_counts_graphs_html if stage_counts_graphs_html else "<p>No per-stage sample count graphs available</p>"}
-        </div>
-    </section>
-
-    <section id="best-inference">
-        <h2>Best Checkpoint Inference</h2>
-        <h3>Selected Frame {selected_frame}</h3>
-        <div class="inference-row">
-            {selected_html if selected_html else "<p>No inference images available</p>"}
-        </div>
-        <h3>Random Observations</h3>
-        {random_html if random_html else "<p>No random observation images available</p>"}
-    </section>
-
-    <section id="stage-links">
-        <h2>Individual Stage Reports</h2>
-        <ul>
-            {stage_links}
-        </ul>
-    </section>
+    {sample_counts_html}
+    {inference_html}
+    {stage_links_html}
 </div>
 </body>
 </html>"""
 
-    with open(output_dir / "final_report.html", "w", encoding="utf-8") as f:
-        f.write(html)
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
 
-    # Save summary JSON
-    summary = {
-        "total_time_seconds": total_time,
-        "staged": {
-            "best_checkpoint": best_run_result.best_checkpoint_path,
-            "best_stage": best_stage,
-            "best_loss_original": best_orig_loss,
-            "stages": [
-                {
-                    "stage": stage_num,
-                    "original_loss": orig_loss,
-                    "train_loss": result.best_loss,
-                    "time": result.elapsed_time,
-                    "samples": result.total_samples_trained,
-                    "stop_reason": result.stop_reason,
-                    "checkpoint": result.best_checkpoint_path,
-                }
-                for stage_num, result, orig_loss, _ in stage_original_evals
-            ],
-        },
-    }
-
-    # Add baseline data if available
-    if baseline_original_evals:
-        best_baseline_eval = min(baseline_original_evals, key=lambda x: x[2])
-        best_baseline_stage, best_baseline_result, best_baseline_orig_loss, _ = best_baseline_eval
-
-        summary["baseline"] = {
-            "best_checkpoint": best_baseline_result.best_checkpoint_path,
-            "best_stage": best_baseline_stage,
-            "best_loss_original": best_baseline_orig_loss,
-            "stages": [
-                {
-                    "stage": stage_num,
-                    "original_loss": orig_loss,
-                    "train_loss": result.best_loss,
-                    "time": result.elapsed_time,
-                    "samples": result.total_samples_trained,
-                    "stop_reason": result.stop_reason,
-                    "checkpoint": result.best_checkpoint_path,
-                }
-                for stage_num, result, orig_loss, _ in baseline_original_evals
-            ],
-        }
-
-        # Add comparison data
-        stages_won_staged = sum(1 for c in comparisons if c.improvement_absolute > 0)
-        stages_won_baseline = sum(1 for c in comparisons if c.improvement_absolute < 0)
-        avg_improvement_ratio = sum(c.improvement_ratio for c in comparisons) / len(comparisons)
-
-        if stages_won_staged > stages_won_baseline:
-            winner = "staged"
-        elif stages_won_baseline > stages_won_staged:
-            winner = "baseline"
-        else:
-            winner = "tie"
-
-        summary["comparison"] = {
-            "winner": winner,
-            "stages_won_staged": stages_won_staged,
-            "stages_won_baseline": stages_won_baseline,
-            "improvement_ratio_mean": avg_improvement_ratio,
-            "per_stage": [
-                {
-                    "stage": c.stage_num,
-                    "staged_loss": c.staged_orig_loss,
-                    "baseline_loss": c.baseline_orig_loss,
-                    "improvement_absolute": c.improvement_absolute,
-                    "improvement_ratio": c.improvement_ratio,
-                    "staged_samples": c.staged_samples_trained,
-                    "baseline_samples": c.baseline_samples_trained,
-                    "winner": "staged" if c.improvement_absolute > 0 else ("baseline" if c.improvement_absolute < 0 else "tie"),
-                }
-                for c in comparisons
-            ],
-        }
-
-    with open(output_dir / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2, default=str)
-
-    print(f"\nFinal report saved to {output_dir / 'final_report.html'}")
+    print(f"[REPORT] Report updated: {report_path}")
+    return str(report_path)
 
 
 def cleanup_stage_checkpoints(
@@ -1474,6 +1708,9 @@ def run_staged_training(
     # Set instance_id for checkpoint naming (prevents collisions with concurrent runs)
     state.instance_id = run_id
     print(f"Run ID: {run_id}")
+
+    # Track overall training time
+    overall_start_time = time.time()
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1528,8 +1765,13 @@ def run_staged_training(
     # Run STAGED training (weights carry over between stages)
     staged_results = []
     current_checkpoint = None  # Fresh weights for stage 1
+    all_sweep_results = []  # Track LR sweep results for reporting
+    all_timings = []  # Track timing for each stage
+    completed_stages = []  # For incremental final reports
 
     for stage_num, train_path, val_path in stages:
+        stage_start_time = time.time()
+
         print(f"\n{'#'*60}")
         print(f"# STAGE {stage_num}")
         print(f"{'#'*60}")
@@ -1541,38 +1783,118 @@ def run_staged_training(
         print(f"Loading validation session: {Path(val_path).name}")
         val_session = load_session_for_training(val_path)
 
+        # LR Sweep (if enabled)
+        selected_lr = cfg.custom_lr
+        sweep_result = None
+        sweep_elapsed = 0.0
+
+        if cfg.lr_sweep.enabled:
+            sweep_start = time.time()
+            print(f"\n--- LR Sweep for Stage {stage_num} ---")
+
+            # Allocate time budget for sweep if stage has total budget
+            sweep_budget = 0  # Unlimited by default
+            if cfg.stage_time_budget_min > 0:
+                # Allocate up to 70% of stage time for sweep
+                sweep_budget = cfg.stage_time_budget_min * 0.7
+
+            sweep_result = run_lr_sweep_for_stage(
+                stage_num=stage_num,
+                train_session_path=train_path,
+                val_session_path=val_path,
+                starting_checkpoint=current_checkpoint,
+                cfg_dict=cfg.to_dict(),
+                output_dir=output_path / f"stage{stage_num}_lr_sweep",
+                run_id=run_id,
+                lr_min=cfg.lr_sweep.lr_min,
+                lr_max=cfg.lr_sweep.lr_max,
+                phase_a_num_candidates=cfg.lr_sweep.phase_a_num_candidates,
+                phase_a_seeds=cfg.lr_sweep.phase_a_seeds,
+                phase_a_time_budget_min=cfg.lr_sweep.phase_a_time_budget_min,
+                phase_a_survivor_count=cfg.lr_sweep.phase_a_survivor_count,
+                phase_b_seeds=cfg.lr_sweep.phase_b_seeds,
+                phase_b_time_budget_min=cfg.lr_sweep.phase_b_time_budget_min,
+                ranking_metric=cfg.lr_sweep.ranking_metric,
+                save_state=cfg.lr_sweep.save_sweep_state,
+                time_budget_min=sweep_budget,
+            )
+
+            selected_lr = sweep_result.selected_lr
+            sweep_elapsed = time.time() - sweep_start
+            all_sweep_results.append(sweep_result)
+            print(f"LR Sweep selected: {selected_lr:.2e} (took {format_duration(sweep_elapsed)})")
+
+        # Override LR for main training
+        stage_cfg = StagedTrainingConfig.from_dict(cfg.to_dict())
+        stage_cfg.custom_lr = selected_lr
+        stage_cfg.disable_lr_scaling = True
+
+        # Calculate remaining time budget for main training
+        main_training_budget = 0
+        if cfg.stage_time_budget_min > 0:
+            remaining = cfg.stage_time_budget_min - (sweep_elapsed / 60)
+            main_training_budget = max(1.0, remaining)  # At least 1 minute
+            print(f"Main training time budget: {main_training_budget:.1f} min")
+
         stage_results = []
+        main_training_start = time.time()
 
-        for run_num in range(1, cfg.runs_per_stage + 1):
-            run_output_dir = output_path / f"stage{stage_num}_run{run_num}"
-
-            # Run training
+        if cfg.runs_per_stage > 1:
+            # Parallel execution for multiple runs
+            stage_results = run_main_training_parallel(
+                stage_num=stage_num,
+                num_runs=cfg.runs_per_stage,
+                train_session_path=train_path,
+                val_session_path=val_path,
+                starting_checkpoint=current_checkpoint,
+                selected_lr=selected_lr,
+                cfg_dict=stage_cfg.to_dict(),
+                output_dir=output_path,
+                run_id=run_id,
+                is_baseline=False,
+                time_budget_min=main_training_budget / cfg.runs_per_stage if main_training_budget > 0 else 0,
+            )
+        else:
+            # Single run - no parallelization overhead
+            run_output_dir = output_path / f"stage{stage_num}_run1"
             result = run_stage_training(
                 stage_num=stage_num,
-                run_num=run_num,
+                run_num=1,
                 train_session=train_session,
                 val_session=val_session,
                 checkpoint_path=current_checkpoint,
-                cfg=cfg,
+                cfg=stage_cfg,
                 output_dir=run_output_dir,
                 is_baseline=False,
                 run_id=run_id,
+                time_budget_min=main_training_budget if main_training_budget > 0 else 0,
             )
+            stage_results = [result]
 
-            stage_results.append(result)
-
-            # Generate stage report
+        # Generate reports AFTER all runs complete
+        for result in stage_results:
+            run_output_dir = output_path / f"stage{stage_num}_run{result.run_num}"
             generate_stage_report(
                 result=result,
                 train_session=train_session,
                 val_session=val_session,
                 original_session=original_session,
-                cfg=cfg,
+                cfg=stage_cfg,
                 output_dir=run_output_dir,
             )
 
-        # Select best checkpoint from all runs
-        best_run = min(stage_results, key=lambda r: r.best_loss)
+        main_training_elapsed = time.time() - main_training_start
+
+        # Select best checkpoint from all runs (filter out failed runs with no checkpoint)
+        valid_results = [r for r in stage_results if r.best_checkpoint_path]
+        if not valid_results:
+            print(f"\nERROR: All runs failed for stage {stage_num}. Cannot continue.")
+            print("Failed runs:")
+            for r in stage_results:
+                print(f"  Run {r.run_num}: {r.stop_reason}")
+            raise RuntimeError(f"All runs failed for stage {stage_num}")
+
+        best_run = min(valid_results, key=lambda r: r.best_loss)
         print(f"\nBest run for stage {stage_num}: Run {best_run.run_num} (loss: {best_run.best_loss:.6f})")
 
         # Update current checkpoint for next stage
@@ -1585,14 +1907,50 @@ def run_staged_training(
 
         staged_results.append((stage_num, best_run))
 
+        # Track timing
+        stage_total_time = time.time() - stage_start_time
+        timing = StageTiming(
+            stage_num=stage_num,
+            lr_sweep_total_sec=sweep_elapsed,
+            lr_sweep_phase_a_sec=sweep_result.phase_a.total_wall_time_sec if sweep_result else 0,
+            lr_sweep_phase_b_sec=sweep_result.phase_b.total_wall_time_sec if sweep_result else 0,
+            lr_sweep_trial_count=(
+                len(sweep_result.phase_a.lr_results) * cfg.lr_sweep.phase_a_seeds +
+                len(sweep_result.phase_b.lr_results) * cfg.lr_sweep.phase_b_seeds
+            ) if sweep_result else 0,
+            main_training_sec=main_training_elapsed,
+            main_training_samples=best_run.total_samples_trained,
+            total_stage_sec=stage_total_time,
+        )
+        all_timings.append(timing)
+        completed_stages.append((stage_num, best_run, None))  # baseline added later
+
+        # Generate progressive final report (updated after each stage)
+        generate_final_report(
+            completed_stages=completed_stages,
+            all_sweep_results=all_sweep_results,
+            all_timings=all_timings,
+            output_dir=output_path,
+            run_id=run_id,
+            overall_start_time=overall_start_time,
+            original_session=None,  # Don't evaluate until final
+            cfg=cfg,
+            is_final=False,
+        )
+
     # Run BASELINE training if enabled (fresh weights each stage)
     baseline_results = []
+    baseline_sweep_results = []  # Track LR sweep results for baseline
+    baseline_timings = []
+
     if cfg.enable_baseline:
         print("\n" + "#" * 60)
         print("# BASELINE TRAINING (Fresh weights each stage)")
         print("#" * 60)
 
         for stage_num, train_path, val_path in stages:
+            baseline_stage_start = time.time()
+
             print(f"\n{'#'*60}")
             print(f"# BASELINE STAGE {stage_num}")
             print(f"{'#'*60}")
@@ -1604,39 +1962,118 @@ def run_staged_training(
             print(f"Loading validation session: {Path(val_path).name}")
             val_session = load_session_for_training(val_path)
 
+            # Baseline LR Sweep (if enabled) - separate sweep with fresh weights
+            baseline_selected_lr = cfg.custom_lr
+            baseline_sweep_result = None
+            baseline_sweep_elapsed = 0.0
+
+            if cfg.lr_sweep.enabled:
+                baseline_sweep_start = time.time()
+                print(f"\n--- Baseline LR Sweep for Stage {stage_num} ---")
+
+                # Allocate time budget for sweep if stage has total budget
+                sweep_budget = 0  # Unlimited by default
+                if cfg.stage_time_budget_min > 0:
+                    sweep_budget = cfg.stage_time_budget_min * 0.7
+
+                baseline_sweep_result = run_lr_sweep_for_stage(
+                    stage_num=stage_num,
+                    train_session_path=train_path,
+                    val_session_path=val_path,
+                    starting_checkpoint=None,  # Fresh weights for baseline
+                    cfg_dict=cfg.to_dict(),
+                    output_dir=output_path / f"stage{stage_num}_baseline_lr_sweep",
+                    run_id=run_id,
+                    lr_min=cfg.lr_sweep.lr_min,
+                    lr_max=cfg.lr_sweep.lr_max,
+                    phase_a_num_candidates=cfg.lr_sweep.phase_a_num_candidates,
+                    phase_a_seeds=cfg.lr_sweep.phase_a_seeds,
+                    phase_a_time_budget_min=cfg.lr_sweep.phase_a_time_budget_min,
+                    phase_a_survivor_count=cfg.lr_sweep.phase_a_survivor_count,
+                    phase_b_seeds=cfg.lr_sweep.phase_b_seeds,
+                    phase_b_time_budget_min=cfg.lr_sweep.phase_b_time_budget_min,
+                    ranking_metric=cfg.lr_sweep.ranking_metric,
+                    save_state=cfg.lr_sweep.save_sweep_state,
+                    time_budget_min=sweep_budget,
+                )
+
+                baseline_selected_lr = baseline_sweep_result.selected_lr
+                baseline_sweep_elapsed = time.time() - baseline_sweep_start
+                baseline_sweep_results.append(baseline_sweep_result)
+                print(f"Baseline LR Sweep selected: {baseline_selected_lr:.2e} (took {format_duration(baseline_sweep_elapsed)})")
+
+            # Override LR for baseline training
+            baseline_cfg = StagedTrainingConfig.from_dict(cfg.to_dict())
+            baseline_cfg.custom_lr = baseline_selected_lr
+            baseline_cfg.disable_lr_scaling = True
+
+            # Calculate remaining time budget for main training
+            baseline_main_budget = 0
+            if cfg.stage_time_budget_min > 0:
+                remaining = cfg.stage_time_budget_min - (baseline_sweep_elapsed / 60)
+                baseline_main_budget = max(1.0, remaining)
+
             baseline_stage_results = []
+            baseline_main_start = time.time()
 
-            for run_num in range(1, cfg.baseline_runs_per_stage + 1):
-                run_output_dir = output_path / f"stage{stage_num}_baseline_run{run_num}"
-
-                # Run training with fresh weights (no checkpoint)
+            if cfg.baseline_runs_per_stage > 1:
+                # Parallel execution for multiple baseline runs
+                baseline_stage_results = run_main_training_parallel(
+                    stage_num=stage_num,
+                    num_runs=cfg.baseline_runs_per_stage,
+                    train_session_path=train_path,
+                    val_session_path=val_path,
+                    starting_checkpoint=None,  # ALWAYS fresh weights for baseline
+                    selected_lr=baseline_selected_lr,
+                    cfg_dict=baseline_cfg.to_dict(),
+                    output_dir=output_path,
+                    run_id=run_id,
+                    is_baseline=True,
+                    time_budget_min=baseline_main_budget / cfg.baseline_runs_per_stage if baseline_main_budget > 0 else 0,
+                )
+            else:
+                # Single run - no parallelization overhead
+                run_output_dir = output_path / f"stage{stage_num}_baseline_run1"
                 result = run_stage_training(
                     stage_num=stage_num,
-                    run_num=run_num,
+                    run_num=1,
                     train_session=train_session,
                     val_session=val_session,
                     checkpoint_path=None,  # ALWAYS fresh weights for baseline
-                    cfg=cfg,
+                    cfg=baseline_cfg,
                     output_dir=run_output_dir,
                     is_baseline=True,
                     run_id=run_id,
+                    time_budget_min=baseline_main_budget if baseline_main_budget > 0 else 0,
                 )
+                baseline_stage_results = [result]
 
-                baseline_stage_results.append(result)
-
-                # Generate stage report
+            # Generate reports AFTER all baseline runs complete
+            for result in baseline_stage_results:
+                run_output_dir = output_path / f"stage{stage_num}_baseline_run{result.run_num}"
                 generate_stage_report(
                     result=result,
                     train_session=train_session,
                     val_session=val_session,
                     original_session=original_session,
-                    cfg=cfg,
+                    cfg=baseline_cfg,
                     output_dir=run_output_dir,
                 )
 
-            # Select best baseline run for this stage
-            best_baseline_run = min(baseline_stage_results, key=lambda r: r.best_loss)
-            print(f"\nBest baseline run for stage {stage_num}: Run {best_baseline_run.run_num} (loss: {best_baseline_run.best_loss:.6f})")
+            baseline_main_elapsed = time.time() - baseline_main_start
+
+            # Select best baseline run for this stage (filter out failed runs with no checkpoint)
+            valid_baseline_results = [r for r in baseline_stage_results if r.best_checkpoint_path]
+            if not valid_baseline_results:
+                print(f"\nWARNING: All baseline runs failed for stage {stage_num}.")
+                print("Failed baseline runs:")
+                for r in baseline_stage_results:
+                    print(f"  Run {r.run_num}: {r.stop_reason}")
+                # Use a dummy result with inf loss for comparison
+                best_baseline_run = baseline_stage_results[0] if baseline_stage_results else None
+            else:
+                best_baseline_run = min(valid_baseline_results, key=lambda r: r.best_loss)
+                print(f"\nBest baseline run for stage {stage_num}: Run {best_baseline_run.run_num} (loss: {best_baseline_run.best_loss:.6f})")
 
             # Cleanup non-best baseline checkpoints
             if cfg.baseline_runs_per_stage > 1:
@@ -1645,13 +2082,40 @@ def run_staged_training(
 
             baseline_results.append((stage_num, best_baseline_run))
 
-    # Generate final summary (pass baseline_results if available)
+            # Track baseline timing
+            baseline_stage_total = time.time() - baseline_stage_start
+            baseline_timing = StageTiming(
+                stage_num=stage_num,
+                lr_sweep_total_sec=baseline_sweep_elapsed,
+                lr_sweep_phase_a_sec=baseline_sweep_result.phase_a.total_wall_time_sec if baseline_sweep_result else 0,
+                lr_sweep_phase_b_sec=baseline_sweep_result.phase_b.total_wall_time_sec if baseline_sweep_result else 0,
+                lr_sweep_trial_count=(
+                    len(baseline_sweep_result.phase_a.lr_results) * cfg.lr_sweep.phase_a_seeds +
+                    len(baseline_sweep_result.phase_b.lr_results) * cfg.lr_sweep.phase_b_seeds
+                ) if baseline_sweep_result else 0,
+                main_training_sec=baseline_main_elapsed,
+                main_training_samples=best_baseline_run.total_samples_trained,
+                total_stage_sec=baseline_stage_total,
+            )
+            baseline_timings.append(baseline_timing)
+
+            # Update completed_stages with baseline result
+            for i, (s_num, staged, _) in enumerate(completed_stages):
+                if s_num == stage_num:
+                    completed_stages[i] = (s_num, staged, best_baseline_run)
+                    break
+
+    # Generate final summary with evaluation and inference
     generate_final_report(
-        staged_results,
-        baseline_results if cfg.enable_baseline else None,
-        original_session,
-        output_path,
-        cfg,
+        completed_stages=completed_stages,
+        all_sweep_results=all_sweep_results,
+        all_timings=all_timings,
+        output_dir=output_path,
+        run_id=run_id,
+        overall_start_time=overall_start_time,
+        original_session=original_session,
+        cfg=cfg,
+        is_final=True,
     )
 
     print("\n" + "=" * 60)
@@ -1688,6 +2152,65 @@ def main():
         "--run-id",
         help="Unique run identifier for concurrent execution (default: auto-generated timestamp)",
     )
+    # LR Sweep arguments
+    parser.add_argument(
+        "--enable-lr-sweep",
+        action="store_true",
+        help="Enable learning rate sweep before each stage",
+    )
+    parser.add_argument(
+        "--lr-sweep-lr-min",
+        type=float,
+        default=1e-6,
+        help="Minimum LR for sweep search space (default: 1e-6)",
+    )
+    parser.add_argument(
+        "--lr-sweep-lr-max",
+        type=float,
+        default=1e-2,
+        help="Maximum LR for sweep search space (default: 1e-2)",
+    )
+    parser.add_argument(
+        "--lr-sweep-phase-a-candidates",
+        type=int,
+        default=40,
+        help="Number of LR candidates in Phase A (default: 40)",
+    )
+    parser.add_argument(
+        "--lr-sweep-phase-a-budget-min",
+        type=float,
+        default=3.0,
+        help="Time budget per Phase A trial in minutes (default: 3)",
+    )
+    parser.add_argument(
+        "--lr-sweep-phase-a-survivors",
+        type=int,
+        default=5,
+        help="Number of LRs to advance from Phase A to Phase B (default: 5)",
+    )
+    parser.add_argument(
+        "--lr-sweep-phase-b-seeds",
+        type=int,
+        default=3,
+        help="Seeds per LR in Phase B (default: 3)",
+    )
+    parser.add_argument(
+        "--lr-sweep-phase-b-budget-min",
+        type=float,
+        default=10.0,
+        help="Time budget per Phase B trial in minutes (default: 10)",
+    )
+    parser.add_argument(
+        "--stage-time-budget-min",
+        type=float,
+        default=0,
+        help="Total time budget per stage in minutes, including LR sweep and main training (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--disable-baseline",
+        action="store_true",
+        help="Disable baseline comparison runs",
+    )
 
     args = parser.parse_args()
 
@@ -1703,6 +2226,28 @@ def main():
     # Override runs_per_stage from CLI only if explicitly provided
     if args.runs_per_stage is not None:
         cfg.runs_per_stage = args.runs_per_stage
+
+    # Override LR sweep settings from CLI
+    if args.enable_lr_sweep:
+        cfg.lr_sweep.enabled = True
+    if args.lr_sweep_lr_min != 1e-6:
+        cfg.lr_sweep.lr_min = args.lr_sweep_lr_min
+    if args.lr_sweep_lr_max != 1e-2:
+        cfg.lr_sweep.lr_max = args.lr_sweep_lr_max
+    if args.lr_sweep_phase_a_candidates != 40:
+        cfg.lr_sweep.phase_a_num_candidates = args.lr_sweep_phase_a_candidates
+    if args.lr_sweep_phase_a_budget_min != 3.0:
+        cfg.lr_sweep.phase_a_time_budget_min = args.lr_sweep_phase_a_budget_min
+    if args.lr_sweep_phase_a_survivors != 5:
+        cfg.lr_sweep.phase_a_survivor_count = args.lr_sweep_phase_a_survivors
+    if args.lr_sweep_phase_b_seeds != 3:
+        cfg.lr_sweep.phase_b_seeds = args.lr_sweep_phase_b_seeds
+    if args.lr_sweep_phase_b_budget_min != 10.0:
+        cfg.lr_sweep.phase_b_time_budget_min = args.lr_sweep_phase_b_budget_min
+    if args.stage_time_budget_min != 0:
+        cfg.stage_time_budget_min = args.stage_time_budget_min
+    if args.disable_baseline:
+        cfg.enable_baseline = False
 
     # Determine output directory (include run_id to prevent conflicts between concurrent runs)
     if args.output_dir:

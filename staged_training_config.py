@@ -12,6 +12,61 @@ from pathlib import Path
 
 
 @dataclass
+class LRSweepConfig:
+    """Configuration for time-budgeted learning rate sweep."""
+
+    # Enable/disable LR sweep
+    enabled: bool = True
+
+    # LR search space
+    lr_min: float = 1e-6
+    lr_max: float = 1e-2
+
+    # Phase A: Broad exploration (many LRs, 1 seed, short budget)
+    phase_a_num_candidates: int = 3
+    phase_a_seeds: int = 1
+    phase_a_time_budget_min: float = 1.0  # 3 minutes per trial
+    phase_a_survivor_count: int = 2
+
+    # Phase B: Deep validation (few LRs, multiple seeds, longer budget)
+    phase_b_seeds: int = 2
+    phase_b_time_budget_min: float = 1.0  # 10 minutes per trial
+
+    # Ranking metric for selecting best LR
+    ranking_metric: str = "median_best_val"  # "median_best_val", "mean_best_val", "min_best_val"
+
+    # Early termination thresholds
+    min_samples_before_timeout: int = 10  # Minimum samples before allowing timeout
+    min_evals_before_stop: int = 2  # Minimum eval intervals before early stop
+
+    # Resume support
+    save_sweep_state: bool = True  # Save intermediate state for resume
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary."""
+        return {
+            'enabled': self.enabled,
+            'lr_min': self.lr_min,
+            'lr_max': self.lr_max,
+            'phase_a_num_candidates': self.phase_a_num_candidates,
+            'phase_a_seeds': self.phase_a_seeds,
+            'phase_a_time_budget_min': self.phase_a_time_budget_min,
+            'phase_a_survivor_count': self.phase_a_survivor_count,
+            'phase_b_seeds': self.phase_b_seeds,
+            'phase_b_time_budget_min': self.phase_b_time_budget_min,
+            'ranking_metric': self.ranking_metric,
+            'min_samples_before_timeout': self.min_samples_before_timeout,
+            'min_evals_before_stop': self.min_evals_before_stop,
+            'save_sweep_state': self.save_sweep_state,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LRSweepConfig":
+        """Create from dictionary."""
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
 class StagedTrainingConfig:
     """Configuration for staged training runs."""
 
@@ -68,8 +123,8 @@ class StagedTrainingConfig:
     clean_old_checkpoints: bool = True  # Clean old auto-saved checkpoints before starting
 
     # Baseline comparison
-    enable_baseline: bool = True  # Enable baseline (from-scratch) runs for comparison
-    baseline_runs_per_stage: int = 5  # Number of baseline runs per stage
+    enable_baseline: bool = False  # Enable baseline (from-scratch) runs for comparison
+    baseline_runs_per_stage: int = 2  # Number of baseline runs per stage
 
     # Run identification (set at runtime, saved for reference/reproducibility)
     run_id: Optional[str] = None  # Unique identifier for concurrent execution
@@ -78,11 +133,23 @@ class StagedTrainingConfig:
     enable_wandb: bool = True  # User specified (app default is False)
     wandb_project: str = "developmental-robot-movement"
 
+    # LR Sweep configuration
+    lr_sweep: LRSweepConfig = field(default_factory=LRSweepConfig)
+
+    # Stage-level time budget in minutes (0 = unlimited)
+    # Includes both LR sweep and main training time
+    stage_time_budget_min: float = 5
+
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "StagedTrainingConfig":
         """Load configuration from YAML file, merging with defaults."""
         with open(yaml_path, "r") as f:
             overrides = yaml.safe_load(f) or {}
+
+        # Handle nested LRSweepConfig
+        if 'lr_sweep' in overrides and isinstance(overrides['lr_sweep'], dict):
+            overrides['lr_sweep'] = LRSweepConfig.from_dict(overrides['lr_sweep'])
+
         return cls(**overrides)
 
     def to_yaml(self, yaml_path: str) -> None:
@@ -91,5 +158,20 @@ class StagedTrainingConfig:
             yaml.dump(self.__dict__, f, default_flow_style=False)
 
     def to_dict(self) -> dict:
-        """Convert to dictionary."""
-        return self.__dict__.copy()
+        """Convert to dictionary (serializable for multiprocessing)."""
+        d = {}
+        for key, value in self.__dict__.items():
+            if hasattr(value, 'to_dict'):
+                d[key] = value.to_dict()
+            else:
+                d[key] = value
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StagedTrainingConfig":
+        """Create from dictionary."""
+        # Handle nested LRSweepConfig
+        if 'lr_sweep' in data and isinstance(data['lr_sweep'], dict):
+            data = data.copy()
+            data['lr_sweep'] = LRSweepConfig.from_dict(data['lr_sweep'])
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})

@@ -774,7 +774,9 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           # ReduceLROnPlateau parameters
                           plateau_factor=0.1, plateau_patience=0,
                           # Baseline comparison parameters (for W&B logging)
-                          is_baseline_run=False, enable_baseline=False, baseline_runs_per_stage=1):
+                          is_baseline_run=False, enable_baseline=False, baseline_runs_per_stage=1,
+                          # Time budget parameters (for LR sweep)
+                          time_budget_min=0, min_samples_for_timeout=1000):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -1575,6 +1577,14 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                           f"current_raw: {val_loss:.6f}, min_delta: {val_plateau_min_delta})")
                             print(f"[PLATEAU] {stop_reason}")
 
+                    # Time budget check for LR sweep
+                    if time_budget_min > 0 and not stop_early:
+                        time_budget_sec = time_budget_min * 60
+                        if samples_seen >= min_samples_for_timeout and elapsed_time >= time_budget_sec:
+                            stop_early = True
+                            stop_reason = f"Time budget exceeded: {elapsed_time/60:.1f} min >= {time_budget_min:.1f} min"
+                            print(f"[TIMEOUT] {stop_reason}")
+
                     # Debug logging to diagnose periodic loss spikes
                     log_training_debug_state(state.world_model, batch_count, samples_seen, loss, enable_wandb)
 
@@ -1651,6 +1661,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         stop_early = True
                         stop_reason = "Training stopped by user request"
                         state.reset_training_stop()
+
+                    # Export cumulative_metrics to state for external access (e.g., lr_sweep.py)
+                    # This allows reading metrics during training iteration, not just at the end
+                    state.cumulative_metrics = cumulative_metrics.copy()
 
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
@@ -1903,6 +1917,14 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                           f"current_raw: {val_loss:.6f}, min_delta: {val_plateau_min_delta})")
                             print(f"[PLATEAU] {stop_reason}")
 
+                    # Time budget check for LR sweep
+                    if time_budget_min > 0 and not stop_early:
+                        time_budget_sec = time_budget_min * 60
+                        if samples_seen >= min_samples_for_timeout and elapsed_time >= time_budget_sec:
+                            stop_early = True
+                            stop_reason = f"Time budget exceeded: {elapsed_time/60:.1f} min >= {time_budget_min:.1f} min"
+                            print(f"[TIMEOUT] {stop_reason}")
+
                     # Debug logging to diagnose periodic loss spikes
                     log_training_debug_state(state.world_model, batch_count, samples_seen, loss, enable_wandb)
 
@@ -1979,6 +2001,10 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         stop_early = True
                         stop_reason = "Training stopped by user request"
                         state.reset_training_stop()
+
+                    # Export cumulative_metrics to state for external access (e.g., lr_sweep.py)
+                    # This allows reading metrics during training iteration, not just at the end
+                    state.cumulative_metrics = cumulative_metrics.copy()
 
                     # Yield update (no evaluation plots)
                     print(f"[DEBUG] Yielding update at {samples_seen} samples (batch {batch_count})")
