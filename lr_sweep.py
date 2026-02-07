@@ -122,9 +122,10 @@ class LRSweepPhaseResult:
     survivors: list  # list[float] - LR values
     winner: Optional[float]  # Single best LR (Phase B only)
     winner_best_val: Optional[float]  # Best val loss of winner
+    winner_checkpoint_path: Optional[str] = None  # Checkpoint from winning trial
 
     # Timing
-    total_wall_time_sec: float
+    total_wall_time_sec: float = 0.0
 
     def get_ranked_lrs(self, metric: str = "median_best_val") -> list:
         """Return LRs sorted by ranking metric (ascending loss)."""
@@ -146,6 +147,7 @@ class LRSweepPhaseResult:
             'survivors': self.survivors,
             'winner': self.winner,
             'winner_best_val': self.winner_best_val,
+            'winner_checkpoint_path': self.winner_checkpoint_path,
             'total_wall_time_sec': self.total_wall_time_sec,
         }
 
@@ -158,6 +160,7 @@ class LRSweepStageResult:
     phase_b: LRSweepPhaseResult
     selected_lr: float
     total_wall_time_sec: float
+    winning_checkpoint_path: Optional[str] = None  # Checkpoint from winning Phase B trial
 
     def to_dict(self) -> dict:
         """Serialize for JSON."""
@@ -167,6 +170,7 @@ class LRSweepStageResult:
             'phase_b': self.phase_b.to_dict(),
             'selected_lr': self.selected_lr,
             'total_wall_time_sec': self.total_wall_time_sec,
+            'winning_checkpoint_path': self.winning_checkpoint_path,
         }
 
 
@@ -682,6 +686,17 @@ def run_lr_trial(
     if len(loss_history) > 100:
         loss_history = loss_history[-100:]
 
+    # Extract best checkpoint path from auto-saved checkpoints
+    best_checkpoint_path = None
+    try:
+        auto_saved_checkpoints = state.cumulative_metrics.get('auto_saved_checkpoints', [])
+        if auto_saved_checkpoints:
+            # Sort by loss (ascending) - list contains (loss, filepath) tuples
+            auto_saved_checkpoints.sort(key=lambda x: x[0])
+            _, best_checkpoint_path = auto_saved_checkpoints[0]
+    except Exception:
+        pass  # Silently ignore if checkpoints not available
+
     return LRTrialResult(
         lr=lr,
         seed=seed,
@@ -696,7 +711,7 @@ def run_lr_trial(
         best_train_loss=best_train_loss,
         final_train_loss=final_train_loss,
         loss_history=loss_history,
-        checkpoint_path=None,
+        checkpoint_path=best_checkpoint_path,
     )
 
 
@@ -849,12 +864,17 @@ def run_lr_sweep_phase(
     survivors = select_survivors(aggregated_results, survivor_count, ranking_metric)
     winner = survivors[0] if phase == "B" and survivors else None
 
-    # Get winner's best val loss
+    # Get winner's best val loss and checkpoint path
     winner_best_val = None
+    winner_checkpoint_path = None
     if winner:
         for r in aggregated_results:
             if r.lr == winner:
                 winner_best_val = r.median_best_val
+                # Find the trial with the best val loss to get its checkpoint
+                if r.trials:
+                    best_trial = min(r.trials, key=lambda t: t.best_val_loss)
+                    winner_checkpoint_path = best_trial.checkpoint_path
                 break
 
     total_time = time.time() - phase_start
@@ -863,7 +883,8 @@ def run_lr_sweep_phase(
     if phase == "A":
         print(f"[LR SWEEP] Survivors: {[f'{lr:.2e}' for lr in survivors]}")
     else:
-        print(f"[LR SWEEP] Winner: {winner:.2e} (median_best_val={winner_best_val:.6f})")
+        checkpoint_info = f", checkpoint={winner_checkpoint_path}" if winner_checkpoint_path else ""
+        print(f"[LR SWEEP] Winner: {winner:.2e} (median_best_val={winner_best_val:.6f}{checkpoint_info})")
 
     return LRSweepPhaseResult(
         phase=phase,
@@ -872,6 +893,7 @@ def run_lr_sweep_phase(
         survivors=survivors,
         winner=winner,
         winner_best_val=winner_best_val,
+        winner_checkpoint_path=winner_checkpoint_path,
         total_wall_time_sec=total_time,
     )
 
@@ -1004,11 +1026,14 @@ def run_lr_sweep_for_stage(
     )
 
     selected_lr = phase_b_result.winner
+    winning_checkpoint = phase_b_result.winner_checkpoint_path
     total_time = time.time() - sweep_start
 
     print(f"\n{'='*60}")
     print(f"LR SWEEP COMPLETE for Stage {stage_num}")
     print(f"Selected LR: {selected_lr:.2e}")
+    if winning_checkpoint:
+        print(f"Winning checkpoint: {winning_checkpoint}")
     print(f"Total sweep time: {format_duration(total_time)}")
     print(f"{'='*60}\n")
 
@@ -1018,7 +1043,87 @@ def run_lr_sweep_for_stage(
         phase_b=phase_b_result,
         selected_lr=selected_lr,
         total_wall_time_sec=total_time,
+        winning_checkpoint_path=winning_checkpoint,
     )
+
+
+def run_plateau_triggered_sweep(
+    sweep_number: int,
+    train_session_path: str,
+    val_session_path: str,
+    current_checkpoint: str,
+    cfg_dict: dict,
+    output_dir: Path,
+    run_id: str,
+    max_workers: Optional[int] = None,
+) -> tuple:
+    """
+    Run LR sweep triggered by plateau detection.
+
+    This is a wrapper around run_lr_sweep_for_stage() for mid-training use.
+    Uses the same Phase A → Phase B multi-phase sweep structure.
+
+    Key differences from upfront sweep:
+    1. REQUIRES current_checkpoint (starts from current weights, not fresh)
+    2. Returns tuple of (selected_lr, winning_checkpoint_path) for easy unpacking
+    3. Uses phase budgets from lr_sweep config directly
+
+    Args:
+        sweep_number: Which sweep this is (1, 2, 3, ...)
+        train_session_path: Path to training session
+        val_session_path: Path to validation session
+        current_checkpoint: Current checkpoint path (REQUIRED - starts from current weights)
+        cfg_dict: Configuration dictionary (includes LRSweepConfig and PlateauSweepConfig)
+        output_dir: Output directory for this sweep
+        run_id: Run identifier
+        max_workers: Maximum parallel workers
+
+    Returns:
+        Tuple of (selected_lr, winning_checkpoint_path)
+    """
+    from staged_training_config import StagedTrainingConfig
+
+    # Reconstruct config to get LR sweep parameters
+    cfg = StagedTrainingConfig.from_dict(cfg_dict)
+
+    print(f"\n{'='*60}")
+    print(f"PLATEAU-TRIGGERED LR SWEEP #{sweep_number}")
+    print(f"Starting from checkpoint: {current_checkpoint}")
+    print(f"Phase A budget: {cfg.lr_sweep.phase_a_time_budget_min:.1f} min, Phase B budget: {cfg.lr_sweep.phase_b_time_budget_min:.1f} min")
+    print(f"{'='*60}\n")
+
+    # Create sweep output directory
+    sweep_dir = output_dir / f"plateau_sweep_{sweep_number}"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
+    # Run the full Phase A → Phase B sweep using phase budgets directly
+    result = run_lr_sweep_for_stage(
+        stage_num=0,  # Not used for plateau sweeps, use sweep_number for identification
+        train_session_path=train_session_path,
+        val_session_path=val_session_path,
+        starting_checkpoint=current_checkpoint,
+        cfg_dict=cfg_dict,
+        output_dir=sweep_dir,
+        run_id=f"{run_id}_plateau_sweep_{sweep_number}",
+        lr_min=cfg.lr_sweep.lr_min,
+        lr_max=cfg.lr_sweep.lr_max,
+        phase_a_num_candidates=cfg.lr_sweep.phase_a_num_candidates,
+        phase_a_seeds=cfg.lr_sweep.phase_a_seeds,
+        phase_a_time_budget_min=cfg.lr_sweep.phase_a_time_budget_min,
+        phase_a_survivor_count=cfg.lr_sweep.phase_a_survivor_count,
+        phase_b_seeds=cfg.lr_sweep.phase_b_seeds,
+        phase_b_time_budget_min=cfg.lr_sweep.phase_b_time_budget_min,
+        ranking_metric=cfg.lr_sweep.ranking_metric,
+        save_state=cfg.lr_sweep.save_sweep_state,
+        max_workers=max_workers,
+    )
+
+    print(f"\n[PLATEAU SWEEP #{sweep_number}] Complete")
+    print(f"  Selected LR: {result.selected_lr:.2e}")
+    print(f"  Checkpoint: {result.winning_checkpoint_path}")
+    print(f"  Total time: {format_duration(result.total_wall_time_sec)}")
+
+    return (result.selected_lr, result.winning_checkpoint_path)
 
 
 # =============================================================================

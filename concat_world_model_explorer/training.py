@@ -769,14 +769,22 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           divergence_patience=3, divergence_min_updates=5,
                           # Validation spike detection parameters
                           val_spike_threshold=2.0, val_spike_window=25, val_spike_frequency=0.75,
-                          # Validation plateau early stopping parameters
+                          # Validation plateau early stopping parameters (legacy - ignored when plateau_sweep_enabled=True)
                           val_plateau_patience=0, val_plateau_min_delta=0.0001,
-                          # ReduceLROnPlateau parameters
+                          # ReduceLROnPlateau parameters (legacy - ignored when plateau_sweep_enabled=True)
                           plateau_factor=0.1, plateau_patience=0,
                           # Baseline comparison parameters (for W&B logging)
                           is_baseline_run=False, enable_baseline=False, baseline_runs_per_stage=1,
                           # Time budget parameters (for LR sweep)
-                          time_budget_min=0, min_samples_for_timeout=1000):
+                          time_budget_min=0, min_samples_for_timeout=1000,
+                          # Plateau-triggered LR sweep parameters (new mode - replaces ReduceLROnPlateau and val_plateau early stopping)
+                          plateau_sweep_enabled=False,
+                          plateau_sweep_ema_alpha=0.9,
+                          plateau_sweep_improvement_threshold=0.005,
+                          plateau_sweep_patience=10,
+                          plateau_sweep_cooldown_updates=10,
+                          plateau_sweep_max_sweeps=3,
+                          plateau_sweep_count=0):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -816,12 +824,25 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         val_plateau_patience: Stop if val loss hasn't improved in N updates (default: 0 = disabled)
         val_plateau_min_delta: Minimum improvement to count as "better" (default: 0.0001)
         plateau_factor: ReduceLROnPlateau reduction factor (new_lr = lr * factor) (default: 0.1)
+                       DEPRECATED when plateau_sweep_enabled=True.
         plateau_patience: ReduceLROnPlateau patience (updates without improvement before LR reduction).
                          0 = use divergence_patience * 2 (default: 0)
+                         DEPRECATED when plateau_sweep_enabled=True.
+        plateau_sweep_enabled: Enable plateau-triggered LR sweeps (default: False).
+                              When True, replaces ReduceLROnPlateau and val_plateau early stopping.
+        plateau_sweep_ema_alpha: EMA smoothing alpha for validation loss (default: 0.9, higher = more responsive)
+        plateau_sweep_improvement_threshold: Required relative improvement (default: 0.005 = 0.5%)
+        plateau_sweep_patience: Updates without improvement before triggering sweep (default: 10)
+        plateau_sweep_cooldown_updates: Updates to wait after sweep before detection resumes (default: 10)
+        plateau_sweep_max_sweeps: Maximum sweeps before stopping (default: 3)
+        plateau_sweep_count: Current sweep count (for resuming, default: 0)
 
     Yields:
         Tuple of (status, loss_vs_samples_plot, loss_vs_recent_plot, eval_loss_plot, eval_dist_plot,
                   obs_status, obs_combined_fig)
+
+        When plateau_sweep_enabled=True and a plateau is detected, yields a special sentinel:
+        ("SWEEP_REQUESTED", samples_seen, best_checkpoint_path, sweep_count, val_loss_ema)
     """
 
     print(f"[DEBUG] run_world_model_batch called with: total_samples={total_samples}, batch_size={batch_size}, "
@@ -1103,8 +1124,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     # option only applies when NOT using global schedule (e.g., continuing with exact same schedule).
     use_plateau_scheduler = False  # Track which scheduler type we're using
 
-    if stop_on_divergence:
-        # Divergence mode: use ReduceLROnPlateau since total steps are unknown
+    if stop_on_divergence and not plateau_sweep_enabled:
+        # Divergence mode without plateau sweep: use ReduceLROnPlateau since total steps are unknown
         # This scheduler adapts based on validation loss
         # Use explicit plateau_patience if set, otherwise default to divergence_patience * 2
         effective_plateau_patience = plateau_patience if plateau_patience > 0 else divergence_patience * 2
@@ -1116,6 +1137,17 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         )
         use_plateau_scheduler = True
         print(f"[DEBUG] Created ReduceLROnPlateau scheduler (divergence mode): patience={effective_plateau_patience}, factor={plateau_factor}, min_lr={global_min_lr:.6e}")
+    elif stop_on_divergence and plateau_sweep_enabled:
+        # Plateau sweep mode: use warmup + cosine scheduler
+        # LR adaptation happens through plateau-triggered sweeps, not scheduler
+        state.world_model.ae_scheduler = world_model_utils.create_warmup_cosine_scheduler(
+            state.world_model.ae_optimizer,
+            warmup_steps=scaled_warmup_steps,
+            total_steps=num_gradient_updates,
+            lr_min=global_min_lr,
+        )
+        print(f"[DEBUG] Created warmup+cosine scheduler (plateau_sweep mode): {num_gradient_updates} steps, "
+              f"warmup={scaled_warmup_steps}, LR {target_lr:.6e} -> {global_min_lr:.6e}")
     elif resume_mode and preserve_scheduler and starting_samples == 0:
         # Keep existing scheduler only if not using global schedule
         print(f"[DEBUG] Preserved scheduler state (step {state.world_model.ae_scheduler.last_epoch})")
@@ -1223,10 +1255,19 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     val_spike_window = int(val_spike_window)  # Ensure integer for window size
 
     # Validation plateau tracking for early stopping (uses smoothed val loss to handle spikes)
+    # LEGACY: Ignored when plateau_sweep_enabled=True
     val_plateau_counter = 0  # Updates since last improvement
     best_val_loss_for_plateau = float('inf')  # Best smoothed val loss for plateau detection
     val_loss_ema_for_plateau = None  # EMA of validation loss for plateau detection
     val_loss_ema_alpha_plateau = 0.3  # Smoothing factor (higher = more responsive, lower = more smoothing)
+
+    # Plateau sweep state tracking (new mode - replaces ReduceLROnPlateau and val_plateau early stopping)
+    plateau_sweep_ema = None  # EMA of validation loss for sweep triggering
+    plateau_sweep_best = float('inf')  # Best EMA value seen (for improvement comparison)
+    plateau_sweep_patience_counter = 0  # Updates without significant improvement
+    plateau_sweep_in_cooldown = False  # True during post-sweep cooldown period
+    plateau_sweep_cooldown_remaining = 0  # Updates remaining in cooldown
+    trigger_lr_sweep = False  # Flag to signal sweep request to caller
 
     # Track total training time
     training_start_time = time.time()
@@ -1553,29 +1594,78 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                               f"val={val_loss:.6f} vs train_ema={smoothed_train_loss:.6f}")
                                 print(f"[DIVERGENCE] {stop_reason}")
 
-                    # Validation plateau detection (separate from divergence)
-                    # Uses smoothed validation loss (EMA) to handle spiky validation loss
-                    if val_loss is not None and val_plateau_patience > 0 and not stop_early:
-                        # Update EMA of validation loss
-                        if val_loss_ema_for_plateau is None:
-                            val_loss_ema_for_plateau = val_loss
-                        else:
-                            val_loss_ema_for_plateau = (val_loss_ema_alpha_plateau * val_loss +
-                                                        (1 - val_loss_ema_alpha_plateau) * val_loss_ema_for_plateau)
+                    # Plateau detection logic (two modes: legacy early stopping OR plateau sweep triggering)
+                    if val_loss is not None and not stop_early and not trigger_lr_sweep:
+                        if plateau_sweep_enabled:
+                            # NEW MODE: Plateau-triggered LR sweeps
+                            # Update EMA with higher alpha (more responsive)
+                            if plateau_sweep_ema is None:
+                                plateau_sweep_ema = val_loss
+                            else:
+                                plateau_sweep_ema = (plateau_sweep_ema_alpha * val_loss +
+                                                    (1 - plateau_sweep_ema_alpha) * plateau_sweep_ema)
 
-                        # Check improvement against smoothed value
-                        if val_loss_ema_for_plateau < best_val_loss_for_plateau - val_plateau_min_delta:
-                            best_val_loss_for_plateau = val_loss_ema_for_plateau
-                            val_plateau_counter = 0
-                        else:
-                            val_plateau_counter += 1
+                            # Check if in cooldown
+                            if plateau_sweep_in_cooldown:
+                                plateau_sweep_cooldown_remaining -= 1
+                                if plateau_sweep_cooldown_remaining <= 0:
+                                    plateau_sweep_in_cooldown = False
+                                    plateau_sweep_best = plateau_sweep_ema  # Reset baseline after cooldown
+                                    plateau_sweep_patience_counter = 0
+                                    print(f"[PLATEAU SWEEP] Cooldown ended, resetting baseline to {plateau_sweep_ema:.6f}")
+                            else:
+                                # Check for relative improvement
+                                if plateau_sweep_best > 0:
+                                    improvement = (plateau_sweep_best - plateau_sweep_ema) / plateau_sweep_best
+                                else:
+                                    improvement = 1.0 if plateau_sweep_ema < plateau_sweep_best else 0.0
 
-                        if val_plateau_counter >= val_plateau_patience:
-                            stop_early = True
-                            stop_reason = (f"Validation plateau: no improvement in {val_plateau_patience} updates "
-                                          f"(best_ema: {best_val_loss_for_plateau:.6f}, current_ema: {val_loss_ema_for_plateau:.6f}, "
-                                          f"current_raw: {val_loss:.6f}, min_delta: {val_plateau_min_delta})")
-                            print(f"[PLATEAU] {stop_reason}")
+                                if improvement > plateau_sweep_improvement_threshold:
+                                    # Significant improvement - reset counter
+                                    plateau_sweep_best = plateau_sweep_ema
+                                    plateau_sweep_patience_counter = 0
+                                else:
+                                    # No significant improvement
+                                    plateau_sweep_patience_counter += 1
+
+                                # Check if plateau reached and we can still trigger sweeps
+                                if plateau_sweep_patience_counter >= plateau_sweep_patience:
+                                    if plateau_sweep_count < plateau_sweep_max_sweeps:
+                                        # TRIGGER LR SWEEP
+                                        trigger_lr_sweep = True
+                                        print(f"[PLATEAU SWEEP] Triggered sweep #{plateau_sweep_count + 1}: "
+                                              f"no improvement > {plateau_sweep_improvement_threshold*100:.1f}% "
+                                              f"for {plateau_sweep_patience} updates "
+                                              f"(ema={plateau_sweep_ema:.6f}, best={plateau_sweep_best:.6f})")
+                                    else:
+                                        # Max sweeps reached - stop training
+                                        stop_early = True
+                                        stop_reason = (f"Max sweeps reached ({plateau_sweep_max_sweeps}): "
+                                                      f"validation loss plateaued after {plateau_sweep_count} LR sweeps")
+                                        print(f"[PLATEAU SWEEP] {stop_reason}")
+
+                        elif val_plateau_patience > 0:
+                            # LEGACY MODE: Validation plateau early stopping
+                            # Uses smoothed validation loss (EMA) to handle spiky validation loss
+                            if val_loss_ema_for_plateau is None:
+                                val_loss_ema_for_plateau = val_loss
+                            else:
+                                val_loss_ema_for_plateau = (val_loss_ema_alpha_plateau * val_loss +
+                                                            (1 - val_loss_ema_alpha_plateau) * val_loss_ema_for_plateau)
+
+                            # Check improvement against smoothed value
+                            if val_loss_ema_for_plateau < best_val_loss_for_plateau - val_plateau_min_delta:
+                                best_val_loss_for_plateau = val_loss_ema_for_plateau
+                                val_plateau_counter = 0
+                            else:
+                                val_plateau_counter += 1
+
+                            if val_plateau_counter >= val_plateau_patience:
+                                stop_early = True
+                                stop_reason = (f"Validation plateau: no improvement in {val_plateau_patience} updates "
+                                              f"(best_ema: {best_val_loss_for_plateau:.6f}, current_ema: {val_loss_ema_for_plateau:.6f}, "
+                                              f"current_raw: {val_loss:.6f}, min_delta: {val_plateau_min_delta})")
+                                print(f"[PLATEAU] {stop_reason}")
 
                     # Time budget check for LR sweep
                     if time_budget_min > 0 and not stop_early:
@@ -1677,6 +1767,17 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
                     yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
+
+                    # Check for sweep trigger - yield special sentinel and return
+                    if trigger_lr_sweep:
+                        # Get best checkpoint path from auto-saved checkpoints
+                        best_checkpoint_for_sweep = None
+                        if auto_saved_checkpoints:
+                            auto_saved_checkpoints.sort(key=lambda x: x[0])
+                            _, best_checkpoint_for_sweep = auto_saved_checkpoints[0]
+                        print(f"[PLATEAU SWEEP] Yielding sweep request with checkpoint: {best_checkpoint_for_sweep}, val_loss_ema={plateau_sweep_ema:.6f}")
+                        yield ("SWEEP_REQUESTED", samples_seen, best_checkpoint_for_sweep, plateau_sweep_count + 1, plateau_sweep_ema)
+                        return  # Exit generator - caller will handle sweep and restart
 
                     # Check for early stop after yield
                     if stop_early:
@@ -1893,29 +1994,78 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                               f"val={val_loss:.6f} vs train_ema={smoothed_train_loss:.6f}")
                                 print(f"[DIVERGENCE] {stop_reason}")
 
-                    # Validation plateau detection (separate from divergence)
-                    # Uses smoothed validation loss (EMA) to handle spiky validation loss
-                    if val_loss is not None and val_plateau_patience > 0 and not stop_early:
-                        # Update EMA of validation loss
-                        if val_loss_ema_for_plateau is None:
-                            val_loss_ema_for_plateau = val_loss
-                        else:
-                            val_loss_ema_for_plateau = (val_loss_ema_alpha_plateau * val_loss +
-                                                        (1 - val_loss_ema_alpha_plateau) * val_loss_ema_for_plateau)
+                    # Plateau detection logic (two modes: legacy early stopping OR plateau sweep triggering)
+                    if val_loss is not None and not stop_early and not trigger_lr_sweep:
+                        if plateau_sweep_enabled:
+                            # NEW MODE: Plateau-triggered LR sweeps
+                            # Update EMA with higher alpha (more responsive)
+                            if plateau_sweep_ema is None:
+                                plateau_sweep_ema = val_loss
+                            else:
+                                plateau_sweep_ema = (plateau_sweep_ema_alpha * val_loss +
+                                                    (1 - plateau_sweep_ema_alpha) * plateau_sweep_ema)
 
-                        # Check improvement against smoothed value
-                        if val_loss_ema_for_plateau < best_val_loss_for_plateau - val_plateau_min_delta:
-                            best_val_loss_for_plateau = val_loss_ema_for_plateau
-                            val_plateau_counter = 0
-                        else:
-                            val_plateau_counter += 1
+                            # Check if in cooldown
+                            if plateau_sweep_in_cooldown:
+                                plateau_sweep_cooldown_remaining -= 1
+                                if plateau_sweep_cooldown_remaining <= 0:
+                                    plateau_sweep_in_cooldown = False
+                                    plateau_sweep_best = plateau_sweep_ema  # Reset baseline after cooldown
+                                    plateau_sweep_patience_counter = 0
+                                    print(f"[PLATEAU SWEEP] Cooldown ended, resetting baseline to {plateau_sweep_ema:.6f}")
+                            else:
+                                # Check for relative improvement
+                                if plateau_sweep_best > 0:
+                                    improvement = (plateau_sweep_best - plateau_sweep_ema) / plateau_sweep_best
+                                else:
+                                    improvement = 1.0 if plateau_sweep_ema < plateau_sweep_best else 0.0
 
-                        if val_plateau_counter >= val_plateau_patience:
-                            stop_early = True
-                            stop_reason = (f"Validation plateau: no improvement in {val_plateau_patience} updates "
-                                          f"(best_ema: {best_val_loss_for_plateau:.6f}, current_ema: {val_loss_ema_for_plateau:.6f}, "
-                                          f"current_raw: {val_loss:.6f}, min_delta: {val_plateau_min_delta})")
-                            print(f"[PLATEAU] {stop_reason}")
+                                if improvement > plateau_sweep_improvement_threshold:
+                                    # Significant improvement - reset counter
+                                    plateau_sweep_best = plateau_sweep_ema
+                                    plateau_sweep_patience_counter = 0
+                                else:
+                                    # No significant improvement
+                                    plateau_sweep_patience_counter += 1
+
+                                # Check if plateau reached and we can still trigger sweeps
+                                if plateau_sweep_patience_counter >= plateau_sweep_patience:
+                                    if plateau_sweep_count < plateau_sweep_max_sweeps:
+                                        # TRIGGER LR SWEEP
+                                        trigger_lr_sweep = True
+                                        print(f"[PLATEAU SWEEP] Triggered sweep #{plateau_sweep_count + 1}: "
+                                              f"no improvement > {plateau_sweep_improvement_threshold*100:.1f}% "
+                                              f"for {plateau_sweep_patience} updates "
+                                              f"(ema={plateau_sweep_ema:.6f}, best={plateau_sweep_best:.6f})")
+                                    else:
+                                        # Max sweeps reached - stop training
+                                        stop_early = True
+                                        stop_reason = (f"Max sweeps reached ({plateau_sweep_max_sweeps}): "
+                                                      f"validation loss plateaued after {plateau_sweep_count} LR sweeps")
+                                        print(f"[PLATEAU SWEEP] {stop_reason}")
+
+                        elif val_plateau_patience > 0:
+                            # LEGACY MODE: Validation plateau early stopping
+                            # Uses smoothed validation loss (EMA) to handle spiky validation loss
+                            if val_loss_ema_for_plateau is None:
+                                val_loss_ema_for_plateau = val_loss
+                            else:
+                                val_loss_ema_for_plateau = (val_loss_ema_alpha_plateau * val_loss +
+                                                            (1 - val_loss_ema_alpha_plateau) * val_loss_ema_for_plateau)
+
+                            # Check improvement against smoothed value
+                            if val_loss_ema_for_plateau < best_val_loss_for_plateau - val_plateau_min_delta:
+                                best_val_loss_for_plateau = val_loss_ema_for_plateau
+                                val_plateau_counter = 0
+                            else:
+                                val_plateau_counter += 1
+
+                            if val_plateau_counter >= val_plateau_patience:
+                                stop_early = True
+                                stop_reason = (f"Validation plateau: no improvement in {val_plateau_patience} updates "
+                                              f"(best_ema: {best_val_loss_for_plateau:.6f}, current_ema: {val_loss_ema_for_plateau:.6f}, "
+                                              f"current_raw: {val_loss:.6f}, min_delta: {val_plateau_min_delta})")
+                                print(f"[PLATEAU] {stop_reason}")
 
                     # Time budget check for LR sweep
                     if time_budget_min > 0 and not stop_early:
@@ -2017,6 +2167,17 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
                     yield update_result
                     print(f"[DEBUG] Resumed after yield, continuing training...")
+
+                    # Check for sweep trigger - yield special sentinel and return
+                    if trigger_lr_sweep:
+                        # Get best checkpoint path from auto-saved checkpoints
+                        best_checkpoint_for_sweep = None
+                        if auto_saved_checkpoints:
+                            auto_saved_checkpoints.sort(key=lambda x: x[0])
+                            _, best_checkpoint_for_sweep = auto_saved_checkpoints[0]
+                        print(f"[PLATEAU SWEEP] Yielding sweep request with checkpoint: {best_checkpoint_for_sweep}, val_loss_ema={plateau_sweep_ema:.6f}")
+                        yield ("SWEEP_REQUESTED", samples_seen, best_checkpoint_for_sweep, plateau_sweep_count + 1, plateau_sweep_ema)
+                        return  # Exit generator - caller will handle sweep and restart
 
                     # Check for early stop after yield
                     if stop_early:

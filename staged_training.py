@@ -32,7 +32,7 @@ import random
 import re
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -79,6 +79,7 @@ from lr_sweep import (
     format_duration,
     run_lr_sweep_for_stage,
     run_main_training_parallel,
+    run_plateau_triggered_sweep,
 )
 
 
@@ -96,6 +97,11 @@ class StageResult:
     cumulative_metrics: dict
     final_train_loss: float
     final_val_loss: Optional[float]
+    # Plateau sweep tracking
+    sweep_history: list = field(default_factory=list)  # List of sweep results
+    total_sweeps_triggered: int = 0
+    initial_lr: float = 0.0
+    final_lr: float = 0.0
 
 
 @dataclass
@@ -153,6 +159,160 @@ def create_staged_vs_baseline_plot(
     ax.legend()
     ax.grid(True, alpha=0.3)
 
+    return fig
+
+
+def aggregate_sweep_data(
+    completed_stages: list[tuple[int, StageResult, Optional[StageResult]]],
+) -> dict:
+    """
+    Aggregate plateau sweep data across all stages for timeline visualization.
+
+    Args:
+        completed_stages: List of (stage_num, staged_result, baseline_result) tuples
+
+    Returns:
+        Dictionary with aggregated sweep statistics and per-stage data with
+        cumulative sample offsets for timeline plotting.
+    """
+    total_sweeps = 0
+    total_sweep_time_sec = 0.0
+    per_stage = []
+    cumulative_samples = 0
+
+    for stage_num, staged, _ in completed_stages:
+        sweep_history = staged.sweep_history if hasattr(staged, 'sweep_history') else []
+        sweep_count = len(sweep_history)
+        total_sweeps += sweep_count
+
+        stage_sweep_time = sum(s.get('sweep_duration_sec', 0) for s in sweep_history)
+        total_sweep_time_sec += stage_sweep_time
+
+        per_stage.append({
+            'stage_num': stage_num,
+            'sweep_count': sweep_count,
+            'sweep_history': sweep_history,
+            'initial_lr': staged.initial_lr if hasattr(staged, 'initial_lr') else 0.0,
+            'final_lr': staged.final_lr if hasattr(staged, 'final_lr') else 0.0,
+            'cumulative_samples_start': cumulative_samples,
+            'total_samples_trained': staged.total_samples_trained,
+            'cumulative_samples_end': cumulative_samples + staged.total_samples_trained,
+        })
+
+        cumulative_samples += staged.total_samples_trained
+
+    avg_sweep_duration = total_sweep_time_sec / total_sweeps if total_sweeps > 0 else 0.0
+
+    return {
+        'total_sweeps': total_sweeps,
+        'total_sweep_time_sec': total_sweep_time_sec,
+        'avg_sweep_duration_sec': avg_sweep_duration,
+        'stages_with_sweeps': sum(1 for s in per_stage if s['sweep_count'] > 0),
+        'per_stage': per_stage,
+        'total_samples': cumulative_samples,
+    }
+
+
+def create_plateau_sweep_timeline_plot(
+    completed_stages: list[tuple[int, StageResult, Optional[StageResult]]],
+) -> Optional[plt.Figure]:
+    """
+    Create timeline plot showing LR changes and plateau sweep events across all stages.
+
+    X-axis: Cumulative samples trained across all stages
+    Y-axis: Learning rate (log scale)
+    Markers: Vertical dashed lines at sweep trigger points, solid lines at stage boundaries
+
+    Args:
+        completed_stages: List of (stage_num, staged_result, baseline_result) tuples
+
+    Returns:
+        Matplotlib figure or None if no data to plot
+    """
+    sweep_data = aggregate_sweep_data(completed_stages)
+
+    if not sweep_data['per_stage']:
+        return None
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Color palette for stages
+    colors = plt.cm.tab10.colors
+    stage_colors = {s['stage_num']: colors[i % len(colors)] for i, s in enumerate(sweep_data['per_stage'])}
+
+    # Track all LR points for y-axis limits
+    all_lrs = []
+
+    for stage_info in sweep_data['per_stage']:
+        stage_num = stage_info['stage_num']
+        color = stage_colors[stage_num]
+        start_samples = stage_info['cumulative_samples_start']
+        end_samples = stage_info['cumulative_samples_end']
+        initial_lr = stage_info['initial_lr']
+        sweep_history = stage_info['sweep_history']
+
+        if initial_lr <= 0:
+            continue
+
+        all_lrs.append(initial_lr)
+
+        # Build LR segments for this stage
+        lr_points = [(start_samples, initial_lr)]
+        current_lr = initial_lr
+
+        for sweep in sorted(sweep_history, key=lambda s: s.get('triggered_at_samples', 0)):
+            trigger_samples = start_samples + sweep.get('triggered_at_samples', 0)
+            selected_lr = sweep.get('selected_lr', current_lr)
+
+            # Add point just before sweep
+            lr_points.append((trigger_samples, current_lr))
+            # Add point after sweep with new LR
+            lr_points.append((trigger_samples, selected_lr))
+
+            all_lrs.append(selected_lr)
+            current_lr = selected_lr
+
+            # Draw vertical dashed line for sweep trigger
+            ax.axvline(x=trigger_samples, color=color, linestyle='--', alpha=0.6, linewidth=1.5)
+
+            # Annotate sweep
+            sweep_num = sweep.get('sweep_num', '?')
+            ax.annotate(
+                f'S{stage_num}#{sweep_num}',
+                xy=(trigger_samples, selected_lr),
+                xytext=(5, 10), textcoords='offset points',
+                fontsize=8, color=color, alpha=0.8,
+            )
+
+        # Add final point at stage end
+        lr_points.append((end_samples, current_lr))
+
+        # Plot LR line for this stage
+        x_vals = [p[0] for p in lr_points]
+        y_vals = [p[1] for p in lr_points]
+        ax.plot(x_vals, y_vals, color=color, linewidth=2, marker='o', markersize=4,
+                label=f'Stage {stage_num}')
+
+        # Draw stage boundary (solid vertical line)
+        if start_samples > 0:
+            ax.axvline(x=start_samples, color='gray', linestyle='-', alpha=0.3, linewidth=2)
+
+    # Configure axes
+    ax.set_xlabel('Cumulative Samples Trained', fontsize=11)
+    ax.set_ylabel('Learning Rate', fontsize=11)
+    ax.set_title('Learning Rate Timeline with Plateau Sweeps', fontsize=12, fontweight='bold')
+    ax.set_yscale('log')
+
+    # Set y-axis limits with padding
+    if all_lrs:
+        min_lr = min(all_lrs) * 0.5
+        max_lr = max(all_lrs) * 2
+        ax.set_ylim(min_lr, max_lr)
+
+    ax.grid(True, alpha=0.3, which='both')
+    ax.legend(loc='upper right', fontsize=9)
+
+    plt.tight_layout()
     return fig
 
 
@@ -403,96 +563,198 @@ def run_stage_training(
         effective_total_samples = cfg.total_samples
         print(f"Fixed sample budget: {effective_total_samples:,} samples")
 
-    # Run batch training generator
+    # Plateau sweep tracking
+    sweep_history = []
+    sweep_count = 0  # Total sweeps triggered (for reporting)
+    consecutive_sweep_count = 0  # Consecutive sweeps within same plateau (resets on improvement)
+    val_loss_at_plateau_start = None  # Baseline for detecting improvement between sweeps
+    initial_lr = cfg.custom_lr
+    current_lr = cfg.custom_lr
+    current_checkpoint = checkpoint_path
+
+    # Determine if plateau sweep mode is enabled
+    plateau_sweep_enabled = hasattr(cfg, 'plateau_sweep') and cfg.plateau_sweep.enabled
+
+    # Run batch training generator (with sweep loop if plateau_sweep_enabled)
+    training_complete = False
     try:
-        generator = training.run_world_model_batch(
-            total_samples=effective_total_samples,
-            batch_size=cfg.batch_size,
-            current_observation_idx=cfg.selected_frame_offset,
-            update_interval=cfg.update_interval,
-            window_size=cfg.window_size,
-            num_random_obs=cfg.num_random_obs_to_visualize,
-            num_best_models_to_keep=cfg.num_best_models_to_keep,
-            enable_wandb=cfg.enable_wandb,
-            wandb_run_name=wandb_run_name,
-            # Resume mode
-            resume_mode=resume_mode,
-            samples_mode=cfg.samples_mode,
-            starting_samples=starting_samples,
-            preserve_optimizer=cfg.preserve_optimizer,
-            preserve_scheduler=cfg.preserve_scheduler,
-            # Learning rate
-            custom_lr=cfg.custom_lr,
-            disable_lr_scaling=cfg.disable_lr_scaling,
-            custom_warmup=cfg.custom_warmup,
-            lr_min_ratio=cfg.lr_min_ratio,
-            resume_warmup_ratio=cfg.resume_warmup_ratio,
-            # Sampling
-            sampling_mode=cfg.sampling_mode,
-            # Loss-weighted
-            loss_weight_temperature=cfg.loss_weight_temperature,
-            loss_weight_refresh_interval=cfg.loss_weight_refresh_interval,
-            # Divergence
-            stop_on_divergence=cfg.stop_on_divergence,
-            divergence_gap=cfg.divergence_gap,
-            divergence_ratio=cfg.divergence_ratio,
-            divergence_patience=cfg.divergence_patience,
-            divergence_min_updates=cfg.divergence_min_updates,
-            val_spike_threshold=cfg.val_spike_threshold,
-            val_spike_window=cfg.val_spike_window,
-            val_spike_frequency=cfg.val_spike_frequency,
-            # Validation plateau early stopping
-            val_plateau_patience=cfg.val_plateau_patience,
-            val_plateau_min_delta=cfg.val_plateau_min_delta,
-            # ReduceLROnPlateau
-            plateau_factor=cfg.plateau_factor,
-            plateau_patience=cfg.plateau_patience,
-            # Baseline comparison parameters (for W&B logging)
-            is_baseline_run=is_baseline,
-            enable_baseline=cfg.enable_baseline,
-            baseline_runs_per_stage=cfg.baseline_runs_per_stage,
-            # Time budget for LR sweep
-            time_budget_min=time_budget_min,
-            min_samples_for_timeout=cfg.lr_sweep.min_samples_before_timeout if hasattr(cfg, 'lr_sweep') else 1000,
-        )
+        while not training_complete:
+            # Determine if we can still trigger sweeps (based on consecutive count, not total)
+            can_trigger_sweep = (plateau_sweep_enabled and
+                                consecutive_sweep_count < cfg.plateau_sweep.max_sweeps_per_stage)
 
-        # Consume generator and collect results
-        for result in generator:
-            if result is None:
-                continue
+            generator = training.run_world_model_batch(
+                total_samples=effective_total_samples,
+                batch_size=cfg.batch_size,
+                current_observation_idx=cfg.selected_frame_offset,
+                update_interval=cfg.update_interval,
+                window_size=cfg.window_size,
+                num_random_obs=cfg.num_random_obs_to_visualize,
+                num_best_models_to_keep=cfg.num_best_models_to_keep,
+                enable_wandb=cfg.enable_wandb,
+                wandb_run_name=wandb_run_name,
+                # Resume mode
+                resume_mode=(current_checkpoint is not None),
+                samples_mode=cfg.samples_mode,
+                starting_samples=starting_samples,
+                preserve_optimizer=cfg.preserve_optimizer,
+                preserve_scheduler=cfg.preserve_scheduler,
+                # Learning rate
+                custom_lr=current_lr,
+                disable_lr_scaling=cfg.disable_lr_scaling,
+                custom_warmup=cfg.custom_warmup,
+                lr_min_ratio=cfg.lr_min_ratio,
+                resume_warmup_ratio=cfg.resume_warmup_ratio,
+                # Sampling
+                sampling_mode=cfg.sampling_mode,
+                # Loss-weighted
+                loss_weight_temperature=cfg.loss_weight_temperature,
+                loss_weight_refresh_interval=cfg.loss_weight_refresh_interval,
+                # Divergence
+                stop_on_divergence=cfg.stop_on_divergence,
+                divergence_gap=cfg.divergence_gap,
+                divergence_ratio=cfg.divergence_ratio,
+                divergence_patience=cfg.divergence_patience,
+                divergence_min_updates=cfg.divergence_min_updates,
+                val_spike_threshold=cfg.val_spike_threshold,
+                val_spike_window=cfg.val_spike_window,
+                val_spike_frequency=cfg.val_spike_frequency,
+                # Validation plateau early stopping (legacy - ignored when plateau_sweep_enabled)
+                val_plateau_patience=cfg.val_plateau_patience if not plateau_sweep_enabled else 0,
+                val_plateau_min_delta=cfg.val_plateau_min_delta,
+                # ReduceLROnPlateau (legacy - ignored when plateau_sweep_enabled)
+                plateau_factor=cfg.plateau_factor,
+                plateau_patience=cfg.plateau_patience,
+                # Baseline comparison parameters (for W&B logging)
+                is_baseline_run=is_baseline,
+                enable_baseline=cfg.enable_baseline,
+                baseline_runs_per_stage=cfg.baseline_runs_per_stage,
+                # Time budget for LR sweep
+                time_budget_min=time_budget_min,
+                min_samples_for_timeout=cfg.lr_sweep.min_samples_before_timeout if hasattr(cfg, 'lr_sweep') else 1000,
+                # Plateau sweep parameters
+                plateau_sweep_enabled=can_trigger_sweep,
+                plateau_sweep_ema_alpha=cfg.plateau_sweep.plateau_ema_alpha if plateau_sweep_enabled else 0.9,
+                plateau_sweep_improvement_threshold=cfg.plateau_sweep.plateau_improvement_threshold if plateau_sweep_enabled else 0.005,
+                plateau_sweep_patience=cfg.plateau_sweep.plateau_patience if plateau_sweep_enabled else 10,
+                plateau_sweep_cooldown_updates=cfg.plateau_sweep.cooldown_updates if plateau_sweep_enabled else 10,
+                plateau_sweep_max_sweeps=cfg.plateau_sweep.max_sweeps_per_stage if plateau_sweep_enabled else 3,
+                plateau_sweep_count=consecutive_sweep_count,
+            )
 
-            # Unpack result tuple (matches generate_batch_training_update output)
-            (status_msg, loss_fig, loss_recent_fig, lr_fig, weights_fig,
-             eval_loss_fig, eval_dist_fig, obs_status, obs_fig) = result
+            # Consume generator and collect results
+            sweep_triggered = False
+            for result in generator:
+                if result is None:
+                    continue
 
-            # Parse status for metrics
-            if "samples" in status_msg.lower():
-                # Extract samples count from status
-                match = re.search(r"(\d+)\s*/\s*(\d+|\?+)", status_msg)
-                if match:
-                    samples_seen = int(match.group(1))
+                # Check for sweep request sentinel
+                if isinstance(result, tuple) and len(result) >= 5 and result[0] == "SWEEP_REQUESTED":
+                    _, samples_at_sweep, checkpoint_for_sweep, new_consecutive_count, val_loss_at_trigger = result
+                    sweep_triggered = True
+                    sweep_count += 1  # Total sweeps (for reporting)
 
-            # Check for stop reason in status (use specific phrases to avoid false positives)
-            status_lower = status_msg.lower()
-            if "nan" in status_lower or "inf loss" in status_lower:
-                stop_reason = "nan_loss"
-            elif "divergence detected" in status_lower:
-                stop_reason = "divergence"
-            elif "validation plateau" in status_lower:
-                stop_reason = "val_plateau"
-            elif "time budget" in status_lower:
-                stop_reason = "time_budget"
-            elif "training complete" in status_lower or "training finished" in status_lower:
-                stop_reason = "completed"
+                    # Determine if this is a new plateau (improvement) or same plateau (consecutive)
+                    improvement_threshold = cfg.plateau_sweep.plateau_improvement_threshold if plateau_sweep_enabled else 0.0005
+                    if val_loss_at_plateau_start is None:
+                        # First sweep - establish baseline
+                        val_loss_at_plateau_start = val_loss_at_trigger
+                        consecutive_sweep_count = 1
+                        print(f"\n[STAGED TRAINING] Sweep #{sweep_count} (consecutive: {consecutive_sweep_count}) - first plateau at val_loss={val_loss_at_trigger:.6f}")
+                    elif val_loss_at_trigger < val_loss_at_plateau_start * (1 - improvement_threshold):
+                        # Improvement detected - this is a new plateau, reset consecutive count
+                        print(f"\n[STAGED TRAINING] Sweep #{sweep_count} - improvement detected: {val_loss_at_trigger:.6f} < {val_loss_at_plateau_start:.6f} * {1 - improvement_threshold:.4f}")
+                        val_loss_at_plateau_start = val_loss_at_trigger
+                        consecutive_sweep_count = 1
+                        print(f"[STAGED TRAINING] New plateau - reset consecutive count to {consecutive_sweep_count}")
+                    else:
+                        # No improvement - same plateau, increment consecutive count
+                        consecutive_sweep_count = new_consecutive_count
+                        print(f"\n[STAGED TRAINING] Sweep #{sweep_count} (consecutive: {consecutive_sweep_count}) - same plateau, val_loss={val_loss_at_trigger:.6f} vs baseline={val_loss_at_plateau_start:.6f}")
 
-            # Close figures to free memory
-            for fig in [loss_fig, loss_recent_fig, lr_fig, weights_fig,
-                        eval_loss_fig, eval_dist_fig, obs_fig]:
-                if fig is not None:
-                    plt.close(fig)
+                    print(f"[STAGED TRAINING] Checkpoint for sweep: {checkpoint_for_sweep}")
+
+                    # Run plateau-triggered sweep (uses phase budgets from lr_sweep config)
+                    sweep_start_time = time.time()
+                    new_lr, new_checkpoint = run_plateau_triggered_sweep(
+                        sweep_number=sweep_count,
+                        train_session_path=train_session["session_dir"],
+                        val_session_path=val_session["session_dir"],
+                        current_checkpoint=checkpoint_for_sweep,
+                        cfg_dict=cfg.to_dict(),
+                        output_dir=output_dir,
+                        run_id=run_id,
+                    )
+                    sweep_elapsed = time.time() - sweep_start_time
+
+                    # Record sweep in history
+                    sweep_history.append({
+                        'sweep_num': sweep_count,
+                        'consecutive_num': consecutive_sweep_count,
+                        'triggered_at_samples': samples_at_sweep,
+                        'triggered_at_time': time.time() - start_time - sweep_elapsed,
+                        'val_loss_at_trigger': val_loss_at_trigger,
+                        'selected_lr': new_lr,
+                        'checkpoint_path': new_checkpoint,
+                        'sweep_duration_sec': sweep_elapsed,
+                    })
+
+                    # Update for next iteration
+                    current_lr = new_lr
+                    current_checkpoint = new_checkpoint
+                    # Update starting_samples from the checkpoint we'll resume from
+                    if new_checkpoint:
+                        try:
+                            ckpt = torch.load(new_checkpoint, map_location='cpu')
+                            starting_samples = ckpt.get('samples_seen', samples_at_sweep)
+                        except Exception:
+                            starting_samples = samples_at_sweep
+
+                    print(f"[STAGED TRAINING] Continuing training with LR={new_lr:.2e}, consecutive={consecutive_sweep_count}/{cfg.plateau_sweep.max_sweeps_per_stage}")
+                    break  # Exit generator loop to restart with new LR/checkpoint
+
+                # Normal result - unpack tuple (matches generate_batch_training_update output)
+                if isinstance(result, tuple) and len(result) == 9:
+                    (status_msg, loss_fig, loss_recent_fig, lr_fig, weights_fig,
+                     eval_loss_fig, eval_dist_fig, obs_status, obs_fig) = result
+
+                    # Parse status for metrics
+                    if isinstance(status_msg, str) and "samples" in status_msg.lower():
+                        # Extract samples count from status
+                        match = re.search(r"(\d+)\s*/\s*(\d+|\?+)", status_msg)
+                        if match:
+                            samples_seen = int(match.group(1))
+
+                    # Check for stop reason in status (use specific phrases to avoid false positives)
+                    if isinstance(status_msg, str):
+                        status_lower = status_msg.lower()
+                        if "nan" in status_lower or "inf loss" in status_lower:
+                            stop_reason = "nan_loss"
+                        elif "divergence detected" in status_lower:
+                            stop_reason = "divergence"
+                        elif "validation plateau" in status_lower:
+                            stop_reason = "val_plateau"
+                        elif "max sweeps reached" in status_lower:
+                            stop_reason = f"max_sweeps ({cfg.plateau_sweep.max_sweeps_per_stage})"
+                        elif "time budget" in status_lower:
+                            stop_reason = "time_budget"
+                        elif "training complete" in status_lower or "training finished" in status_lower:
+                            stop_reason = "completed"
+
+                    # Close figures to free memory
+                    for fig in [loss_fig, loss_recent_fig, lr_fig, weights_fig,
+                                eval_loss_fig, eval_dist_fig, obs_fig]:
+                        if fig is not None:
+                            plt.close(fig)
+
+            # If no sweep was triggered, training is complete
+            if not sweep_triggered:
+                training_complete = True
 
     except Exception as e:
         print(f"Training error: {e}")
+        import traceback
+        traceback.print_exc()
         stop_reason = f"error: {str(e)}"
 
     elapsed_time = time.time() - start_time
@@ -557,6 +819,11 @@ def run_stage_training(
         cumulative_metrics=state.cumulative_metrics,  # Get from state (populated by run_world_model_batch)
         final_train_loss=final_train_loss,
         final_val_loss=final_val_loss,
+        # Plateau sweep tracking
+        sweep_history=sweep_history,
+        total_sweeps_triggered=sweep_count,
+        initial_lr=initial_lr,
+        final_lr=current_lr,
     )
 
 
@@ -829,6 +1096,116 @@ def generate_stage_report(
     print(f"  Report saved to {output_dir / 'report.html'}")
 
 
+def generate_sweep_history_html(sweep_history: list) -> str:
+    """Generate HTML table for sweep history."""
+    if not sweep_history:
+        return "<p>No plateau-triggered sweeps occurred during this training run.</p>"
+
+    rows = ""
+    for sweep in sweep_history:
+        rows += f"""
+        <tr>
+            <td>{sweep.get('sweep_num', 'N/A')}</td>
+            <td>{sweep.get('triggered_at_samples', 'N/A'):,}</td>
+            <td>{format_duration(sweep.get('triggered_at_time', 0))}</td>
+            <td>{sweep.get('selected_lr', 0):.2e}</td>
+            <td>{format_duration(sweep.get('sweep_duration_sec', 0))}</td>
+        </tr>"""
+
+    return f"""
+    <table class="stats-table">
+        <tr>
+            <th>Sweep #</th>
+            <th>Triggered At (samples)</th>
+            <th>Wall Time</th>
+            <th>Selected LR</th>
+            <th>Sweep Duration</th>
+        </tr>
+        {rows}
+    </table>
+    """
+
+
+def generate_plateau_sweep_summary_html(
+    completed_stages: list[tuple[int, StageResult, Optional[StageResult]]],
+) -> str:
+    """
+    Generate HTML summary of plateau sweeps across all stages.
+
+    Args:
+        completed_stages: List of (stage_num, staged_result, baseline_result) tuples
+
+    Returns:
+        HTML string with summary statistics and per-stage sweep tables.
+    """
+    sweep_data = aggregate_sweep_data(completed_stages)
+
+    if sweep_data['total_sweeps'] == 0:
+        return "<p>No plateau-triggered sweeps occurred during training.</p>"
+
+    # Summary metrics box
+    summary_html = f"""
+    <div class="metric">
+        <strong>Total Sweeps:</strong> {sweep_data['total_sweeps']}<br>
+        <strong>Stages with Sweeps:</strong> {sweep_data['stages_with_sweeps']} of {len(sweep_data['per_stage'])}<br>
+        <strong>Total Sweep Time:</strong> {format_duration(sweep_data['total_sweep_time_sec'])}<br>
+        <strong>Average Sweep Duration:</strong> {format_duration(sweep_data['avg_sweep_duration_sec'])}
+    </div>
+    """
+
+    # Per-stage details
+    per_stage_html = ""
+    for stage_info in sweep_data['per_stage']:
+        stage_num = stage_info['stage_num']
+        sweep_count = stage_info['sweep_count']
+        initial_lr = stage_info['initial_lr']
+        final_lr = stage_info['final_lr']
+        sweep_history = stage_info['sweep_history']
+
+        # Build LR progression string
+        if sweep_count > 0 and initial_lr > 0:
+            lr_progression = f"{initial_lr:.1e}"
+            for sweep in sorted(sweep_history, key=lambda s: s.get('sweep_num', 0)):
+                lr_progression += f" → {sweep.get('selected_lr', 0):.1e}"
+        elif initial_lr > 0:
+            lr_progression = f"{initial_lr:.1e} (unchanged)"
+        else:
+            lr_progression = "N/A"
+
+        per_stage_html += f"""
+        <h3>Stage {stage_num}: {sweep_count} sweep{'s' if sweep_count != 1 else ''}</h3>
+        <p><strong>LR Progression:</strong> {lr_progression}</p>
+        """
+
+        if sweep_count > 0:
+            # Generate table for this stage's sweeps
+            rows = ""
+            for sweep in sorted(sweep_history, key=lambda s: s.get('sweep_num', 0)):
+                rows += f"""
+                <tr>
+                    <td>{sweep.get('sweep_num', 'N/A')}</td>
+                    <td>{sweep.get('triggered_at_samples', 0):,}</td>
+                    <td>{format_duration(sweep.get('triggered_at_time', 0))}</td>
+                    <td>{sweep.get('selected_lr', 0):.2e}</td>
+                    <td>{format_duration(sweep.get('sweep_duration_sec', 0))}</td>
+                </tr>"""
+
+            per_stage_html += f"""
+            <table>
+                <tr>
+                    <th>Sweep #</th>
+                    <th>Triggered At (samples)</th>
+                    <th>Wall Time</th>
+                    <th>Selected LR</th>
+                    <th>Duration</th>
+                </tr>
+                {rows}
+            </table>
+            """
+
+    return summary_html + per_stage_html
+
+
 def generate_stage_html(
     result: StageResult,
     images: dict,
@@ -901,6 +1278,16 @@ def generate_stage_html(
             <strong>Name:</strong> {Path(result.best_checkpoint_path).name}<br>
             <strong>Hybrid Loss:</strong> {format_loss_safe(result.best_loss)}
         </div>
+    </section>
+
+    <section id="lr-sweeps">
+        <h2>Learning Rate Sweeps</h2>
+        <div class="metric">
+            <strong>Initial LR:</strong> {result.initial_lr:.2e}<br>
+            <strong>Final LR:</strong> {result.final_lr:.2e}<br>
+            <strong>Total Sweeps Triggered:</strong> {result.total_sweeps_triggered}
+        </div>
+        {generate_sweep_history_html(result.sweep_history)}
     </section>
 
     <section id="training-progress">
@@ -1037,103 +1424,64 @@ def generate_final_report(
     # Calculate total elapsed time
     total_elapsed = time.time() - overall_start_time
 
-    # Build timing summary table
+    # Build timing summary table (using plateau sweep data from stage results)
     timing_rows = ""
-    for timing in all_timings:
+    total_sweep_count = 0
+    total_sweep_time = 0.0
+    total_main_time = 0.0
+    total_stage_time = 0.0
+
+    for stage_num, staged, _ in completed_stages:
+        # Calculate plateau sweep time from sweep_history
+        sweep_history = staged.sweep_history if hasattr(staged, 'sweep_history') else []
+        sweep_time = sum(s.get('sweep_duration_sec', 0) for s in sweep_history)
+        sweep_count = len(sweep_history)
+
+        # Main training time = stage time minus sweep time
+        main_time = staged.elapsed_time - sweep_time
+
+        total_sweep_count += sweep_count
+        total_sweep_time += sweep_time
+        total_main_time += main_time
+        total_stage_time += staged.elapsed_time
+
         timing_rows += f"""
         <tr>
-            <td>Stage {timing.stage_num}</td>
-            <td>{format_duration(timing.lr_sweep_phase_a_sec)}</td>
-            <td>{format_duration(timing.lr_sweep_phase_b_sec)}</td>
-            <td>{format_duration(timing.lr_sweep_total_sec)}</td>
-            <td>{format_duration(timing.main_training_sec)}</td>
-            <td>{format_duration(timing.total_stage_sec)}</td>
+            <td>Stage {stage_num}</td>
+            <td>{sweep_count}</td>
+            <td>{format_duration(sweep_time)}</td>
+            <td>{format_duration(main_time)}</td>
+            <td>{format_duration(staged.elapsed_time)}</td>
         </tr>
         """
-
-    # Total row
-    total_phase_a = sum(t.lr_sweep_phase_a_sec for t in all_timings)
-    total_phase_b = sum(t.lr_sweep_phase_b_sec for t in all_timings)
-    total_sweep = sum(t.lr_sweep_total_sec for t in all_timings)
-    total_main = sum(t.main_training_sec for t in all_timings)
-    total_stage = sum(t.total_stage_sec for t in all_timings)
 
     timing_rows += f"""
     <tr style="background: #e0e0e0; font-weight: bold;">
         <td>TOTAL</td>
-        <td>{format_duration(total_phase_a)}</td>
-        <td>{format_duration(total_phase_b)}</td>
-        <td>{format_duration(total_sweep)}</td>
-        <td>{format_duration(total_main)}</td>
-        <td>{format_duration(total_stage)}</td>
+        <td>{total_sweep_count}</td>
+        <td>{format_duration(total_sweep_time)}</td>
+        <td>{format_duration(total_main_time)}</td>
+        <td>{format_duration(total_stage_time)}</td>
     </tr>
     """
 
-    # Build detailed LR sweep tables
-    lr_details_html = ""
-    for sweep in all_sweep_results:
-        # Phase A table
-        phase_a_rows = ""
-        for agg in sorted(sweep.phase_a.lr_results, key=lambda r: r.median_best_val):
-            survivor = "✓" if agg.lr in sweep.phase_a.survivors else ""
-            phase_a_rows += f"""
-            <tr>
-                <td>{agg.lr:.2e}</td>
-                <td>{format_loss_safe(agg.median_best_val)}</td>
-                <td>{format_loss_safe(agg.mean_best_val)}</td>
-                <td>±{format_loss_safe(agg.std_best_val)}</td>
-                <td>{agg.num_seeds}</td>
-                <td style="text-align: center;">{survivor}</td>
-            </tr>
-            """
-
-        # Phase B table
-        phase_b_rows = ""
-        for agg in sorted(sweep.phase_b.lr_results, key=lambda r: r.median_best_val):
-            winner = "★" if agg.lr == sweep.selected_lr else ""
-            phase_b_rows += f"""
-            <tr>
-                <td>{agg.lr:.2e}</td>
-                <td>{format_loss_safe(agg.median_best_val)}</td>
-                <td>{format_loss_safe(agg.mean_best_val)}</td>
-                <td>±{format_loss_safe(agg.std_best_val)}</td>
-                <td>{agg.num_seeds}</td>
-                <td style="text-align: center;">{winner}</td>
-            </tr>
-            """
-
-        lr_details_html += f"""
-        <h3>Stage {sweep.stage_num} LR Sweep</h3>
-        <p><strong>Selected LR:</strong> {sweep.selected_lr:.2e}</p>
-        <h4>Phase A: {len(sweep.phase_a.lr_results)} candidates → {len(sweep.phase_a.survivors)} survivors</h4>
-        <table>
-            <tr>
-                <th>Learning Rate</th>
-                <th>Median Loss</th>
-                <th>Mean Loss</th>
-                <th>Std Dev</th>
-                <th>Seeds</th>
-                <th>Survivor</th>
-            </tr>
-            {phase_a_rows}
-        </table>
-        <h4>Phase B: {len(sweep.phase_b.lr_results)} candidates</h4>
-        <table>
-            <tr>
-                <th>Learning Rate</th>
-                <th>Median Loss</th>
-                <th>Mean Loss</th>
-                <th>Std Dev</th>
-                <th>Seeds</th>
-                <th>Winner</th>
-            </tr>
-            {phase_b_rows}
-        </table>
-        """
+    # Build plateau sweep details (default mode - sweeps triggered on plateau during training)
+    lr_details_html = generate_plateau_sweep_summary_html(completed_stages)
 
     # Build basic stage results table (always available)
     stage_results_rows = ""
+    total_plateau_sweeps = 0
+    stop_reason_counts = {}
     for stage_num, staged, baseline in completed_stages:
+        # Track plateau sweeps
+        sweeps = staged.total_sweeps_triggered if hasattr(staged, 'total_sweeps_triggered') else 0
+        total_plateau_sweeps += sweeps
+        lr_info = f"{staged.initial_lr:.1e}→{staged.final_lr:.1e}" if hasattr(staged, 'initial_lr') and staged.initial_lr != staged.final_lr else f"{staged.initial_lr:.1e}" if hasattr(staged, 'initial_lr') else "N/A"
+
+        # Track stop reasons
+        reason_key = staged.stop_reason.split("(")[0].strip()  # Get base reason
+        stop_reason_counts[reason_key] = stop_reason_counts.get(reason_key, 0) + 1
+
         stage_results_rows += f"""
         <tr>
             <td>Stage {stage_num}</td>
@@ -1141,8 +1489,13 @@ def generate_final_report(
             <td>{staged.stop_reason}</td>
             <td>{staged.total_samples_trained:,}</td>
             <td>{format_duration(staged.elapsed_time)}</td>
+            <td>{sweeps}</td>
+            <td>{lr_info}</td>
         </tr>
         """
+
+    # Build stop reason breakdown
+    stop_reason_html = "<ul>" + "".join(f"<li><strong>{reason}:</strong> {count} stages</li>" for reason, count in sorted(stop_reason_counts.items())) + "</ul>"
 
     # === Sections that require original_session evaluation (only on final call) ===
     best_checkpoint_html = ""
@@ -1239,18 +1592,17 @@ def generate_final_report(
     </section>
 """
 
-        # Learning rate graph for best stage
+        # Learning rate timeline with plateau sweeps across all stages
         lr_b64 = ""
-        if best_run_result.cumulative_metrics.get("lr_at_sample"):
-            fig_lr = visualization.create_lr_vs_samples_plot(best_run_result.cumulative_metrics)
-            if fig_lr:
-                lr_b64 = fig_to_base64(fig_lr)
-                plt.close(fig_lr)
+        fig_lr = create_plateau_sweep_timeline_plot(completed_stages)
+        if fig_lr:
+            lr_b64 = fig_to_base64(fig_lr)
+            plt.close(fig_lr)
 
         lr_schedule_html = f"""
-    <section id="learning-rate">
-        <h2>Learning Rate Schedule (Best Stage)</h2>
-        {'<img src="data:image/png;base64,' + lr_b64 + '" />' if lr_b64 else "<p>No learning rate data available</p>"}
+    <section id="lr-timeline">
+        <h2>Learning Rate Timeline with Plateau Sweeps</h2>
+        {'<img src="data:image/png;base64,' + lr_b64 + '" />' if lr_b64 else "<p>No plateau sweep data available</p>"}
     </section>
 """ if lr_b64 else ""
 
@@ -1639,17 +1991,16 @@ def generate_final_report(
         <table>
             <tr>
                 <th>Stage</th>
-                <th>Phase A</th>
-                <th>Phase B</th>
-                <th>LR Sweep Total</th>
-                <th>Main Training</th>
+                <th>Plateau Sweeps</th>
+                <th>Sweep Time</th>
+                <th>Training Time</th>
                 <th>Stage Total</th>
             </tr>
             {timing_rows}
         </table>
     </section>
 
-    {f'<section id="lr-sweep"><h2>LR Sweep Details</h2>{lr_details_html}</section>' if all_sweep_results else ""}
+    {f'<section id="plateau-sweeps"><h2>Plateau Sweep Details</h2>{lr_details_html}</section>' if total_plateau_sweeps > 0 else ""}
 
     <section id="stage-results">
         <h2>Stage Results</h2>
@@ -1660,9 +2011,17 @@ def generate_final_report(
                 <th>Stop Reason</th>
                 <th>Samples Trained</th>
                 <th>Time</th>
+                <th>Sweeps</th>
+                <th>LR (Initial→Final)</th>
             </tr>
             {stage_results_rows}
         </table>
+        <p><strong>Total Plateau Sweeps:</strong> {total_plateau_sweeps}</p>
+    </section>
+
+    <section id="stop-reasons">
+        <h2>Stop Reason Breakdown</h2>
+        {stop_reason_html}
     </section>
 
     {best_checkpoint_html}
@@ -1787,12 +2146,12 @@ def run_staged_training(
         print(f"Loading validation session: {Path(val_path).name}")
         val_session = load_session_for_training(val_path)
 
-        # LR Sweep (if enabled)
+        # Upfront LR Sweep (when plateau sweep is disabled)
         selected_lr = cfg.custom_lr
         sweep_result = None
         sweep_elapsed = 0.0
 
-        if cfg.lr_sweep.enabled:
+        if not cfg.plateau_sweep.enabled:
             sweep_start = time.time()
             print(f"\n--- LR Sweep for Stage {stage_num} ---")
 
@@ -1966,12 +2325,12 @@ def run_staged_training(
             print(f"Loading validation session: {Path(val_path).name}")
             val_session = load_session_for_training(val_path)
 
-            # Baseline LR Sweep (if enabled) - separate sweep with fresh weights
+            # Baseline Upfront LR Sweep (when plateau sweep is disabled) - separate sweep with fresh weights
             baseline_selected_lr = cfg.custom_lr
             baseline_sweep_result = None
             baseline_sweep_elapsed = 0.0
 
-            if cfg.lr_sweep.enabled:
+            if not cfg.plateau_sweep.enabled:
                 baseline_sweep_start = time.time()
                 print(f"\n--- Baseline LR Sweep for Stage {stage_num} ---")
 
@@ -2158,9 +2517,9 @@ def main():
     )
     # LR Sweep arguments
     parser.add_argument(
-        "--enable-lr-sweep",
+        "--disable-plateau-sweep",
         action="store_true",
-        help="Enable learning rate sweep before each stage",
+        help="Disable plateau-triggered sweeps (default mode). Enables upfront LR sweep before each stage instead.",
     )
     parser.add_argument(
         "--lr-sweep-lr-min",
@@ -2231,9 +2590,9 @@ def main():
     if args.runs_per_stage is not None:
         cfg.runs_per_stage = args.runs_per_stage
 
-    # Override LR sweep settings from CLI
-    if args.enable_lr_sweep:
-        cfg.lr_sweep.enabled = True
+    # Override sweep mode from CLI
+    if args.disable_plateau_sweep:
+        cfg.plateau_sweep.enabled = False
     if args.lr_sweep_lr_min != 1e-6:
         cfg.lr_sweep.lr_min = args.lr_sweep_lr_min
     if args.lr_sweep_lr_max != 1e-2:

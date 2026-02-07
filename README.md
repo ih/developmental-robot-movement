@@ -227,21 +227,24 @@ python create_staged_splits.py --session-path saved/sessions/so101/my_session --
 
 **2. Run Staged Training:**
 ```bash
-# Basic usage (LR sweep enabled by default)
+# Basic usage (plateau-triggered sweeps enabled by default)
 python staged_training.py --root-session saved/sessions/so101/my_session
 
 # Multiple runs per stage for robustness
 python staged_training.py --root-session saved/sessions/so101/my_session --runs-per-stage 3
 
-# With time budget per stage (includes LR sweep + main training)
+# With time budget per stage (main training only; sweeps use lr_sweep phase budgets)
 python staged_training.py --root-session saved/sessions/so101/my_session --stage-time-budget-min 10
 
-# Custom LR sweep configuration
+# Custom LR sweep configuration (applies to both plateau and upfront sweeps)
 python staged_training.py --root-session saved/sessions/so101/my_session \
     --lr-sweep-phase-a-candidates 5 \
     --lr-sweep-phase-a-budget-min 2.0 \
     --lr-sweep-phase-b-seeds 3 \
     --lr-sweep-phase-b-budget-min 5.0
+
+# Use upfront sweeps instead of plateau-triggered sweeps (legacy mode)
+python staged_training.py --root-session saved/sessions/so101/my_session --disable-plateau-sweep
 
 # Disable baseline comparison
 python staged_training.py --root-session saved/sessions/so101/my_session --disable-baseline
@@ -252,7 +255,11 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 
 **Features:**
 - **Progressive training**: Trains on each stage's data until divergence, then moves to next stage
-- **Learning rate sweep**: Automatic LR optimization before each stage with two-phase search
+- **Plateau-triggered LR sweeps** (default mode): LR optimization triggered when validation loss plateaus
+  - Uses current weights for sweep, continues with winning LR and weights
+  - Maximum sweeps per stage (default 3) prevents infinite optimization loops
+- **Upfront LR sweeps** (legacy mode): Automatic LR optimization before each stage (use `--disable-plateau-sweep`)
+- **Two-phase sweep structure** (both modes):
   - **Phase A**: Broad exploration with many LR candidates, short time budgets
   - **Phase B**: Deep validation with top survivors, multiple seeds for robust selection
   - Ranking by median/mean/min best validation loss across seeds
@@ -260,17 +267,19 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - **EMA-smoothed divergence detection**: Uses exponential moving average of training loss for robust detection
 - **Loss-weighted sampling**: Focuses on high-loss samples for efficient learning
 - **Parallel execution**: Multiple training runs can execute in parallel within a stage
-- **Time budget control**: Optional per-stage time budget including LR sweep and main training
+- **Time budget control**: Optional per-stage time budget for main training
 - **Baseline comparison**: Optionally run parallel baseline training (fresh weights each stage) to compare against staged training (weight carryover)
 - **Progressive reporting**: Final report updated after each stage for real-time progress visibility
-- **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, LR sweep results, staged vs baseline comparison, and inference visualizations
+- **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, LR sweep results (including plateau sweep history), staged vs baseline comparison, and inference visualizations
 - **Best checkpoint selection**: Selects best checkpoint based on hybrid loss over original (full) session
 - **W&B integration**: Optional Weights & Biases logging with run_id in run names and baseline config tracking
 
 **Configuration** (`staged_training_config.py`):
 - All parameters match Gradio app defaults
-- Key parameters: `batch_size`, `divergence_patience`, `plateau_factor`, `loss_weight_temperature`
-- LR Sweep config: `lr_sweep.enabled`, `lr_sweep.lr_min`, `lr_sweep.lr_max`, `lr_sweep.phase_a_num_candidates`, `lr_sweep.phase_a_time_budget_min`, `lr_sweep.phase_b_seeds`, `lr_sweep.phase_b_time_budget_min`
+- **Sweep mode**: `plateau_sweep.enabled` (default True = plateau-triggered sweeps, False = upfront sweeps)
+- Key parameters: `batch_size`, `divergence_patience`, `loss_weight_temperature`
+- Plateau Sweep config: `plateau_sweep.plateau_patience`, `plateau_sweep.plateau_improvement_threshold`, `plateau_sweep.cooldown_updates`, `plateau_sweep.max_sweeps_per_stage`
+- LR Sweep config (shared by both modes): `lr_sweep.lr_min`, `lr_sweep.lr_max`, `lr_sweep.phase_a_num_candidates`, `lr_sweep.phase_a_time_budget_min`, `lr_sweep.phase_b_seeds`, `lr_sweep.phase_b_time_budget_min`
 - Baseline config: `enable_baseline` (default False), `baseline_runs_per_stage` (default 2)
 - Stage time budget: `stage_time_budget_min` (0 = unlimited)
 - Supports YAML config files for reproducible experiments
