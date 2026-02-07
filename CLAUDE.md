@@ -399,7 +399,8 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 **Reports:**
 - Per-stage reports: `saved/staged_training_reports/{session}/stage{N}_run{M}/report.html`
 - Baseline reports: `saved/staged_training_reports/{session}/stage{N}_baseline_run{M}/report.html`
-- Final summary: `saved/staged_training_reports/{session}/final_report.html`
+- Final summary: `saved/staged_training_reports/{session}/final_report_{date}.html` (dated, e.g., `final_report_2026_feb_07.html`)
+- Also copied to: `docs/final_report_{date}.html` for easy access
 - Includes: training progress graphs, hybrid loss over session graphs, staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
 
 ### Recording Sessions

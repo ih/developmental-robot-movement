@@ -1419,7 +1419,23 @@ def generate_final_report(
     Returns:
         Path to generated report
     """
-    report_path = output_dir / "final_report.html"
+    # Generate dated filename with deduplication for same-day reports
+    # Pattern: final_report_2026_feb_07.html, final_report_2026_feb_07_2.html, etc.
+    date_str = datetime.now().strftime("%Y_%b_%d").lower()
+    base_filename = f"final_report_{date_str}"
+
+    # Check docs folder for existing reports with same date to determine suffix
+    docs_dir = Path(__file__).parent / "docs"
+    docs_dir.mkdir(exist_ok=True)
+
+    # Find next available number
+    counter = 1
+    report_filename = f"{base_filename}.html"
+    while (docs_dir / report_filename).exists():
+        counter += 1
+        report_filename = f"{base_filename}_{counter}.html"
+
+    report_path = output_dir / report_filename
 
     # Calculate total elapsed time
     total_elapsed = time.time() - overall_start_time
@@ -2037,7 +2053,15 @@ def generate_final_report(
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(html_content)
 
-    print(f"[REPORT] Report updated: {report_path}")
+    # Copy to docs folder for easy access (only for final reports)
+    if is_final:
+        docs_copy_path = docs_dir / report_filename
+        shutil.copy(report_path, docs_copy_path)
+        print(f"[REPORT] Report updated: {report_path}")
+        print(f"[REPORT] Copied to: {docs_copy_path}")
+    else:
+        print(f"[REPORT] Report updated: {report_path}")
+
     return str(report_path)
 
 
@@ -2469,7 +2493,7 @@ def run_staged_training(
                     break
 
     # Generate final summary with evaluation and inference
-    generate_final_report(
+    final_report_path = generate_final_report(
         completed_stages=completed_stages,
         all_sweep_results=all_sweep_results,
         all_timings=all_timings,
@@ -2485,7 +2509,8 @@ def run_staged_training(
     print("STAGED TRAINING COMPLETE")
     print("=" * 60)
     print(f"Output directory: {output_path}")
-    print(f"Final report: {output_path / 'final_report.html'}")
+    print(f"Final report: {final_report_path}")
+    print(f"Also available at: docs/{Path(final_report_path).name}")
 
 
 def main():
