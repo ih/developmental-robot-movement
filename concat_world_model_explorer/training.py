@@ -1138,16 +1138,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         use_plateau_scheduler = True
         print(f"[DEBUG] Created ReduceLROnPlateau scheduler (divergence mode): patience={effective_plateau_patience}, factor={plateau_factor}, min_lr={global_min_lr:.6e}")
     elif stop_on_divergence and plateau_sweep_enabled:
-        # Plateau sweep mode: use warmup + cosine scheduler
-        # LR adaptation happens through plateau-triggered sweeps, not scheduler
-        state.world_model.ae_scheduler = world_model_utils.create_warmup_cosine_scheduler(
-            state.world_model.ae_optimizer,
-            warmup_steps=scaled_warmup_steps,
-            total_steps=num_gradient_updates,
-            lr_min=global_min_lr,
+        # Plateau sweep mode: use constant LR
+        # LR adaptation happens through plateau-triggered sweeps, not scheduler decay
+        state.world_model.ae_scheduler = world_model_utils.create_constant_lr_scheduler(
+            state.world_model.ae_optimizer
         )
-        print(f"[DEBUG] Created warmup+cosine scheduler (plateau_sweep mode): {num_gradient_updates} steps, "
-              f"warmup={scaled_warmup_steps}, LR {target_lr:.6e} -> {global_min_lr:.6e}")
+        print(f"[DEBUG] Created constant LR scheduler (plateau_sweep mode): LR fixed at {target_lr:.6e}")
     elif resume_mode and preserve_scheduler and starting_samples == 0:
         # Keep existing scheduler only if not using global schedule
         print(f"[DEBUG] Preserved scheduler state (step {state.world_model.ae_scheduler.last_epoch})")
@@ -1194,7 +1190,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         num_workers = 4  # Multiple workers on Linux
 
     # Create DataLoader
-    use_stream_pipelining = (state.device == 'cuda' and torch.cuda.is_available())
+    use_stream_pipelining = (state.device.type == 'cuda' and torch.cuda.is_available())
 
     try:
         dataloader = create_canvas_dataloader(
@@ -2269,7 +2265,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
             print(f"[DEBUG] Loading best checkpoint for validation eval: {best_checkpoint_path}")
 
             try:
-                checkpoint = torch.load(best_checkpoint_path, map_location=state.device)
+                checkpoint = torch.load(best_checkpoint_path, map_location=state.device, weights_only=False)
                 state.world_model.autoencoder.load_state_dict(checkpoint['model_state_dict'])
                 best_samples = checkpoint.get('samples_seen', 0)
                 best_loss = checkpoint.get('loss', 0)
@@ -2530,7 +2526,7 @@ def run_batch_comparison(batch_sizes_str, total_samples):
 
             # Create DataLoader with optimized settings
             # Phase 4: Disable automatic GPU transfer for manual stream management
-            use_stream_pipelining = (state.device == 'cuda' and torch.cuda.is_available())
+            use_stream_pipelining = (state.device.type == 'cuda' and torch.cuda.is_available())
 
             dataloader = create_canvas_dataloader(
                 canvas_cache=canvas_cache,

@@ -344,6 +344,18 @@ python staged_training.py --root-session saved/sessions/so101/my_session --runs-
 # With time budget per stage (main training only; sweeps use lr_sweep phase budgets)
 python staged_training.py --root-session saved/sessions/so101/my_session --stage-time-budget-min 10
 
+# Single stage only (run just stage 2)
+python staged_training.py --root-session saved/sessions/so101/my_session --stage 2
+
+# Direct session mode (no staged splits needed)
+python staged_training.py --train-session saved/sessions/so101/train --val-session saved/sessions/so101/val
+
+# Direct mode with explicit original session for evaluation
+python staged_training.py --train-session .../train --val-session .../val --original-session saved/sessions/so101/full_session
+
+# Resume from a checkpoint
+python staged_training.py --train-session .../train --val-session .../val --checkpoint saved/checkpoints/model.pth
+
 # Custom LR sweep configuration (applies to both plateau and upfront sweeps)
 python staged_training.py --root-session saved/sessions/so101/my_session \
     --lr-sweep-phase-a-candidates 5 \
@@ -366,11 +378,13 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - **Dynamic sample budget**: `stage_samples_multiplier` scales training samples based on stage size (e.g., 61 frames × 1000 = 61,000 samples) to prevent overfitting on small stages
 - **Divergence-based early stopping**: Automatically stops when validation loss diverges from training
 - **Plateau-triggered LR sweeps** (default mode): When validation loss plateaus, triggers a multi-phase LR sweep
-  - Replaces ReduceLROnPlateau scheduler with dynamic LR optimization
+  - Uses constant LR scheduler (no decay) - LR adaptation happens through sweep-triggered restarts
   - Uses current weights for sweep, continues with winning LR and weights
-  - Configurable: `plateau_patience=10` updates, `improvement_threshold=0.5%`, `cooldown=10` updates
-  - Maximum sweeps per stage (default 3) prevents infinite optimization loops
+  - Configurable: `plateau_patience=100` updates, `improvement_threshold=0.5%`, `cooldown=5` updates
+  - Maximum sweeps per stage (default 2) prevents infinite optimization loops
+  - Early stop on sweep failure: stops training if sweep produces no improvement (`min_sweep_improvement`)
   - Sweeps use full Phase A → Phase B multi-phase structure
+  - GPU memory management: frees model before sweep, reloads from winning checkpoint after
 - **Loss-weighted sampling**: Focuses on high-loss samples for efficient learning
 - **Upfront LR sweep** (legacy mode): Automatic LR optimization before each stage (when `plateau_sweep.enabled=False`)
   - **Phase A**: Broad exploration with many LR candidates, short time budgets
@@ -389,9 +403,9 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - All parameters match Gradio app defaults
 - Key parameters: `stage_samples_multiplier`, `divergence_patience`, `loss_weight_temperature`
 - **Sweep mode**: Controlled by `plateau_sweep.enabled` (default True = plateau-triggered sweeps, False = upfront sweeps before each stage)
-- **Plateau Sweep config**: `plateau_sweep.plateau_patience` (10 updates), `plateau_sweep.plateau_improvement_threshold` (0.5%), `plateau_sweep.cooldown_updates` (10), `plateau_sweep.max_sweeps_per_stage` (3)
+- **Plateau Sweep config**: `plateau_sweep.plateau_patience` (100 updates), `plateau_sweep.plateau_improvement_threshold` (0.5%), `plateau_sweep.cooldown_updates` (5), `plateau_sweep.max_sweeps_per_stage` (2), `plateau_sweep.min_sweep_improvement` (0.0)
 - **LR Sweep config** (shared by both modes): `lr_sweep.lr_min`, `lr_sweep.lr_max`, `lr_sweep.phase_a_num_candidates`, `lr_sweep.phase_a_time_budget_min`, `lr_sweep.phase_b_seeds`, `lr_sweep.phase_b_time_budget_min`
-- Baseline config: `enable_baseline` (default False), `baseline_runs_per_stage` (default 2)
+- Baseline config: `enable_baseline` (default False), `baseline_runs_per_stage` (default 1)
 - Stage time budget: `stage_time_budget_min` (0 = unlimited)
 - Supports YAML config files for reproducible experiments
 - **Deprecated fields**: `val_plateau_patience`, `val_plateau_min_delta`, `plateau_factor`, `plateau_patience` (replaced by plateau_sweep when enabled)
@@ -458,6 +472,9 @@ Required Python packages:
   - Baseline comparison training (fresh weights each stage) for comparing against staged (weight carryover)
   - Comprehensive HTML reports with training progress, staged vs baseline comparison, and inference visualizations
   - Integrated LR sweep before each stage with parallel execution support
+  - Direct session mode: train on specific train/val sessions without staged splits
+  - Single stage mode: run only a specific stage from staged splits
+  - Starting checkpoint support for resuming training
 - `staged_training_config.py`: Dataclass configuration for staged training runs
   - All parameters match Gradio app defaults
   - `PlateauSweepConfig`: Plateau-triggered LR sweep configuration (enabled by default)
@@ -467,7 +484,10 @@ Required Python packages:
 - `lr_sweep.py`: Time-budgeted learning rate optimization module
   - Two-phase search: Phase A (broad exploration) and Phase B (deep validation)
   - Parallel trial execution with multiprocessing
-  - `run_plateau_triggered_sweep()`: Mid-training sweep for plateau detection mode
+  - `run_plateau_triggered_sweep()`: Mid-training sweep for plateau detection mode (returns lr, checkpoint, best_val)
+  - Fallback logic when Phase B trials fail (falls back to Phase A survivor or config default)
+  - GPU memory cleanup between sweep phases and worker processes
+  - Worker GPU assignment by index (not PID) for reliable multi-GPU distribution
   - Data structures: `LRTrialResult`, `LRAggregatedResult`, `LRSweepPhaseResult`, `LRSweepStageResult`, `StageTiming`
   - Checkpoint path tracking for winning trials
   - Resume support for interrupted sweeps

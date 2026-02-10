@@ -226,6 +226,20 @@ def format_duration(seconds: float) -> str:
         return f"{hours:.1f}h"
 
 
+def cleanup_gpu_memory():
+    """
+    Force GPU memory cleanup after parallel training.
+
+    Call this after ProcessPoolExecutor completes to free cached GPU memory
+    that may not be immediately released when worker processes terminate.
+    """
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
 def get_max_parallel_workers(verbose: bool = True) -> int:
     """
     Determine max parallel workers based on available GPU memory.
@@ -572,6 +586,7 @@ def run_lr_trial(
     time_to_best_val = 0.0
     samples_to_best_val = 0
     loss_history = []
+    history_update_counter = 0
     status = "completed"
     samples_trained = 0
     final_train_loss = float('inf')
@@ -622,7 +637,8 @@ def run_lr_trial(
             val_spike_threshold=cfg.val_spike_threshold,
             val_spike_window=cfg.val_spike_window,
             val_spike_frequency=cfg.val_spike_frequency,
-            val_plateau_patience=cfg.val_plateau_patience,
+            # Disable plateau features in sweep trials - trials should train to time budget
+            val_plateau_patience=0,  # Disable legacy plateau early stopping
             val_plateau_min_delta=cfg.val_plateau_min_delta,
             plateau_factor=cfg.plateau_factor,
             plateau_patience=cfg.plateau_patience,
@@ -633,6 +649,8 @@ def run_lr_trial(
             resume_mode=starting_checkpoint is not None,
             time_budget_min=time_budget_min,
             min_samples_for_timeout=cfg.lr_sweep.min_samples_before_timeout if hasattr(cfg, 'lr_sweep') else 1000,
+            # Explicitly disable plateau sweep in trial workers to prevent re-triggering
+            plateau_sweep_enabled=False,
         )
 
         for result in generator:
@@ -659,8 +677,9 @@ def run_lr_trial(
                     time_to_best_val = time.time() - start_time
                     samples_to_best_val = samples_trained
 
-            # Record history (sample every 10th point to avoid huge logs)
-            if len(samples_seen_list) > 0 and len(samples_seen_list) % 10 == 0:
+            # Record history (sample every 10th update to avoid huge logs)
+            history_update_counter += 1
+            if history_update_counter % 10 == 0:
                 train_val = train_loss_list[-1] if train_loss_list else 0
                 val_val = val_loss_list[-1] if val_loss_list else 0
                 loss_history.append((samples_trained, train_val, val_val))
@@ -697,6 +716,16 @@ def run_lr_trial(
     except Exception:
         pass  # Silently ignore if checkpoints not available
 
+    # Cleanup GPU memory in worker process before returning
+    try:
+        if state.world_model is not None:
+            del state.world_model
+            state.world_model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass  # Silently ignore cleanup errors
+
     return LRTrialResult(
         lr=lr,
         seed=seed,
@@ -722,17 +751,18 @@ def _run_trial_worker(args: tuple) -> LRTrialResult:
     """
     import os
 
-    # Get worker-specific GPU device if multiple available
+    # Extract worker_index from end of args tuple for GPU assignment
+    *trial_args, worker_index = args
     worker_id = os.getpid()
 
     # Initialize CUDA in worker process
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
-        # Simple round-robin GPU assignment if multiple GPUs
+        # Round-robin GPU assignment using worker index (not PID)
         if device_count > 1:
-            device_id = worker_id % device_count
+            device_id = worker_index % device_count
             torch.cuda.set_device(device_id)
-            print(f"[Worker {worker_id}] Using CUDA device {device_id}/{device_count}")
+            print(f"[Worker {worker_id}] Using CUDA device {device_id}/{device_count} (worker_index={worker_index})")
         else:
             print(f"[Worker {worker_id}] Using CUDA device 0 (single GPU)")
         # Force CUDA initialization
@@ -740,7 +770,7 @@ def _run_trial_worker(args: tuple) -> LRTrialResult:
     else:
         print(f"[Worker {worker_id}] CUDA not available, using CPU")
 
-    return run_lr_trial(*args)
+    return run_lr_trial(*trial_args)
 
 
 # =============================================================================
@@ -797,16 +827,19 @@ def run_lr_sweep_phase(
     print(f"Time budget: {time_budget_min:.1f} min per trial")
     print(f"{'='*60}\n")
 
-    # Build list of trial args
+    # Build list of trial args (worker_index appended for GPU assignment)
     trial_args = []
+    worker_index = 0
     for lr in lr_candidates:
         for seed in range(seeds_per_lr):
             trial_dir = output_dir / f"phase_{phase}" / f"lr_{lr:.2e}" / f"seed_{seed}"
             trial_args.append((
                 lr, seed, phase, time_budget_min,
                 train_session_path, val_session_path,
-                starting_checkpoint, cfg_dict, str(trial_dir), run_id
+                starting_checkpoint, cfg_dict, str(trial_dir), run_id,
+                worker_index
             ))
+            worker_index += 1
 
     # Run trials in parallel
     all_trials: dict = {lr: [] for lr in lr_candidates}
@@ -853,6 +886,9 @@ def run_lr_sweep_phase(
             # Save intermediate state
             if save_state:
                 save_sweep_state(output_dir, phase, stage_num, all_trials)
+
+    # Force GPU memory cleanup after all workers complete
+    cleanup_gpu_memory()
 
     # Aggregate results
     aggregated_results = [
@@ -1027,6 +1063,29 @@ def run_lr_sweep_for_stage(
 
     selected_lr = phase_b_result.winner
     winning_checkpoint = phase_b_result.winner_checkpoint_path
+
+    # Fallback if all Phase B trials failed (winner is None)
+    if selected_lr is None:
+        if phase_a_result.survivors:
+            selected_lr = phase_a_result.survivors[0]
+            print(f"[LR SWEEP] WARNING: All Phase B trials failed. Falling back to best Phase A survivor: {selected_lr:.2e}")
+        else:
+            # Extract default LR from config
+            from staged_training_config import StagedTrainingConfig
+            fallback_cfg = StagedTrainingConfig.from_dict(cfg_dict)
+            selected_lr = fallback_cfg.custom_lr
+            print(f"[LR SWEEP] WARNING: All sweep trials failed. Falling back to config default LR: {selected_lr:.2e}")
+
+    # Fallback checkpoint: use Phase A winner's checkpoint if Phase B has none
+    if winning_checkpoint is None and phase_a_result.lr_results:
+        for r in phase_a_result.lr_results:
+            if r.lr == selected_lr and r.trials:
+                best_trial = min(r.trials, key=lambda t: t.best_val_loss)
+                if best_trial.checkpoint_path:
+                    winning_checkpoint = best_trial.checkpoint_path
+                    print(f"[LR SWEEP] Using Phase A checkpoint as fallback: {winning_checkpoint}")
+                break
+
     total_time = time.time() - sweep_start
 
     print(f"\n{'='*60}")
@@ -1036,6 +1095,9 @@ def run_lr_sweep_for_stage(
         print(f"Winning checkpoint: {winning_checkpoint}")
     print(f"Total sweep time: {format_duration(total_time)}")
     print(f"{'='*60}\n")
+
+    # Final GPU memory cleanup after stage sweep
+    cleanup_gpu_memory()
 
     return LRSweepStageResult(
         stage_num=stage_num,
@@ -1065,7 +1127,7 @@ def run_plateau_triggered_sweep(
 
     Key differences from upfront sweep:
     1. REQUIRES current_checkpoint (starts from current weights, not fresh)
-    2. Returns tuple of (selected_lr, winning_checkpoint_path) for easy unpacking
+    2. Returns tuple of (selected_lr, winning_checkpoint_path, winner_best_val) for easy unpacking
     3. Uses phase budgets from lr_sweep config directly
 
     Args:
@@ -1079,7 +1141,7 @@ def run_plateau_triggered_sweep(
         max_workers: Maximum parallel workers
 
     Returns:
-        Tuple of (selected_lr, winning_checkpoint_path)
+        Tuple of (selected_lr, winning_checkpoint_path, winner_best_val)
     """
     from staged_training_config import StagedTrainingConfig
 
@@ -1123,7 +1185,7 @@ def run_plateau_triggered_sweep(
     print(f"  Checkpoint: {result.winning_checkpoint_path}")
     print(f"  Total time: {format_duration(result.total_wall_time_sec)}")
 
-    return (result.selected_lr, result.winning_checkpoint_path)
+    return (result.selected_lr, result.winning_checkpoint_path, result.phase_b.winner_best_val)
 
 
 # =============================================================================

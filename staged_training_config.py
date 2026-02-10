@@ -24,13 +24,13 @@ class LRSweepConfig:
     """
 
     # LR search space
-    lr_min: float = 1e-6
+    lr_min: float = 1e-7
     lr_max: float = 1e-2
 
     # Phase A: Broad exploration (many LRs, 1 seed, short budget)
     phase_a_num_candidates: int = 5
     phase_a_seeds: int = 1
-    phase_a_time_budget_min: float = 5.0  # 3 minutes per trial
+    phase_a_time_budget_min: float = 3.0  # 3 minutes per trial
     phase_a_survivor_count: int = 2
 
     # Phase B: Deep validation (few LRs, multiple seeds, longer budget)
@@ -88,14 +88,19 @@ class PlateauSweepConfig:
     # Plateau detection parameters
     plateau_ema_alpha: float = 0.9  # EMA smoothing for validation loss (higher = more responsive)
     plateau_improvement_threshold: float = 0.0005  # 0.5% relative improvement required
-    plateau_patience: int = 10  # Updates without improvement before triggering sweep
+    plateau_patience: int = 100  # Updates without improvement before triggering sweep
 
     # Cooldown after sweep (prevents immediate re-triggering)
-    cooldown_updates: int = 10  # Updates to wait after sweep before detection resumes
+    cooldown_updates: int = 5  # Updates to wait after sweep before detection resumes
 
     # Maximum consecutive sweeps within the same plateau before stopping
     # Resets to 0 if sweep finds improvement (val_loss drops below plateau baseline)
-    max_sweeps_per_stage: int = 3
+    max_sweeps_per_stage: int = 2
+
+    # Minimum improvement required from a sweep to continue training
+    # If sweep_improvement <= min_sweep_improvement, stop training
+    # 0.0 = stop on any regression (sweep made loss worse or same)
+    min_sweep_improvement: float = 0.0
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -106,6 +111,7 @@ class PlateauSweepConfig:
             'plateau_patience': self.plateau_patience,
             'cooldown_updates': self.cooldown_updates,
             'max_sweeps_per_stage': self.max_sweeps_per_stage,
+            'min_sweep_improvement': self.min_sweep_improvement,
         }
 
     @classmethod
@@ -123,7 +129,7 @@ class StagedTrainingConfig:
     batch_size: int = 1  # App default
 
     # Dynamic sample budget for staged training
-    stage_samples_multiplier: int = 100000  # total_samples = num_valid_frames * multiplier
+    stage_samples_multiplier: int = 100000000000  # total_samples = num_valid_frames * multiplier
                                            # 0 = use fixed total_samples instead
     update_interval: int = 250  # Samples between validation evaluations (triggers checkpointing, divergence/plateau checks)
     window_size: int = 100  # App default
@@ -138,14 +144,14 @@ class StagedTrainingConfig:
     stop_on_divergence: bool = True  # App default
     divergence_gap: float = 0.002  # App default
     divergence_ratio: float = 1.3  # App default
-    divergence_patience: int = 5  # App default
+    divergence_patience: int = 10  # App default
     divergence_min_updates: int = 5  # App default
     val_spike_threshold: float = 2.0  # App default
     val_spike_window: int = 15  # App default
     val_spike_frequency: float = 0.75  # App default
 
     # Validation plateau early stopping
-    val_plateau_patience: int = 500  # Stop if val loss hasn't improved in N updates (0 = disabled)
+    val_plateau_patience: int = 100  # Stop if val loss hasn't improved in N updates (0 = disabled)
     val_plateau_min_delta: float = 0.0001  # Minimum improvement to count as "better"
 
     # Learning rate (app defaults)
@@ -167,18 +173,18 @@ class StagedTrainingConfig:
     selected_frame_offset: int = 3  # App default for frame selection
 
     # Stage settings
-    runs_per_stage: int = 3  # CLI parameter
+    runs_per_stage: int = 1  # CLI parameter
     clean_old_checkpoints: bool = True  # Clean old auto-saved checkpoints before starting
 
     # Baseline comparison
     enable_baseline: bool = False  # Enable baseline (from-scratch) runs for comparison
-    baseline_runs_per_stage: int = 2  # Number of baseline runs per stage
+    baseline_runs_per_stage: int = 1  # Number of baseline runs per stage
 
     # Run identification (set at runtime, saved for reference/reproducibility)
     run_id: Optional[str] = None  # Unique identifier for concurrent execution
 
     # W&B (user override: enabled)
-    enable_wandb: bool = False  # User specified (app default is False)
+    enable_wandb: bool = True  # User specified (app default is False)
     wandb_project: str = "developmental-robot-movement"
 
     # LR Sweep configuration (for upfront sweeps - legacy mode)
@@ -202,7 +208,7 @@ class StagedTrainingConfig:
                     DeprecationWarning,
                     stacklevel=2
                 )
-            if self.val_plateau_patience != 500 or self.val_plateau_min_delta != 0.0001:
+            if self.val_plateau_patience != 100 or self.val_plateau_min_delta != 0.0001:
                 warnings.warn(
                     "val_plateau_patience and val_plateau_min_delta are ignored when "
                     "plateau_sweep.enabled=True. Plateau detection now triggers LR sweeps "

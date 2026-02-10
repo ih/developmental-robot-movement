@@ -5,9 +5,22 @@ Trains progressively on staged splits of a session, using batch training
 with loss-weighted sampling and divergence-based early stopping.
 
 Usage:
+    # Full staged training (all stages)
     python staged_training.py --root-session saved/sessions/so101/my_session
     python staged_training.py --root-session saved/sessions/so101/my_session --runs-per-stage 3
     python staged_training.py --root-session saved/sessions/so101/my_session --config my_config.yaml
+
+    # Single stage only
+    python staged_training.py --root-session saved/sessions/so101/my_session --stage 2
+
+    # Direct session mode (no staged splits needed)
+    python staged_training.py --train-session saved/sessions/so101/train --val-session saved/sessions/so101/val
+
+    # Direct mode with explicit original session for evaluation
+    python staged_training.py --train-session .../train --val-session .../val --original-session saved/sessions/so101/full_session
+
+    # With starting checkpoint
+    python staged_training.py --train-session ... --val-session ... --checkpoint saved/checkpoints/model.pth
 
 Concurrent Execution:
     Multiple instances can run concurrently with isolated checkpoints and reports:
@@ -25,6 +38,7 @@ Concurrent Execution:
 
 import argparse
 import base64
+import gc
 import io
 import json
 import os
@@ -479,6 +493,10 @@ def setup_world_model(
     else:
         state.loaded_checkpoint_metadata = {}
 
+    # Free checkpoint dict to release GPU memory
+    if checkpoint is not None:
+        del checkpoint
+
 
 def run_stage_training(
     stage_num: int,
@@ -571,6 +589,7 @@ def run_stage_training(
     initial_lr = cfg.custom_lr
     current_lr = cfg.custom_lr
     current_checkpoint = checkpoint_path
+    post_sweep = False  # Track if we're resuming after a sweep (affects samples_mode)
 
     # Determine if plateau sweep mode is enabled
     plateau_sweep_enabled = hasattr(cfg, 'plateau_sweep') and cfg.plateau_sweep.enabled
@@ -595,7 +614,11 @@ def run_stage_training(
                 wandb_run_name=wandb_run_name,
                 # Resume mode
                 resume_mode=(current_checkpoint is not None),
-                samples_mode=cfg.samples_mode,
+                # After a sweep, use "Train to total samples" to avoid over-training.
+                # BUT: in divergence mode, total_samples gets overridden to chunk size,
+                # so "Train to total samples" would exit immediately if starting_samples > chunk_size.
+                # Keep "Train additional samples" in divergence mode to let chunking work correctly.
+                samples_mode="Train to total samples" if (post_sweep and not cfg.stop_on_divergence) else cfg.samples_mode,
                 starting_samples=starting_samples,
                 preserve_optimizer=cfg.preserve_optimizer,
                 preserve_scheduler=cfg.preserve_scheduler,
@@ -674,9 +697,18 @@ def run_stage_training(
 
                     print(f"[STAGED TRAINING] Checkpoint for sweep: {checkpoint_for_sweep}")
 
+                    # Free main process model to give GPU memory to sweep workers
+                    # Model state is preserved in checkpoint_for_sweep
+                    if state.world_model is not None:
+                        del state.world_model
+                        state.world_model = None
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                     # Run plateau-triggered sweep (uses phase budgets from lr_sweep config)
                     sweep_start_time = time.time()
-                    new_lr, new_checkpoint = run_plateau_triggered_sweep(
+                    new_lr, new_checkpoint, sweep_best_val = run_plateau_triggered_sweep(
                         sweep_number=sweep_count,
                         train_session_path=train_session["session_dir"],
                         val_session_path=val_session["session_dir"],
@@ -687,6 +719,24 @@ def run_stage_training(
                     )
                     sweep_elapsed = time.time() - sweep_start_time
 
+                    # Force GPU memory cleanup after sweep
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    # Reload model with winning checkpoint weights
+                    # This fixes both memory (fresh model) and correctness (sweep's optimized weights)
+                    if new_checkpoint:
+                        setup_world_model(train_session, new_checkpoint, cfg)
+                        state.validation_session_state = val_session
+
+                    # Calculate improvement from sweep
+                    # Handle None case (if phase_b.winner_best_val was None)
+                    if sweep_best_val is None:
+                        sweep_best_val = val_loss_at_trigger  # Assume no improvement
+                    sweep_improvement = val_loss_at_trigger - sweep_best_val
+                    improvement_pct = (sweep_improvement / val_loss_at_trigger) * 100 if val_loss_at_trigger > 0 else 0.0
+
                     # Record sweep in history
                     sweep_history.append({
                         'sweep_num': sweep_count,
@@ -694,23 +744,38 @@ def run_stage_training(
                         'triggered_at_samples': samples_at_sweep,
                         'triggered_at_time': time.time() - start_time - sweep_elapsed,
                         'val_loss_at_trigger': val_loss_at_trigger,
+                        'val_loss_after': sweep_best_val,
+                        'improvement': sweep_improvement,
+                        'improvement_pct': improvement_pct,
                         'selected_lr': new_lr,
                         'checkpoint_path': new_checkpoint,
                         'sweep_duration_sec': sweep_elapsed,
                     })
 
+                    # Check if sweep produced improvement
+                    min_improvement = cfg.plateau_sweep.min_sweep_improvement
+                    if sweep_improvement <= min_improvement:
+                        stop_reason = f"sweep_no_improvement (val: {val_loss_at_trigger:.6f} -> {sweep_best_val:.6f}, delta: {sweep_improvement:.6f})"
+                        print(f"\n[STAGED TRAINING] Sweep produced no improvement: {sweep_improvement:.6f} <= {min_improvement}")
+                        print(f"[STAGED TRAINING] Stopping training: {stop_reason}")
+                        training_complete = True
+                        break
+
+                    print(f"[STAGED TRAINING] Sweep improved val_loss: {val_loss_at_trigger:.6f} -> {sweep_best_val:.6f} ({improvement_pct:+.2f}%)")
+
                     # Update for next iteration
                     current_lr = new_lr
                     current_checkpoint = new_checkpoint
-                    # Update starting_samples from the checkpoint we'll resume from
-                    if new_checkpoint:
-                        try:
-                            ckpt = torch.load(new_checkpoint, map_location='cpu')
-                            starting_samples = ckpt.get('samples_seen', samples_at_sweep)
-                        except Exception:
-                            starting_samples = samples_at_sweep
+                    # Use samples_at_sweep (not checkpoint's samples_seen) to avoid over-training
+                    # The sweep trains extra samples internally, but those shouldn't count toward stage budget
+                    # With post_sweep=True, we use "Train to total samples" mode to reach effective_total_samples
+                    starting_samples = samples_at_sweep
+                    post_sweep = True
 
-                    print(f"[STAGED TRAINING] Continuing training with LR={new_lr:.2e}, consecutive={consecutive_sweep_count}/{cfg.plateau_sweep.max_sweeps_per_stage}")
+                    print(f"[STAGED TRAINING] Continuing training with LR={new_lr:.2e}, starting_samples={starting_samples}, consecutive={consecutive_sweep_count}/{cfg.plateau_sweep.max_sweeps_per_stage}")
+                    # Clean up old generator to free DataLoader pinned memory buffers
+                    del generator
+                    gc.collect()
                     break  # Exit generator loop to restart with new LR/checkpoint
 
                 # Normal result - unpack tuple (matches generate_batch_training_update output)
@@ -760,7 +825,7 @@ def run_stage_training(
     elapsed_time = time.time() - start_time
 
     # Make stop_reason more informative for sample budget or time budget completion
-    if stop_reason in ("completed", "max_samples"):
+    if stop_reason == "completed":
         if cfg.stage_samples_multiplier > 0:
             stop_reason = f"sample_budget ({num_valid_frames} frames x {cfg.stage_samples_multiplier} = {effective_total_samples:,})"
         else:
@@ -768,11 +833,19 @@ def run_stage_training(
     elif stop_reason == "time_budget":
         stop_reason = f"time_budget ({time_budget_min:.1f} min limit)"
 
-    # Extract total_samples_trained from cumulative_metrics
+    # Extract total_samples_trained and final losses from cumulative_metrics
     if state.cumulative_metrics and state.cumulative_metrics.get("samples_seen"):
         total_samples_trained = state.cumulative_metrics["samples_seen"][-1] - starting_samples
     else:
         total_samples_trained = 0
+
+    if state.cumulative_metrics:
+        train_losses = state.cumulative_metrics.get("loss_at_sample", [])
+        val_losses = state.cumulative_metrics.get("val_loss_at_sample", [])
+        if train_losses:
+            final_train_loss = train_losses[-1]
+        if val_losses:
+            final_val_loss = val_losses[-1]
 
     # Find best checkpoint from this run (use tracked checkpoints, not glob to avoid old checkpoint pollution)
     checkpoint_dir = state.get_checkpoint_dir_for_session(train_session["session_dir"])
@@ -1103,11 +1176,25 @@ def generate_sweep_history_html(sweep_history: list) -> str:
 
     rows = ""
     for sweep in sweep_history:
+        # Format improvement percentage with sign
+        improvement_pct = sweep.get('improvement_pct', 0)
+        improvement_str = f"{improvement_pct:+.2f}%" if improvement_pct != 0 else "0.00%"
+        # Color code: green for improvement, red for regression
+        if improvement_pct > 0:
+            improvement_cell = f'<td style="color: green;">{improvement_str}</td>'
+        elif improvement_pct < 0:
+            improvement_cell = f'<td style="color: red;">{improvement_str}</td>'
+        else:
+            improvement_cell = f'<td>{improvement_str}</td>'
+
         rows += f"""
         <tr>
             <td>{sweep.get('sweep_num', 'N/A')}</td>
+            <td>{sweep.get('consecutive_num', 'N/A')}</td>
             <td>{sweep.get('triggered_at_samples', 'N/A'):,}</td>
-            <td>{format_duration(sweep.get('triggered_at_time', 0))}</td>
+            <td>{sweep.get('val_loss_at_trigger', 0):.6f}</td>
+            <td>{sweep.get('val_loss_after', 0):.6f}</td>
+            {improvement_cell}
             <td>{sweep.get('selected_lr', 0):.2e}</td>
             <td>{format_duration(sweep.get('sweep_duration_sec', 0))}</td>
         </tr>"""
@@ -1116,10 +1203,13 @@ def generate_sweep_history_html(sweep_history: list) -> str:
     <table class="stats-table">
         <tr>
             <th>Sweep #</th>
-            <th>Triggered At (samples)</th>
-            <th>Wall Time</th>
+            <th>Consec #</th>
+            <th>Triggered At</th>
+            <th>Val Loss Before</th>
+            <th>Val Loss After</th>
+            <th>Improvement</th>
             <th>Selected LR</th>
-            <th>Sweep Duration</th>
+            <th>Duration</th>
         </tr>
         {rows}
     </table>
@@ -2082,6 +2172,11 @@ def run_staged_training(
     cfg: StagedTrainingConfig,
     output_dir: str,
     run_id: str,
+    single_stage: Optional[int] = None,
+    direct_train_session: Optional[str] = None,
+    direct_val_session: Optional[str] = None,
+    original_session_path: Optional[str] = None,
+    starting_checkpoint: Optional[str] = None,
 ) -> None:
     """
     Main function to run staged training.
@@ -2091,6 +2186,11 @@ def run_staged_training(
         cfg: Training configuration
         output_dir: Output directory for reports
         run_id: Unique identifier for this run (used in checkpoint names to avoid collisions)
+        single_stage: If specified, run only this stage number
+        direct_train_session: Path to training session (direct mode)
+        direct_val_session: Path to validation session (direct mode)
+        original_session_path: Path to original session for evaluation (optional)
+        starting_checkpoint: Path to starting checkpoint (optional)
     """
     # Set instance_id for checkpoint naming (prevents collisions with concurrent runs)
     state.instance_id = run_id
@@ -2108,19 +2208,44 @@ def run_staged_training(
     # Save config
     cfg.to_yaml(str(output_path / "config.yaml"))
 
-    # Discover stages
-    print("Discovering staged splits...")
-    stages = discover_staged_splits(root_session_path)
-    if not stages:
-        raise ValueError(f"No staged splits found for {root_session_path}")
+    # Discover stages based on mode
+    if direct_train_session and direct_val_session:
+        # Direct mode: create synthetic stage entry
+        print("Direct mode: using provided train/val sessions")
+        stages = [(1, direct_train_session, direct_val_session)]
 
-    print(f"Found {len(stages)} stages:")
+        # Determine original session for evaluation
+        if original_session_path:
+            effective_original_path = original_session_path
+            print(f"Original session for evaluation: {Path(original_session_path).name}")
+        else:
+            # Default to train session (report will note this)
+            effective_original_path = direct_train_session
+            print("Note: Using training session as original for evaluation. "
+                  "Use --original-session to specify a different session.")
+    else:
+        # Discover stages from root session
+        print("Discovering staged splits...")
+        effective_original_path = root_session_path
+        stages = discover_staged_splits(root_session_path)
+
+        if not stages:
+            raise ValueError(f"No staged splits found for {root_session_path}")
+
+        if single_stage is not None:
+            # Filter to only the requested stage
+            stages = [(n, t, v) for n, t, v in stages if n == single_stage]
+            if not stages:
+                raise ValueError(f"Stage {single_stage} not found in staged splits")
+            print(f"Single stage mode: running stage {single_stage} only")
+
+    print(f"Found {len(stages)} stage(s):")
     for stage_num, train_path, val_path in stages:
         print(f"  Stage {stage_num}: train={Path(train_path).name}, val={Path(val_path).name}")
 
     # Load original session for final evaluation
-    print("\nLoading original session...")
-    original_session = load_session_for_training(root_session_path)
+    print("\nLoading original session for evaluation...")
+    original_session = load_session_for_training(effective_original_path)
 
     # Clean old checkpoints if enabled (only cleans checkpoints from THIS run_id to avoid
     # interfering with concurrent runs using different run_ids)
@@ -2151,7 +2276,7 @@ def run_staged_training(
 
     # Run STAGED training (weights carry over between stages)
     staged_results = []
-    current_checkpoint = None  # Fresh weights for stage 1
+    current_checkpoint = starting_checkpoint  # Use provided checkpoint or None for fresh weights
     all_sweep_results = []  # Track LR sweep results for reporting
     all_timings = []  # Track timing for each stage
     completed_stages = []  # For incremental final reports
@@ -2210,6 +2335,11 @@ def run_staged_training(
             sweep_elapsed = time.time() - sweep_start
             all_sweep_results.append(sweep_result)
             print(f"LR Sweep selected: {selected_lr:.2e} (took {format_duration(sweep_elapsed)})")
+
+            # Force GPU memory cleanup after sweep
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Override LR for main training
         stage_cfg = StagedTrainingConfig.from_dict(cfg.to_dict())
@@ -2389,6 +2519,11 @@ def run_staged_training(
                 baseline_sweep_results.append(baseline_sweep_result)
                 print(f"Baseline LR Sweep selected: {baseline_selected_lr:.2e} (took {format_duration(baseline_sweep_elapsed)})")
 
+                # Force GPU memory cleanup after sweep
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             # Override LR for baseline training
             baseline_cfg = StagedTrainingConfig.from_dict(cfg.to_dict())
             baseline_cfg.custom_lr = baseline_selected_lr
@@ -2519,7 +2654,6 @@ def main():
     )
     parser.add_argument(
         "--root-session",
-        required=True,
         help="Path to the root session directory (staged splits should exist)",
     )
     parser.add_argument(
@@ -2599,8 +2733,54 @@ def main():
         action="store_true",
         help="Disable baseline comparison runs",
     )
+    # Single stage / direct session mode
+    parser.add_argument(
+        "--stage",
+        type=int,
+        help="Run only this specific stage number (requires staged splits to exist)",
+    )
+    parser.add_argument(
+        "--train-session",
+        help="Path to training session (use with --val-session for direct mode without staged splits)",
+    )
+    parser.add_argument(
+        "--val-session",
+        help="Path to validation session (use with --train-session for direct mode)",
+    )
+    parser.add_argument(
+        "--original-session",
+        help="Path to original (full) session for evaluation (optional in direct mode, defaults to train session)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        help="Starting checkpoint path (optional, for resuming training)",
+    )
 
     args = parser.parse_args()
+
+    # Determine training mode and validate arguments
+    if args.train_session and args.val_session:
+        # Direct mode: use provided sessions as a single "stage"
+        training_mode = "direct"
+        if args.stage:
+            print("Warning: --stage is ignored when using --train-session/--val-session")
+        if not args.root_session:
+            # In direct mode, root_session is not required but we need a value for output_dir
+            args.root_session = args.train_session  # Use train session name
+    elif args.stage is not None:
+        # Single stage mode: run only the specified stage from staged splits
+        training_mode = "single_stage"
+        if not args.root_session:
+            parser.error("--root-session is required when using --stage")
+    else:
+        # Full staged training mode (original behavior)
+        training_mode = "full"
+        if not args.root_session:
+            parser.error("--root-session is required (or use --train-session + --val-session)")
+
+    # Validate direct mode has both sessions
+    if (args.train_session and not args.val_session) or (args.val_session and not args.train_session):
+        parser.error("--train-session and --val-session must be used together")
 
     # Generate run_id if not provided (enables concurrent execution without conflicts)
     run_id = args.run_id or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
@@ -2645,7 +2825,17 @@ def main():
         output_dir = f"saved/staged_training_reports/{session_name}/{run_id}"
 
     # Run training
-    run_staged_training(args.root_session, cfg, output_dir, run_id)
+    run_staged_training(
+        root_session_path=args.root_session,
+        cfg=cfg,
+        output_dir=output_dir,
+        run_id=run_id,
+        single_stage=args.stage,
+        direct_train_session=args.train_session,
+        direct_val_session=args.val_session,
+        original_session_path=args.original_session,
+        starting_checkpoint=args.checkpoint,
+    )
 
 
 if __name__ == "__main__":

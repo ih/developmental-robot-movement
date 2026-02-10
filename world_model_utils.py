@@ -124,6 +124,22 @@ def create_reduce_on_plateau_scheduler(optimizer, patience=5, factor=0.1, min_lr
     )
 
 
+def create_constant_lr_scheduler(optimizer):
+    """
+    Create a scheduler that keeps LR constant (no decay).
+
+    Used for plateau sweep mode where LR adaptation happens through
+    sweep-triggered restarts, not through scheduler decay.
+
+    Args:
+        optimizer: The optimizer to schedule
+
+    Returns:
+        Learning rate scheduler (torch.optim.lr_scheduler.LambdaLR)
+    """
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+
 def create_resume_scheduler(optimizer, warmup_from_lr, warmup_to_lr, warmup_steps,
                              decay_to_lr, total_steps):
     """
