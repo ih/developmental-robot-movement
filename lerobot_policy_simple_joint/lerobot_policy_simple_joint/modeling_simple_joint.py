@@ -75,6 +75,8 @@ class SimpleJointPolicy(PreTrainedPolicy):
         """Reset policy state between episodes.
 
         Should be called on env.reset().
+        If discrete_action_log_dir is set, creates a per-episode log file
+        and writes the header automatically.
         """
         self._sequence_index = 0
         self._current_action = 0
@@ -87,6 +89,17 @@ class SimpleJointPolicy(PreTrainedPolicy):
         if self.config.random_seed is not None:
             self._rng = torch.Generator()
             self._rng.manual_seed(self.config.random_seed)
+
+        # Set up per-episode log file if log directory is configured
+        if self.config.discrete_action_log_dir:
+            log_dir = Path(self.config.discrete_action_log_dir)
+            # Auto-detect episode number from existing log files
+            existing = sorted(log_dir.glob("episode_*.jsonl"))
+            episode_num = len(existing)
+            self.config.discrete_action_log_path = str(
+                log_dir / f"episode_{episode_num:06d}.jsonl"
+            )
+            self._write_log_header()
 
     def _write_log_header(self):
         """Write metadata header to log file with recording parameters.

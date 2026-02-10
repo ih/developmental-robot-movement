@@ -505,10 +505,14 @@ Required Python packages:
   - `lerobot_policy_simple_joint/__init__.py`: Package exports and version
   - `lerobot_policy_simple_joint/configuration_simple_joint.py`: SimpleJointConfig class with configurable joint and movement parameters
   - `lerobot_policy_simple_joint/modeling_simple_joint.py`: SimpleJointPolicy class implementing 3 discrete actions with duration-based movement
+  - `lerobot_policy_simple_joint/processor_simple_joint.py`: Identity pre/post processors for LeRobot plugin system
   - `pyproject.toml`: Package metadata and dependencies
   - `README.md`: Usage documentation for the policy
-- `run_lerobot_record.py`: Wrapper script for lerobot-record with auto-calculated episode timing (5s buffer for camera warmup and calibration)
-  - **Debug output**: Prints full lerobot-record command with all parameters before execution for easy verification and troubleshooting
+- `run_lerobot_record.py`: Wrapper script for lerobot-record with Windows camera patches and auto-calculated episode timing
+  - **Windows compatibility**: DSHOW camera backend and synchronous read patches
+  - **Auto episode timing**: Calculates episode_time_s from action_sequence length + 5s buffer
+  - **Discrete action logging**: Injects log directory into policy config via CLI args
+  - **Debug output**: Prints full lerobot-record command with all parameters before execution
 - `convert_lerobot_to_explorer.py`: Converter script for LeRobot v3.0 datasets to concat_world_model_explorer format with dual-camera stacking
 
 ### Models

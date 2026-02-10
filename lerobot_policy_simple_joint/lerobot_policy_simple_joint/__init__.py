@@ -28,10 +28,12 @@ except ImportError:
 
 from .configuration_simple_joint import SimpleJointConfig
 from .modeling_simple_joint import SimpleJointPolicy
+from .processor_simple_joint import make_simple_joint_pre_post_processors
 
 __all__ = [
     "SimpleJointConfig",
     "SimpleJointPolicy",
+    "make_simple_joint_pre_post_processors",
 ]
 
 __version__ = "0.1.0"
