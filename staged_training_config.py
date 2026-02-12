@@ -88,7 +88,7 @@ class PlateauSweepConfig:
     # Plateau detection parameters
     plateau_ema_alpha: float = 0.9  # EMA smoothing for validation loss (higher = more responsive)
     plateau_improvement_threshold: float = 0.0005  # 0.5% relative improvement required
-    plateau_patience: int = 100  # Updates without improvement before triggering sweep
+    plateau_patience: int = 25  # Updates without improvement before triggering sweep
 
     # Cooldown after sweep (prevents immediate re-triggering)
     cooldown_updates: int = 5  # Updates to wait after sweep before detection resumes
@@ -143,8 +143,8 @@ class StagedTrainingConfig:
     # Divergence stopping (app defaults)
     stop_on_divergence: bool = True  # App default
     divergence_gap: float = 0.002  # App default
-    divergence_ratio: float = 1.3  # App default
-    divergence_patience: int = 10  # App default
+    divergence_ratio: float = 1.5  # App default
+    divergence_patience: int = 20  # App default
     divergence_min_updates: int = 5  # App default
     val_spike_threshold: float = 2.0  # App default
     val_spike_window: int = 15  # App default
@@ -161,7 +161,7 @@ class StagedTrainingConfig:
     lr_min_ratio: float = 0.001  # App default
     resume_warmup_ratio: float = 0.05  # App default
     plateau_factor: float = 0.8  # ReduceLROnPlateau reduction factor (new_lr = lr * factor)
-    plateau_patience: int = 20  # ReduceLROnPlateau patience (0 = use divergence_patience * 2)
+    plateau_patience: int = 15  # ReduceLROnPlateau patience (0 = use divergence_patience * 2)
 
     # Resume mode settings (app defaults)
     preserve_optimizer: bool = False  # App default
@@ -174,6 +174,7 @@ class StagedTrainingConfig:
 
     # Stage settings
     runs_per_stage: int = 1  # CLI parameter
+    serial_runs: bool = True  # Run runs_per_stage serially instead of in parallel
     clean_old_checkpoints: bool = True  # Clean old auto-saved checkpoints before starting
 
     # Baseline comparison
@@ -192,6 +193,9 @@ class StagedTrainingConfig:
 
     # Plateau-triggered LR sweep configuration (new default mode)
     plateau_sweep: PlateauSweepConfig = field(default_factory=PlateauSweepConfig)
+
+    # Initial LR sweep before each stage (runs regardless of plateau_sweep.enabled)
+    initial_sweep_enabled: bool = True
 
     # Stage-level time budget in minutes (0 = unlimited)
     # Applies to main training only; sweeps use lr_sweep.phase_a/b_time_budget_min

@@ -1209,13 +1209,25 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         yield f"Error creating DataLoader: {str(e)}", None, None, None, None, None, "", None
         return
 
-    # Initialize metrics with resume offset
-    cumulative_metrics = {
-        'samples_seen': [],
-        'loss_at_sample': [],
-        'val_loss_at_sample': [],  # Validation loss (if validation session loaded)
-        'lr_at_sample': [],  # Learning rate at each checkpoint
-    }
+    # Preserve accumulated metrics across sweep restarts (generator re-invocations).
+    # state.cumulative_metrics retains data from prior training segments within the same
+    # run_stage_training() call; use it if available, otherwise start fresh.
+    if (state.cumulative_metrics
+            and state.cumulative_metrics.get('samples_seen')
+            and starting_samples > 0):
+        cumulative_metrics = {
+            'samples_seen': list(state.cumulative_metrics['samples_seen']),
+            'loss_at_sample': list(state.cumulative_metrics['loss_at_sample']),
+            'val_loss_at_sample': list(state.cumulative_metrics['val_loss_at_sample']),
+            'lr_at_sample': list(state.cumulative_metrics['lr_at_sample']),
+        }
+    else:
+        cumulative_metrics = {
+            'samples_seen': [],
+            'loss_at_sample': [],
+            'val_loss_at_sample': [],  # Validation loss (if validation session loaded)
+            'lr_at_sample': [],  # Learning rate at each checkpoint
+        }
 
     # Check if validation session is loaded
     has_validation = bool(state.validation_session_state.get("canvas_cache"))
@@ -1259,7 +1271,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
 
     # Plateau sweep state tracking (new mode - replaces ReduceLROnPlateau and val_plateau early stopping)
     plateau_sweep_ema = None  # EMA of validation loss for sweep triggering
-    plateau_sweep_best = float('inf')  # Best EMA value seen (for improvement comparison)
+    plateau_sweep_best = None  # Best EMA value seen (for improvement comparison), None until first EMA
     plateau_sweep_patience_counter = 0  # Updates without significant improvement
     plateau_sweep_in_cooldown = False  # True during post-sweep cooldown period
     plateau_sweep_cooldown_remaining = 0  # Updates remaining in cooldown
@@ -1610,19 +1622,31 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                     plateau_sweep_patience_counter = 0
                                     print(f"[PLATEAU SWEEP] Cooldown ended, resetting baseline to {plateau_sweep_ema:.6f}")
                             else:
-                                # Check for relative improvement
-                                if plateau_sweep_best > 0:
-                                    improvement = (plateau_sweep_best - plateau_sweep_ema) / plateau_sweep_best
-                                else:
-                                    improvement = 1.0 if plateau_sweep_ema < plateau_sweep_best else 0.0
-
-                                if improvement > plateau_sweep_improvement_threshold:
-                                    # Significant improvement - reset counter
+                                if plateau_sweep_best is None:
+                                    # First EMA value - establish baseline, don't increment counter
                                     plateau_sweep_best = plateau_sweep_ema
-                                    plateau_sweep_patience_counter = 0
                                 else:
-                                    # No significant improvement
-                                    plateau_sweep_patience_counter += 1
+                                    # Check for relative improvement
+                                    if plateau_sweep_best > 0:
+                                        improvement = (plateau_sweep_best - plateau_sweep_ema) / plateau_sweep_best
+                                    else:
+                                        improvement = 1.0 if plateau_sweep_ema < plateau_sweep_best else 0.0
+
+                                    if improvement > plateau_sweep_improvement_threshold:
+                                        # Significant improvement - reset counter
+                                        if plateau_sweep_patience_counter > 0:
+                                            print(f"[PLATEAU SWEEP] Improvement {improvement:.6f} > {plateau_sweep_improvement_threshold} - "
+                                                  f"counter reset (was {plateau_sweep_patience_counter}), "
+                                                  f"new best={plateau_sweep_ema:.6f}")
+                                        plateau_sweep_best = plateau_sweep_ema
+                                        plateau_sweep_patience_counter = 0
+                                    else:
+                                        # No significant improvement
+                                        plateau_sweep_patience_counter += 1
+                                        if plateau_sweep_patience_counter % 10 == 0 or plateau_sweep_patience_counter == 1:
+                                            print(f"[PLATEAU SWEEP] No improvement: {improvement:.6f} <= {plateau_sweep_improvement_threshold} "
+                                                  f"| counter={plateau_sweep_patience_counter}/{plateau_sweep_patience} "
+                                                  f"| ema={plateau_sweep_ema:.6f} best={plateau_sweep_best:.6f}")
 
                                 # Check if plateau reached and we can still trigger sweeps
                                 if plateau_sweep_patience_counter >= plateau_sweep_patience:
@@ -2010,19 +2034,31 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                                     plateau_sweep_patience_counter = 0
                                     print(f"[PLATEAU SWEEP] Cooldown ended, resetting baseline to {plateau_sweep_ema:.6f}")
                             else:
-                                # Check for relative improvement
-                                if plateau_sweep_best > 0:
-                                    improvement = (plateau_sweep_best - plateau_sweep_ema) / plateau_sweep_best
-                                else:
-                                    improvement = 1.0 if plateau_sweep_ema < plateau_sweep_best else 0.0
-
-                                if improvement > plateau_sweep_improvement_threshold:
-                                    # Significant improvement - reset counter
+                                if plateau_sweep_best is None:
+                                    # First EMA value - establish baseline, don't increment counter
                                     plateau_sweep_best = plateau_sweep_ema
-                                    plateau_sweep_patience_counter = 0
                                 else:
-                                    # No significant improvement
-                                    plateau_sweep_patience_counter += 1
+                                    # Check for relative improvement
+                                    if plateau_sweep_best > 0:
+                                        improvement = (plateau_sweep_best - plateau_sweep_ema) / plateau_sweep_best
+                                    else:
+                                        improvement = 1.0 if plateau_sweep_ema < plateau_sweep_best else 0.0
+
+                                    if improvement > plateau_sweep_improvement_threshold:
+                                        # Significant improvement - reset counter
+                                        if plateau_sweep_patience_counter > 0:
+                                            print(f"[PLATEAU SWEEP] Improvement {improvement:.6f} > {plateau_sweep_improvement_threshold} - "
+                                                  f"counter reset (was {plateau_sweep_patience_counter}), "
+                                                  f"new best={plateau_sweep_ema:.6f}")
+                                        plateau_sweep_best = plateau_sweep_ema
+                                        plateau_sweep_patience_counter = 0
+                                    else:
+                                        # No significant improvement
+                                        plateau_sweep_patience_counter += 1
+                                        if plateau_sweep_patience_counter % 10 == 0 or plateau_sweep_patience_counter == 1:
+                                            print(f"[PLATEAU SWEEP] No improvement: {improvement:.6f} <= {plateau_sweep_improvement_threshold} "
+                                                  f"| counter={plateau_sweep_patience_counter}/{plateau_sweep_patience} "
+                                                  f"| ema={plateau_sweep_ema:.6f} best={plateau_sweep_best:.6f}")
 
                                 # Check if plateau reached and we can still trigger sweeps
                                 if plateau_sweep_patience_counter >= plateau_sweep_patience:

@@ -246,6 +246,9 @@ python staged_training.py --root-session saved/sessions/so101/my_session \
 # Use upfront sweeps instead of plateau-triggered sweeps (legacy mode)
 python staged_training.py --root-session saved/sessions/so101/my_session --disable-plateau-sweep
 
+# Disable the initial LR sweep that runs before each stage
+python staged_training.py --root-session saved/sessions/so101/my_session --disable-initial-sweep
+
 # Disable baseline comparison
 python staged_training.py --root-session saved/sessions/so101/my_session --disable-baseline
 
@@ -266,11 +269,13 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - **Divergence-based early stopping**: Automatically stops when validation loss diverges from training
 - **EMA-smoothed divergence detection**: Uses exponential moving average of training loss for robust detection
 - **Loss-weighted sampling**: Focuses on high-loss samples for efficient learning
-- **Parallel execution**: Multiple training runs can execute in parallel within a stage
+- **Serial runs** (`--serial-runs`, default): Runs `runs_per_stage` sequentially to reduce peak GPU memory; parallel mode still available
+- **Initial LR sweep** (`initial_sweep_enabled=True`): Runs an upfront LR sweep before each stage regardless of whether plateau sweeps are enabled; disable with `--disable-initial-sweep`
 - **Time budget control**: Optional per-stage time budget for main training
+- **Interrupt/crash recovery**: Catches `KeyboardInterrupt` and exceptions, recovers the interrupted stage from auto-saved checkpoints, and generates a partial report with all completed stages
 - **Baseline comparison**: Optionally run parallel baseline training (fresh weights each stage) to compare against staged training (weight carryover)
 - **Progressive reporting**: Final report updated after each stage for real-time progress visibility
-- **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, LR sweep results (including plateau sweep history), staged vs baseline comparison, and inference visualizations
+- **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, config diff vs last commit, full training loss timeline, multi-run statistics, LR sweep results (including plateau sweep history), staged vs baseline comparison, and inference visualizations
 - **Best checkpoint selection**: Selects best checkpoint based on hybrid loss over original (full) session
 - **W&B integration**: Optional Weights & Biases logging with run_id in run names and baseline config tracking
 
@@ -278,9 +283,11 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - All parameters match Gradio app defaults
 - **Sweep mode**: `plateau_sweep.enabled` (default True = plateau-triggered sweeps, False = upfront sweeps)
 - Key parameters: `batch_size`, `divergence_patience`, `loss_weight_temperature`
-- Plateau Sweep config: `plateau_sweep.plateau_patience`, `plateau_sweep.plateau_improvement_threshold`, `plateau_sweep.cooldown_updates`, `plateau_sweep.max_sweeps_per_stage`
+- Plateau Sweep config: `plateau_sweep.plateau_patience` (25 updates), `plateau_sweep.plateau_improvement_threshold`, `plateau_sweep.cooldown_updates`, `plateau_sweep.max_sweeps_per_stage` (2)
 - LR Sweep config (shared by both modes): `lr_sweep.lr_min`, `lr_sweep.lr_max`, `lr_sweep.phase_a_num_candidates`, `lr_sweep.phase_a_time_budget_min`, `lr_sweep.phase_b_seeds`, `lr_sweep.phase_b_time_budget_min`
-- Baseline config: `enable_baseline` (default False), `baseline_runs_per_stage` (default 2)
+- Baseline config: `enable_baseline` (default False), `baseline_runs_per_stage` (default 1)
+- `serial_runs` (default True): run multiple runs per stage serially instead of in parallel
+- `initial_sweep_enabled` (default True): upfront LR sweep before each stage (orthogonal to `plateau_sweep.enabled`)
 - Stage time budget: `stage_time_budget_min` (0 = unlimited)
 - Supports YAML config files for reproducible experiments
 
@@ -289,7 +296,7 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - Baseline reports: `saved/staged_training_reports/{session}/stage{N}_baseline_run{M}/report.html`
 - Final summary: `saved/staged_training_reports/{session}/final_report_{date}.html` (dated, e.g., `final_report_2026_feb_07.html`)
 - Also copied to: `docs/final_report_{date}.html` for easy access
-- Includes: training progress graphs, hybrid loss over session graphs, staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
+- Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, multi-run statistics (when `runs_per_stage > 1`), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
 
 ## Dependencies
 
@@ -334,8 +341,10 @@ Required Python packages:
   - Divergence-based early stopping with EMA-smoothed training loss
   - Best checkpoint selection based on original session loss
   - Baseline comparison training (fresh weights each stage) for comparing against staged (weight carryover)
-  - Integrated LR sweep before each stage with parallel execution support
-  - Comprehensive HTML reports with training progress, staged vs baseline comparison, and inference visualizations
+  - Serial and parallel run modes for `runs_per_stage > 1` (serial is default)
+  - Initial LR sweep before each stage (orthogonal to plateau-triggered sweeps)
+  - Interrupt/crash recovery with partial report generation
+  - Comprehensive HTML reports with config diff, full loss timeline, multi-run stats, staged vs baseline comparison, and inference visualizations
 - `staged_training_config.py`: Dataclass configuration for staged training runs
   - All parameters match Gradio app defaults
   - Baseline config: `enable_baseline`, `baseline_runs_per_stage`
