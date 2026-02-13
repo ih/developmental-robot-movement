@@ -68,11 +68,12 @@ For infinite random actions, use `use_random_policy=true` instead.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `joint_name` | `"shoulder_pan.pos"` | Joint to control. Options: `shoulder_pan.pos`, `shoulder_lift.pos`, `elbow_flex.pos`, `wrist_flex.pos`, `wrist_roll.pos`, `gripper.pos` |
-| `action_duration` | `0.5` | How long each discrete action lasts before selecting the next action (seconds) |
+| `action_duration` | `0.5` | How long each discrete action lasts before selecting the next action (seconds). Can be auto-calibrated by `run_lerobot_record.py`. |
 | `position_delta` | `0.1` | How far to move the joint when action 1 or 2 is selected (radians) |
 | `use_random_policy` | `false` | If true, randomly select actions indefinitely |
 | `action_sequence` | `null` | Optional list of actions to execute once (e.g., `[1, 0, 2, 0]`). No wrapping. |
 | `random_seed` | `null` | Seed for reproducible random actions |
+| `calibrated_action_duration` | `false` | True if `action_duration` was auto-calibrated by measuring servo settling time |
 
 ## Converting to concat_world_model_explorer Format
 

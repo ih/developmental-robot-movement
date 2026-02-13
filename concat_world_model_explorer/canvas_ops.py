@@ -47,7 +47,12 @@ def build_canvas_from_frame(frame_idx):
         # Find action that corresponds to transition from frame idx to idx+1
         # Actions list should align with observations
         if idx < len(actions):
-            selected_actions.append(actions[idx])
+            action_data = actions[idx].get("action", {"action": 0})
+            # Handle both dict and int action formats
+            if isinstance(action_data, dict):
+                selected_actions.append(action_data)
+            else:
+                selected_actions.append({"action": action_data})
         else:
             # Fallback: use session's action space for default (JetBot support)
             action_space = state.session_state.get("action_space", [])

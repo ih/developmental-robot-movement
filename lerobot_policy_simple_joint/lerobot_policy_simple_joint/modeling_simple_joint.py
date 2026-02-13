@@ -121,6 +121,7 @@ class SimpleJointPolicy(PreTrainedPolicy):
                 "joint_name": self.config.joint_name,
                 "action_duration": self.config.action_duration,
                 "position_delta": self.config.position_delta,
+                "calibrated": self.config.calibrated_action_duration,
                 "use_random_policy": self.config.use_random_policy,
                 "action_sequence": self.config.action_sequence,
                 "random_seed": self.config.random_seed
@@ -169,14 +170,15 @@ class SimpleJointPolicy(PreTrainedPolicy):
         device = state.device
         num_joints = state.shape[1]  # Should be 6 for SO-101
 
-        # Check if current action has completed its duration
+        # Check if current action has completed its duration.
+        # action_duration should be calibrated to include servo settling time.
         current_time = time.time()
         action_changed = False
 
         if self._action_start_time is not None:
             elapsed = current_time - self._action_start_time
             if elapsed >= self.config.action_duration:
-                # Action duration completed, select new action
+                # Action + settle completed, select new action
                 self._current_action = self._get_discrete_action(batch_size, device).item()
                 self._action_start_time = current_time
                 action_changed = True

@@ -97,6 +97,12 @@ from lr_sweep import (
 )
 
 
+# Partial report state for interrupt/crash recovery.
+# Populated by run_staged_training() so main() can generate a final report
+# if the process is interrupted (Ctrl+C) or crashes mid-training.
+_partial_report_state = None
+
+
 @dataclass
 class StageResult:
     """Result from training a single stage/run."""
@@ -598,10 +604,6 @@ def run_stage_training(
     training_complete = False
     try:
         while not training_complete:
-            # Determine if we can still trigger sweeps (based on consecutive count, not total)
-            can_trigger_sweep = (plateau_sweep_enabled and
-                                consecutive_sweep_count < cfg.plateau_sweep.max_sweeps_per_stage)
-
             generator = training.run_world_model_batch(
                 total_samples=effective_total_samples,
                 batch_size=cfg.batch_size,
@@ -656,7 +658,7 @@ def run_stage_training(
                 time_budget_min=time_budget_min,
                 min_samples_for_timeout=cfg.lr_sweep.min_samples_before_timeout if hasattr(cfg, 'lr_sweep') else 1000,
                 # Plateau sweep parameters
-                plateau_sweep_enabled=can_trigger_sweep,
+                plateau_sweep_enabled=plateau_sweep_enabled,
                 plateau_sweep_ema_alpha=cfg.plateau_sweep.plateau_ema_alpha if plateau_sweep_enabled else 0.9,
                 plateau_sweep_improvement_threshold=cfg.plateau_sweep.plateau_improvement_threshold if plateau_sweep_enabled else 0.005,
                 plateau_sweep_patience=cfg.plateau_sweep.plateau_patience if plateau_sweep_enabled else 10,
@@ -918,6 +920,331 @@ def save_fig_to_file(fig, path: Path) -> None:
         return
     fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)
+
+
+def get_config_changes_from_git() -> dict[str, tuple]:
+    """
+    Compare current StagedTrainingConfig defaults against the last git commit.
+
+    Returns dict of {param_name: (old_value, new_value)} for changed defaults.
+    Uses dotted names for nested configs (e.g., 'plateau_sweep.plateau_patience').
+    Returns empty dict if git or import fails.
+    """
+    import subprocess
+    import importlib
+    import importlib.util
+    import tempfile
+    import sys
+
+    try:
+        result = subprocess.run(
+            ["git", "show", "HEAD:staged_training_config.py"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return {}
+
+        # Write to temp file and import
+        temp_dir = tempfile.mkdtemp()
+        temp_path = os.path.join(temp_dir, "_prev_config.py")
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(result.stdout)
+
+        # Add temp dir to sys.path temporarily
+        sys.path.insert(0, temp_dir)
+        try:
+            # Import the previous version
+            spec = importlib.util.spec_from_file_location("_prev_config", temp_path)
+            prev_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(prev_module)
+            prev_cfg = prev_module.StagedTrainingConfig()
+        finally:
+            sys.path.remove(temp_dir)
+            # Clean up temp dir (may contain __pycache__)
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except OSError:
+                pass
+
+        # Compare with current defaults
+        current_cfg = StagedTrainingConfig()
+        changes = {}
+
+        def compare_configs(old_obj, new_obj, prefix=""):
+            for field_name in new_obj.__dataclass_fields__:
+                old_val = getattr(old_obj, field_name, None)
+                new_val = getattr(new_obj, field_name, None)
+                full_name = f"{prefix}{field_name}" if not prefix else f"{prefix}.{field_name}"
+                if prefix == "":
+                    full_name = field_name
+
+                # Recurse into nested dataclasses
+                if hasattr(new_val, '__dataclass_fields__') and hasattr(old_val, '__dataclass_fields__'):
+                    compare_configs(old_val, new_val, full_name)
+                elif old_val != new_val:
+                    changes[full_name] = (old_val, new_val)
+
+        compare_configs(prev_cfg, current_cfg)
+        return changes
+
+    except Exception:
+        return {}
+
+
+def generate_config_html(cfg: StagedTrainingConfig) -> str:
+    """
+    Generate HTML showing config changes from git and all parameters.
+
+    Returns HTML with:
+    - Visible table of defaults changed since last commit
+    - Collapsible section with all parameter values
+    """
+    # Get git changes
+    changes = get_config_changes_from_git()
+
+    # Build changed params table
+    if changes:
+        change_rows = ""
+        for param, (old_val, new_val) in sorted(changes.items()):
+            change_rows += f"""
+            <tr>
+                <td><code>{param}</code></td>
+                <td>{old_val}</td>
+                <td><strong>{new_val}</strong></td>
+            </tr>"""
+
+        changes_html = f"""
+        <h3>Config Defaults Changed Since Last Commit</h3>
+        <table>
+            <tr><th>Parameter</th><th>Previous</th><th>Current</th></tr>
+            {change_rows}
+        </table>"""
+    else:
+        changes_html = "<p><em>No config defaults changed since last commit.</em></p>"
+
+    # Build all params table
+    def flatten_config(obj, prefix=""):
+        rows = []
+        for field_name in obj.__dataclass_fields__:
+            val = getattr(obj, field_name, None)
+            full_name = f"{prefix}.{field_name}" if prefix else field_name
+            if hasattr(val, '__dataclass_fields__'):
+                rows.extend(flatten_config(val, full_name))
+            else:
+                rows.append((full_name, val))
+        return rows
+
+    all_params = flatten_config(cfg)
+    all_rows = ""
+    for param, val in all_params:
+        all_rows += f"""
+            <tr><td><code>{param}</code></td><td>{val}</td></tr>"""
+
+    all_params_html = f"""
+        <details>
+            <summary style="cursor: pointer; color: #1976D2; font-weight: bold; margin-top: 15px;">All Configuration Parameters ({len(all_params)} parameters)</summary>
+            <table style="margin-top: 10px;">
+                <tr><th>Parameter</th><th>Value</th></tr>
+                {all_rows}
+            </table>
+        </details>"""
+
+    return f"""
+    <section id="configuration">
+        <h2>Configuration</h2>
+        {changes_html}
+        {all_params_html}
+    </section>
+"""
+
+
+def create_full_training_loss_plot(
+    completed_stages: list[tuple[int, "StageResult", Optional["StageResult"]]],
+) -> tuple[Optional[plt.Figure], Optional[plt.Figure]]:
+    """
+    Create loss plots across the full training run over all stages.
+
+    Returns (full_figure, zoomed_figure):
+    - full_figure: Complete loss timeline with stage boundaries
+    - zoomed_figure: Zoomed view starting after initial drop to show plateau/learning
+    """
+    all_samples = []
+    all_train_loss = []
+    all_val_loss = []
+    stage_boundaries = []  # (sample_offset, stage_num)
+    cumulative_offset = 0
+
+    for stage_num, staged, _ in completed_stages:
+        metrics = staged.cumulative_metrics
+        if not metrics:
+            continue
+
+        samples = metrics.get("samples_seen", [])
+        train_loss = metrics.get("loss_at_sample", [])
+        val_loss = metrics.get("val_loss_at_sample", [])
+
+        if not samples or not train_loss:
+            continue
+
+        stage_boundaries.append((cumulative_offset, stage_num))
+
+        for i, s in enumerate(samples):
+            all_samples.append(s + cumulative_offset)
+            if i < len(train_loss):
+                all_train_loss.append(train_loss[i])
+            if i < len(val_loss):
+                all_val_loss.append(val_loss[i])
+
+        # Offset for next stage
+        if samples:
+            cumulative_offset += samples[-1]
+
+    if not all_samples:
+        return None, None
+
+    # Figure 1: Full timeline
+    fig_full, ax1 = plt.subplots(figsize=(12, 6))
+    ax1.plot(all_samples[:len(all_train_loss)], all_train_loss, 'b-', alpha=0.7, linewidth=1, label='Train Loss')
+    if all_val_loss:
+        ax1.plot(all_samples[:len(all_val_loss)], all_val_loss, 'r-', alpha=0.7, linewidth=1, label='Val Loss')
+    for offset, stage_num in stage_boundaries:
+        ax1.axvline(x=offset, color='gray', linestyle='--', alpha=0.5)
+        ax1.text(offset, ax1.get_ylim()[1] * 0.95, f' S{stage_num}', fontsize=8, color='gray', va='top')
+    ax1.set_xlabel('Cumulative Samples')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Loss Across Full Training Run')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Figure 2: Zoomed view - skip initial drop
+    # Heuristic: start from where loss drops below 2x the final loss or median, whichever is lower
+    reference_loss = all_train_loss[-1] if all_train_loss else 0
+    median_loss = float(np.median(all_train_loss)) if all_train_loss else 0
+    threshold = min(2.0 * reference_loss, median_loss)
+
+    zoom_start_idx = 0
+    for i, loss in enumerate(all_train_loss):
+        if loss <= threshold:
+            zoom_start_idx = max(0, i - 5)  # Include a few points before threshold
+            break
+
+    # Only create zoomed view if we're actually skipping something
+    fig_zoomed = None
+    if zoom_start_idx > len(all_train_loss) * 0.05:  # At least 5% of data is skipped
+        fig_zoomed, ax2 = plt.subplots(figsize=(12, 6))
+        zoomed_samples = all_samples[zoom_start_idx:len(all_train_loss)]
+        zoomed_train = all_train_loss[zoom_start_idx:]
+        ax2.plot(zoomed_samples, zoomed_train, 'b-', alpha=0.7, linewidth=1, label='Train Loss')
+        if all_val_loss and zoom_start_idx < len(all_val_loss):
+            zoomed_val = all_val_loss[zoom_start_idx:]
+            ax2.plot(all_samples[zoom_start_idx:zoom_start_idx + len(zoomed_val)], zoomed_val, 'r-', alpha=0.7, linewidth=1, label='Val Loss')
+        for offset, stage_num in stage_boundaries:
+            if offset >= all_samples[zoom_start_idx]:
+                ax2.axvline(x=offset, color='gray', linestyle='--', alpha=0.5)
+                ax2.text(offset, ax2.get_ylim()[1] * 0.95, f' S{stage_num}', fontsize=8, color='gray', va='top')
+        ax2.set_xlabel('Cumulative Samples')
+        ax2.set_ylabel('Loss')
+        ax2.set_title('Loss Detail (Post Initial Drop)')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+
+    return fig_full, fig_zoomed
+
+
+def generate_multi_run_stats_html(
+    all_stage_runs: dict[int, list["StageResult"]],
+    completed_stages: list[tuple[int, "StageResult", Optional["StageResult"]]],
+) -> str:
+    """
+    Generate HTML section with statistics across all runs per stage.
+
+    Only generates content if any stage has more than 1 run.
+    """
+    # Check if any stage has multiple runs
+    has_multi_runs = any(len(runs) > 1 for runs in all_stage_runs.values())
+    if not has_multi_runs:
+        return ""
+
+    # Build best run lookup
+    best_runs = {}
+    for stage_num, staged, _ in completed_stages:
+        best_runs[stage_num] = staged
+
+    sections = []
+    total_runs = 0
+    all_best_losses = []
+
+    for stage_num in sorted(all_stage_runs.keys()):
+        runs = all_stage_runs[stage_num]
+        if not runs:
+            continue
+
+        best = best_runs.get(stage_num)
+        valid_losses = [r.best_loss for r in runs if r.best_loss < float('inf')]
+        total_runs += len(runs)
+        all_best_losses.extend(valid_losses)
+
+        # Per-run table
+        run_rows = ""
+        for r in sorted(runs, key=lambda x: x.run_num):
+            is_best = best and r.best_checkpoint_path == best.best_checkpoint_path
+            selected = "&#10003;" if is_best else ""
+            row_style = ' style="background: #e8f5e9; font-weight: bold;"' if is_best else ''
+            run_rows += f"""
+                <tr{row_style}>
+                    <td>{r.run_num}</td>
+                    <td>{format_loss_safe(r.best_loss)}</td>
+                    <td>{r.stop_reason}</td>
+                    <td>{r.total_samples_trained:,}</td>
+                    <td>{format_duration(r.elapsed_time)}</td>
+                    <td>{selected}</td>
+                </tr>"""
+
+        # Aggregate stats
+        if valid_losses:
+            mean_loss = np.mean(valid_losses)
+            std_loss = np.std(valid_losses)
+            min_loss = np.min(valid_losses)
+            max_loss = np.max(valid_losses)
+            run_rows += f"""
+                <tr style="background: #e0e0e0; font-weight: bold; font-style: italic;">
+                    <td colspan="2">Mean: {mean_loss:.6f} &plusmn; {std_loss:.6f}</td>
+                    <td colspan="2">Min: {min_loss:.6f} / Max: {max_loss:.6f}</td>
+                    <td colspan="2">Range: {max_loss - min_loss:.6f}</td>
+                </tr>"""
+
+        sections.append(f"""
+        <h3>Stage {stage_num} ({len(runs)} runs)</h3>
+        <table>
+            <tr>
+                <th>Run</th>
+                <th>Best Loss</th>
+                <th>Stop Reason</th>
+                <th>Samples</th>
+                <th>Time</th>
+                <th>Selected</th>
+            </tr>
+            {run_rows}
+        </table>""")
+
+    # Overall summary
+    overall_html = ""
+    if all_best_losses:
+        overall_html = f"""
+        <div class="metric">
+            <strong>Total Runs:</strong> {total_runs}<br>
+            <strong>Average Best Loss:</strong> {np.mean(all_best_losses):.6f} &plusmn; {np.std(all_best_losses):.6f}<br>
+            <strong>Best Overall:</strong> {np.min(all_best_losses):.6f}<br>
+            <strong>Worst Overall:</strong> {np.max(all_best_losses):.6f}
+        </div>"""
+
+    return f"""
+    <section id="multi-run-stats">
+        <h2>Multi-Run Statistics</h2>
+        {overall_html}
+        {"".join(sections)}
+    </section>
+"""
 
 
 def get_available_actions(session: dict) -> list[int]:
@@ -1488,6 +1815,7 @@ def generate_final_report(
     original_session: Optional[dict],
     cfg: StagedTrainingConfig,
     is_final: bool = False,
+    all_stage_runs: Optional[dict[int, list[StageResult]]] = None,
 ) -> str:
     """
     Generate unified final report (updated progressively after each stage).
@@ -2045,6 +2373,28 @@ def generate_final_report(
         best_checkpoint_html = best_checkpoint_html
         stage_progression_html = lr_schedule_html + stage_progression_html
 
+    # Generate config section (always available)
+    config_html = generate_config_html(cfg)
+
+    # Generate full training loss plots (always available, grows with each stage)
+    full_loss_html = ""
+    fig_full, fig_zoomed = create_full_training_loss_plot(completed_stages)
+    if fig_full:
+        full_b64 = fig_to_base64(fig_full)
+        zoomed_b64 = fig_to_base64(fig_zoomed) if fig_zoomed else ""
+        full_loss_html = f"""
+    <section id="full-training-loss">
+        <h2>Loss Across Full Training Run</h2>
+        <img src="data:image/png;base64,{full_b64}" />
+        {'<h3>Loss Detail (Post Initial Drop)</h3><img src="data:image/png;base64,' + zoomed_b64 + '" />' if zoomed_b64 else ""}
+    </section>
+"""
+
+    # Generate multi-run statistics (always available)
+    multi_run_html = generate_multi_run_stats_html(
+        all_stage_runs or {}, completed_stages
+    )
+
     # Build HTML
     status_indicator = "✓ Complete" if is_final else "⏳ In Progress"
     status_color = "#4CAF50" if is_final else "#FF9800"
@@ -2092,6 +2442,8 @@ def generate_final_report(
         </div>
     </section>
 
+    {config_html}
+
     <section id="timing">
         <h2>Timing Summary</h2>
         <table>
@@ -2129,6 +2481,9 @@ def generate_final_report(
         <h2>Stop Reason Breakdown</h2>
         {stop_reason_html}
     </section>
+
+    {full_loss_html}
+    {multi_run_html}
 
     {best_checkpoint_html}
     {stage_progression_html}
@@ -2280,9 +2635,32 @@ def run_staged_training(
     all_sweep_results = []  # Track LR sweep results for reporting
     all_timings = []  # Track timing for each stage
     completed_stages = []  # For incremental final reports
+    all_stage_runs: dict[int, list[StageResult]] = {}  # Track ALL runs per stage for multi-run stats
+
+    # Store state for interrupt/crash recovery (module-level so main() can access it)
+    global _partial_report_state
+    _partial_report_state = {
+        'completed_stages': completed_stages,
+        'all_sweep_results': all_sweep_results,
+        'all_timings': all_timings,
+        'output_dir': output_path,
+        'run_id': run_id,
+        'overall_start_time': overall_start_time,
+        'original_session': original_session,
+        'cfg': cfg,
+        'all_stage_runs': all_stage_runs,
+        'current_stage_info': None,  # Updated per-stage for interrupted stage recovery
+    }
 
     for stage_num, train_path, val_path in stages:
         stage_start_time = time.time()
+
+        # Track in-progress stage for interrupt recovery
+        _partial_report_state['current_stage_info'] = {
+            'stage_num': stage_num,
+            'start_time': stage_start_time,
+            'train_path': train_path,
+        }
 
         print(f"\n{'#'*60}")
         print(f"# STAGE {stage_num}")
@@ -2295,12 +2673,12 @@ def run_staged_training(
         print(f"Loading validation session: {Path(val_path).name}")
         val_session = load_session_for_training(val_path)
 
-        # Upfront LR Sweep (when plateau sweep is disabled)
+        # Upfront LR Sweep (when plateau sweep is disabled, or initial_sweep_enabled is True)
         selected_lr = cfg.custom_lr
         sweep_result = None
         sweep_elapsed = 0.0
 
-        if not cfg.plateau_sweep.enabled:
+        if not cfg.plateau_sweep.enabled or cfg.initial_sweep_enabled:
             sweep_start = time.time()
             print(f"\n--- LR Sweep for Stage {stage_num} ---")
 
@@ -2356,7 +2734,9 @@ def run_staged_training(
         stage_results = []
         main_training_start = time.time()
 
-        if cfg.runs_per_stage > 1:
+        per_run_budget = main_training_budget / cfg.runs_per_stage if main_training_budget > 0 else 0
+
+        if cfg.runs_per_stage > 1 and not cfg.serial_runs:
             # Parallel execution for multiple runs
             stage_results = run_main_training_parallel(
                 stage_num=stage_num,
@@ -2369,8 +2749,38 @@ def run_staged_training(
                 output_dir=output_path,
                 run_id=run_id,
                 is_baseline=False,
-                time_budget_min=main_training_budget / cfg.runs_per_stage if main_training_budget > 0 else 0,
+                time_budget_min=per_run_budget,
             )
+        elif cfg.runs_per_stage > 1 and cfg.serial_runs:
+            # Serial execution for multiple runs
+            print(f"\n[TRAINING] Running {cfg.runs_per_stage} runs serially for stage {stage_num}")
+            stage_results = []
+            for run_num in range(1, cfg.runs_per_stage + 1):
+                print(f"\n[TRAINING] Starting serial run {run_num}/{cfg.runs_per_stage}")
+                seed = hash((run_id, stage_num, run_num, False)) % (2**32)
+                torch.manual_seed(seed)
+                np.random.seed(seed)
+                random.seed(seed)
+
+                # Reload sessions for each run to ensure clean state
+                run_train_session = load_session_for_training(train_path)
+                run_val_session = load_session_for_training(val_path)
+
+                run_output_dir = output_path / f"stage{stage_num}_run{run_num}"
+                result = run_stage_training(
+                    stage_num=stage_num,
+                    run_num=run_num,
+                    train_session=run_train_session,
+                    val_session=run_val_session,
+                    checkpoint_path=current_checkpoint,
+                    cfg=stage_cfg,
+                    output_dir=run_output_dir,
+                    is_baseline=False,
+                    run_id=run_id,
+                    time_budget_min=per_run_budget,
+                )
+                stage_results.append(result)
+                print(f"[TRAINING] Serial run {run_num} complete: loss={result.best_loss:.6f}")
         else:
             # Single run - no parallelization overhead
             run_output_dir = output_path / f"stage{stage_num}_run1"
@@ -2423,6 +2833,7 @@ def run_staged_training(
             cleanup_stage_checkpoints(stage_results, best_run)
 
         staged_results.append((stage_num, best_run))
+        all_stage_runs[stage_num] = stage_results
 
         # Track timing
         stage_total_time = time.time() - stage_start_time
@@ -2441,6 +2852,7 @@ def run_staged_training(
         )
         all_timings.append(timing)
         completed_stages.append((stage_num, best_run, None))  # baseline added later
+        _partial_report_state['current_stage_info'] = None  # Stage completed
 
         # Generate progressive final report (updated after each stage)
         generate_final_report(
@@ -2453,6 +2865,7 @@ def run_staged_training(
             original_session=None,  # Don't evaluate until final
             cfg=cfg,
             is_final=False,
+            all_stage_runs=all_stage_runs,
         )
 
     # Run BASELINE training if enabled (fresh weights each stage)
@@ -2538,7 +2951,9 @@ def run_staged_training(
             baseline_stage_results = []
             baseline_main_start = time.time()
 
-            if cfg.baseline_runs_per_stage > 1:
+            baseline_per_run_budget = baseline_main_budget / cfg.baseline_runs_per_stage if baseline_main_budget > 0 else 0
+
+            if cfg.baseline_runs_per_stage > 1 and not cfg.serial_runs:
                 # Parallel execution for multiple baseline runs
                 baseline_stage_results = run_main_training_parallel(
                     stage_num=stage_num,
@@ -2551,8 +2966,37 @@ def run_staged_training(
                     output_dir=output_path,
                     run_id=run_id,
                     is_baseline=True,
-                    time_budget_min=baseline_main_budget / cfg.baseline_runs_per_stage if baseline_main_budget > 0 else 0,
+                    time_budget_min=baseline_per_run_budget,
                 )
+            elif cfg.baseline_runs_per_stage > 1 and cfg.serial_runs:
+                # Serial execution for multiple baseline runs
+                print(f"\n[BASELINE] Running {cfg.baseline_runs_per_stage} baseline runs serially for stage {stage_num}")
+                baseline_stage_results = []
+                for run_num in range(1, cfg.baseline_runs_per_stage + 1):
+                    print(f"\n[BASELINE] Starting serial baseline run {run_num}/{cfg.baseline_runs_per_stage}")
+                    seed = hash((run_id, stage_num, run_num, True)) % (2**32)
+                    torch.manual_seed(seed)
+                    np.random.seed(seed)
+                    random.seed(seed)
+
+                    run_train_session = load_session_for_training(train_path)
+                    run_val_session = load_session_for_training(val_path)
+
+                    run_output_dir = output_path / f"stage{stage_num}_baseline_run{run_num}"
+                    result = run_stage_training(
+                        stage_num=stage_num,
+                        run_num=run_num,
+                        train_session=run_train_session,
+                        val_session=run_val_session,
+                        checkpoint_path=None,  # ALWAYS fresh weights for baseline
+                        cfg=baseline_cfg,
+                        output_dir=run_output_dir,
+                        is_baseline=True,
+                        run_id=run_id,
+                        time_budget_min=baseline_per_run_budget,
+                    )
+                    baseline_stage_results.append(result)
+                    print(f"[BASELINE] Serial baseline run {run_num} complete: loss={result.best_loss:.6f}")
             else:
                 # Single run - no parallelization overhead
                 run_output_dir = output_path / f"stage{stage_num}_baseline_run1"
@@ -2638,6 +3082,7 @@ def run_staged_training(
         original_session=original_session,
         cfg=cfg,
         is_final=True,
+        all_stage_runs=all_stage_runs,
     )
 
     print("\n" + "=" * 60)
@@ -2646,6 +3091,9 @@ def run_staged_training(
     print(f"Output directory: {output_path}")
     print(f"Final report: {final_report_path}")
     print(f"Also available at: docs/{Path(final_report_path).name}")
+
+    # Clear partial report state on normal completion
+    _partial_report_state = None
 
 
 def main():
@@ -2671,6 +3119,11 @@ def main():
         help="Number of training runs per stage (default: from config)",
     )
     parser.add_argument(
+        "--serial-runs",
+        action="store_true",
+        help="Run runs_per_stage serially instead of in parallel (lower memory usage)",
+    )
+    parser.add_argument(
         "--run-id",
         help="Unique run identifier for concurrent execution (default: auto-generated timestamp)",
     )
@@ -2679,6 +3132,11 @@ def main():
         "--disable-plateau-sweep",
         action="store_true",
         help="Disable plateau-triggered sweeps (default mode). Enables upfront LR sweep before each stage instead.",
+    )
+    parser.add_argument(
+        "--disable-initial-sweep",
+        action="store_true",
+        help="Disable the initial LR sweep at the start of each stage (enabled by default).",
     )
     parser.add_argument(
         "--lr-sweep-lr-min",
@@ -2794,10 +3252,14 @@ def main():
     # Override runs_per_stage from CLI only if explicitly provided
     if args.runs_per_stage is not None:
         cfg.runs_per_stage = args.runs_per_stage
+    if args.serial_runs:
+        cfg.serial_runs = True
 
     # Override sweep mode from CLI
     if args.disable_plateau_sweep:
         cfg.plateau_sweep.enabled = False
+    if args.disable_initial_sweep:
+        cfg.initial_sweep_enabled = False
     if args.lr_sweep_lr_min != 1e-6:
         cfg.lr_sweep.lr_min = args.lr_sweep_lr_min
     if args.lr_sweep_lr_max != 1e-2:
@@ -2824,18 +3286,116 @@ def main():
         session_name = Path(args.root_session).name
         output_dir = f"saved/staged_training_reports/{session_name}/{run_id}"
 
-    # Run training
-    run_staged_training(
-        root_session_path=args.root_session,
-        cfg=cfg,
-        output_dir=output_dir,
-        run_id=run_id,
-        single_stage=args.stage,
-        direct_train_session=args.train_session,
-        direct_val_session=args.val_session,
-        original_session_path=args.original_session,
-        starting_checkpoint=args.checkpoint,
-    )
+    # Run training (with interrupt/crash recovery for final report)
+    try:
+        run_staged_training(
+            root_session_path=args.root_session,
+            cfg=cfg,
+            output_dir=output_dir,
+            run_id=run_id,
+            single_stage=args.stage,
+            direct_train_session=args.train_session,
+            direct_val_session=args.val_session,
+            original_session_path=args.original_session,
+            starting_checkpoint=args.checkpoint,
+        )
+    except (KeyboardInterrupt, Exception) as e:
+        is_interrupt = isinstance(e, KeyboardInterrupt)
+        label = "Interrupted (Ctrl+C)" if is_interrupt else f"Error: {e}"
+        print(f"\n{'='*60}")
+        print(f"STAGED TRAINING {label}")
+        print(f"{'='*60}")
+
+        # Try to recover data from the interrupted stage
+        if _partial_report_state and _partial_report_state.get('current_stage_info'):
+            stage_info = _partial_report_state['current_stage_info']
+            try:
+                from concat_world_model_explorer.state import get_checkpoint_dir_for_session
+                checkpoint_dir = Path(get_checkpoint_dir_for_session(str(stage_info['train_path'])))
+                session_name = Path(stage_info['train_path']).name
+                partial_run_id = _partial_report_state['run_id']
+
+                # Find auto-saved checkpoints on disk for this session/run_id
+                pattern = f"best_model_auto_{session_name}_{partial_run_id}_*"
+                checkpoints = list(checkpoint_dir.glob(pattern))
+
+                if checkpoints:
+                    # Parse checkpoint filenames to find best (lowest) loss
+                    # Pattern: best_model_auto_{session}_{run_id}_{samples:08d}_{origin}_{type}_{loss:.6f}.pth
+                    best_ckpt = None
+                    best_loss = float('inf')
+                    best_is_val = False
+                    for ckpt in checkpoints:
+                        # Loss is always the last part before .pth
+                        parts = ckpt.stem.split('_')
+                        try:
+                            loss = float(parts[-1])
+                            is_val = (len(parts) >= 2 and parts[-2] == "val")
+                            # Prefer val loss checkpoints; among same type, prefer lower loss
+                            if best_ckpt is None or (is_val and not best_is_val) or \
+                               (is_val == best_is_val and loss < best_loss):
+                                best_loss = loss
+                                best_ckpt = ckpt
+                                best_is_val = is_val
+                        except (ValueError, IndexError):
+                            continue
+
+                    if best_ckpt:
+                        # Try to read samples_seen from checkpoint metadata
+                        samples_trained = 0
+                        try:
+                            ckpt_data = torch.load(str(best_ckpt), map_location='cpu', weights_only=True)
+                            samples_trained = ckpt_data.get('samples_seen', 0)
+                        except Exception:
+                            pass
+
+                        elapsed = time.time() - stage_info['start_time']
+                        partial_result = StageResult(
+                            stage_num=stage_info['stage_num'],
+                            run_num=1,
+                            is_baseline=False,
+                            best_checkpoint_path=str(best_ckpt),
+                            best_loss=best_loss,
+                            stop_reason="interrupted",
+                            elapsed_time=elapsed,
+                            total_samples_trained=samples_trained,
+                            cumulative_metrics={},
+                            final_train_loss=best_loss,
+                            final_val_loss=best_loss if best_is_val else None,
+                        )
+                        _partial_report_state['completed_stages'].append(
+                            (stage_info['stage_num'], partial_result, None)
+                        )
+                        print(f"Recovered interrupted stage {stage_info['stage_num']} "
+                              f"(checkpoint: {best_ckpt.name}, loss: {best_loss:.6f})")
+                else:
+                    print(f"No checkpoints found for interrupted stage {stage_info['stage_num']}.")
+            except Exception as stage_err:
+                print(f"Could not recover interrupted stage data: {stage_err}")
+
+        if _partial_report_state and _partial_report_state['completed_stages']:
+            print(f"Generating partial report with {len(_partial_report_state['completed_stages'])} completed stage(s)...")
+            try:
+                report_path = generate_final_report(
+                    completed_stages=_partial_report_state['completed_stages'],
+                    all_sweep_results=_partial_report_state['all_sweep_results'],
+                    all_timings=_partial_report_state['all_timings'],
+                    output_dir=_partial_report_state['output_dir'],
+                    run_id=_partial_report_state['run_id'],
+                    overall_start_time=_partial_report_state['overall_start_time'],
+                    original_session=_partial_report_state['original_session'],
+                    cfg=_partial_report_state['cfg'],
+                    is_final=True,
+                    all_stage_runs=_partial_report_state['all_stage_runs'],
+                )
+                print(f"Partial report saved: {report_path}")
+            except Exception as report_err:
+                print(f"Failed to generate partial report: {report_err}")
+        else:
+            print("No completed stages to report.")
+
+        if not is_interrupt:
+            raise
 
 
 if __name__ == "__main__":
