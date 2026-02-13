@@ -60,9 +60,14 @@ The concat world model uses a unique approach to visual prediction:
 - **LeRobot integration**: Custom policy package for SO-101 follower arm control
 - **Single-joint control**: 3 discrete actions (stay, move positive, move negative) per joint
 - **Configurable joint**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
+- **Servo auto-calibration**: Measures actual servo settling time to set optimal `action_duration` before recording
+  - Polls `Present_Position` at 10ms intervals until stable, applies 1.2x safety margin
+  - Visual verification with test sequence canvases (colored separators show movement vs stay)
+  - Skip with `--skip-calibration` or `--skip-verification` flags
 - **Dual-camera support**: Stacks base_0_rgb and left_wrist_0_rgb cameras vertically for 448x224 combined frames
 - **Discrete action logging**: Automatic JSONL logs for 100% accurate action reconstruction
 - **Dataset converter**: Convert LeRobot v3.0 datasets to concat_world_model_explorer format
+  - Parquet-anchored frame mapping: uses per-frame action/state data to anchor proportional mapping to ground truth
 
 ### Action Selectors
 
@@ -169,7 +174,7 @@ pip install -e .
 
 #### Record with lerobot-record
 
-Use `run_lerobot_record.py` wrapper for action sequences (auto-calculates episode time):
+Use `run_lerobot_record.py` wrapper for action sequences (auto-calibrates and calculates episode time):
 ```bash
 python run_lerobot_record.py \
     --robot.type=so101_follower \
@@ -178,13 +183,15 @@ python run_lerobot_record.py \
     --robot.cameras="{ base_0_rgb: {type: opencv, index_or_path: 0, width: 1280, height: 720, fps: 30}, left_wrist_0_rgb: {type: opencv, index_or_path: 1, width: 1280, height: 720, fps: 30}}" \
     --policy.type=simple_joint \
     --policy.joint_name=wrist_roll.pos \
-    --policy.action_duration=0.5 \
     --policy.position_delta=10 \
     --policy.action_sequence="[1, 0, 2, 0, 1]" \
     --dataset.repo_id=${HF_USER}/so101-test \
     --dataset.num_episodes=1 \
     --dataset.single_task="Single joint movement"
 ```
+
+When `--policy.action_duration` is omitted, the wrapper auto-calibrates by measuring servo settling time.
+Use `--skip-calibration` to use the default 0.5s, or `--skip-verification` to calibrate without the visual preview.
 
 #### Convert LeRobot Dataset to Explorer Format
 ```bash
@@ -366,7 +373,7 @@ Required Python packages:
 - `toroidal_dot_env.py`: Simulated toroidal environment
 - `toroidal_dot_interface.py`: ToroidalDotRobot implementation
 - `lerobot_policy_simple_joint/`: LeRobot custom policy for SO-101 single-joint control
-- `run_lerobot_record.py`: Wrapper for lerobot-record with auto-calculated episode timing
+- `run_lerobot_record.py`: Wrapper for lerobot-record with servo auto-calibration, visual verification, and auto-calculated episode timing
 - `convert_lerobot_to_explorer.py`: Dataset converter for LeRobot v3.0 to explorer format
 
 ### Models

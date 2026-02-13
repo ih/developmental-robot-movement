@@ -16,6 +16,10 @@ This repository contains research code for developmental robot movement with a c
 8. **Staged Training** (`staged_training.py`, `staged_training_config.py`, `create_staged_splits.py`) - Automated progressive training pipeline with HTML reports
 9. **Learning Rate Sweep** (`lr_sweep.py`) - Time-budgeted learning rate optimization with two-phase search (broad exploration + deep validation)
 
+## Environment
+- Python virtual environment: `C:\Projects\pythonenv-deeprl`
+- Activate before running Python commands: `C:\Projects\pythonenv-deeprl\Scripts\activate`
+
 ## Architecture
 
 ### RobotInterface Abstraction
@@ -42,7 +46,12 @@ This repository contains research code for developmental robot movement with a c
 ### SO-101 Robot Arm Integration
 - **LeRobot custom policy**: `lerobot_policy_simple_joint` package for single-joint control with 3 discrete actions
 - **Action space**: Action 0 (stay), Action 1 (move positive by position_delta), Action 2 (move negative by position_delta)
-- **Action parameters**: `action_duration` controls how long each discrete action lasts (default 0.5s), `position_delta` controls movement magnitude (default 0.1 radians)
+- **Action parameters**: `action_duration` controls how long each discrete action lasts (default 0.5s, can be auto-calibrated), `position_delta` controls movement magnitude (default 0.1 radians)
+- **Servo auto-calibration**: `run_lerobot_record.py` can automatically measure servo settling time to determine optimal `action_duration`, ensuring the recorded timing matches actual robot movement
+  - Sends test movement, polls `Present_Position` at 10ms intervals until stable (range < 0.5 units for 50ms)
+  - Applies 1.2x safety margin to measured settling time
+  - Visual verification: runs test sequence [MOVE+, STAY, MOVE-, STAY] with canvas preview showing colored separators
+  - Skip with `--skip-calibration` (uses default 0.5s) or `--skip-verification` (calibrates but no visual check)
 - **Configurable joint**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
 - **Policy modes**: Random exploration (infinite), fixed action sequences (execute once, no wrapping), or deterministic (always stay)
 - **Discrete action logging**: Automatically records exact discrete actions during `lerobot-record` sessions to JSONL logs in `meta/discrete_action_logs/` directory (included in Hub uploads)
@@ -52,8 +61,9 @@ This repository contains research code for developmental robot movement with a c
 - **Dataset converter**: `convert_lerobot_to_explorer.py` converts LeRobot v3.0 datasets to concat_world_model_explorer format
   - **Hub download support**: Converter can download datasets directly via HuggingFace repo_id (e.g., `username/dataset-name`)
   - **Automatic parameter extraction**: Reads action_duration and position_delta from log header when available
+  - **Parquet-anchored mapping**: Uses per-frame action/state data to find exact video frame of first MOVE action, anchoring the proportional mapping to ground truth
   - **Timestamp-based matching**: Uses precise frame-to-action matching via log timestamps
-  - **Backward compatible**: Falls back to velocity-based discretization for datasets without logs
+  - **Backward compatible**: Falls back to even distribution for datasets without timestamps
 - **Dual-camera support**: Stacks base_0_rgb (224×224) and left_wrist_0_rgb (224×224) vertically for 448×224 combined frames
 - **Compatible with concat_world_model_explorer**: Converted sessions can be loaded and visualized in the world model explorer
 
@@ -512,11 +522,14 @@ Required Python packages:
   - `lerobot_policy_simple_joint/processor_simple_joint.py`: Identity pre/post processors for LeRobot plugin system
   - `pyproject.toml`: Package metadata and dependencies
   - `README.md`: Usage documentation for the policy
-- `run_lerobot_record.py`: Wrapper script for lerobot-record with Windows camera patches and auto-calculated episode timing
+- `run_lerobot_record.py`: Wrapper script for lerobot-record with Windows camera patches, auto-calculated episode timing, and servo auto-calibration
   - **Windows compatibility**: DSHOW camera backend and synchronous read patches
   - **Auto episode timing**: Calculates episode_time_s from action_sequence length + 5s buffer
+  - **Servo auto-calibration**: Measures actual servo settling time to set optimal `action_duration` before recording
+  - **Visual verification**: Runs test sequence with canvas preview for manual timing verification
   - **Discrete action logging**: Injects log directory into policy config via CLI args
   - **Debug output**: Prints full lerobot-record command with all parameters before execution
+  - **CLI flags**: `--skip-calibration`, `--skip-verification` to bypass calibration steps
 - `convert_lerobot_to_explorer.py`: Converter script for LeRobot v3.0 datasets to concat_world_model_explorer format with dual-camera stacking
 
 ### Models

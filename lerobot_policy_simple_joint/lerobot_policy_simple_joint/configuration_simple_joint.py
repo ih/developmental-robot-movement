@@ -53,6 +53,9 @@ class SimpleJointConfig(PreTrainedConfig):
     action_sequence: Optional[List[int]] = None
     random_seed: Optional[int] = None
 
+    # Calibration metadata
+    calibrated_action_duration: bool = False  # True if action_duration was auto-calibrated
+
     # Discrete action logging (for recording sessions)
     discrete_action_log_dir: Optional[str] = None   # Directory for discrete action logs
     discrete_action_log_path: Optional[str] = None  # Current episode's log path (set by reset())
