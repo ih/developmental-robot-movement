@@ -42,13 +42,13 @@ class SimpleJointPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: SimpleJointConfig,
-        dataset_stats: Optional[Dict[str, Dict[str, Tensor]]] = None,
+        **kwargs,
     ):
         """Initialize the SimpleJoint policy.
 
         Args:
             config: Policy configuration
-            dataset_stats: Statistics for normalization (not used by this policy)
+            **kwargs: Additional arguments from LeRobot (e.g., dataset_meta)
         """
         super().__init__(config)
         self.config = config

@@ -31,7 +31,10 @@ if platform.system() == "Windows":
     OpenCVCamera.async_read = _patched_async_read
 
 # Import the custom policy to trigger registration before lerobot parses args
-import lerobot_policy_simple_joint  # noqa: F401
+# Use explicit submodule imports to bypass namespace package shadowing when
+# running from the project root (outer directory lacks __init__.py)
+from lerobot_policy_simple_joint.configuration_simple_joint import SimpleJointConfig  # noqa: F401
+from lerobot_policy_simple_joint.modeling_simple_joint import SimpleJointPolicy  # noqa: F401
 
 # Now run lerobot-record
 from lerobot.scripts.lerobot_record import record
