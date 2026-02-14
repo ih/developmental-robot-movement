@@ -146,147 +146,44 @@ def load_discrete_action_log(log_path: Path) -> Optional[DiscreteActionLog]:
     return DiscreteActionLog(header=header, decisions=decisions)
 
 
-def _estimate_decision_frame_range(
-    log: DiscreteActionLog,
-    episode_data: pd.DataFrame,
-    joint_index: int,
-    total_frames: int,
-    fps: float,
-) -> Tuple[int, int]:
-    """Estimate the video frame range spanned by action log decisions.
-
-    Uses the Parquet data's per-frame action targets and joint states to find
-    the exact video frame where the first MOVE action starts, then back-
-    calculates where the first decision (which may be a "stay") occurred.
-
-    This anchors the decision-to-frame mapping to ground truth, correcting
-    for any offset between the start of video recording and the first policy
-    call.
-
-    Args:
-        log: The discrete action log
-        episode_data: Parquet DataFrame with 'observation.state' and 'action'
-        joint_index: Which joint to inspect (0 = shoulder_pan)
-        total_frames: Total video frames
-        fps: Video frames per second
-
-    Returns:
-        (first_decision_frame, last_decision_frame) tuple
-    """
-    try:
-        # Extract action targets and current states for the controlled joint
-        states = np.array([row[joint_index] for row in episode_data["observation.state"]])
-        targets = np.array([row[joint_index] for row in episode_data["action"]])
-        deltas = targets - states
-
-        threshold = log.position_delta / 2.0
-
-        # Find first non-zero action in the log
-        first_nonzero_log_idx = None
-        for i, d in enumerate(log.decisions):
-            if d["discrete_action"] != 0:
-                first_nonzero_log_idx = i
-                break
-
-        # Find first frame where motor target diverges from current position
-        first_move_frame = None
-        for i in range(len(deltas)):
-            if abs(deltas[i]) > threshold:
-                first_move_frame = i
-                break
-
-        if first_nonzero_log_idx is not None and first_move_frame is not None:
-            # Time from first decision to first non-zero decision
-            t_to_nonzero = (log.decisions[first_nonzero_log_idx]["timestamp"]
-                            - log.decisions[0]["timestamp"])
-            # Scale by time_scale (video_duration / log_duration)
-            log_span = log.decisions[-1]["timestamp"] - log.decisions[0]["timestamp"]
-            video_duration = total_frames / fps
-            time_scale = video_duration / log_span if log_span > 0 else 1.0
-            scaled_offset_frames = t_to_nonzero * time_scale * fps
-            first_frame = max(0, round(first_move_frame - scaled_offset_frames))
-
-            print(f"  Anchor: first_move_frame={first_move_frame}, "
-                  f"log_nonzero_idx={first_nonzero_log_idx}, "
-                  f"t_to_nonzero={t_to_nonzero:.2f}s, "
-                  f"first_decision_frame={first_frame}")
-
-            return first_frame, total_frames - 1
-
-    except Exception as e:
-        print(f"  Warning: anchor estimation failed ({e}), using frame 0")
-
-    return 0, total_frames - 1
-
-
 def get_decision_frame_indices(
     log: DiscreteActionLog,
     total_frames: int,
-    episode_data: pd.DataFrame = None,
-    joint_index: int = 0,
-    fps: float = 10.0,
 ) -> List[Tuple[int, int]]:
-    """Map each action decision to a frame index using Parquet-anchored mapping.
+    """Map each action decision to a frame index using logged frame indices.
 
-    When Parquet data is available, uses the per-frame action/state columns to
-    find the exact video frame of the first MOVE action, then anchors the
-    proportional mapping to that ground-truth point.  This corrects for any
-    offset between video start and first policy call.
-
-    Falls back to pure proportional mapping (first decision → frame 0) when
-    Parquet data is unavailable, and to even distribution when timestamps are
-    missing entirely.
+    Each decision in the log must have a 'frame_index' field recorded by the
+    policy during recording. This gives exact frame-to-decision correspondence
+    since select_action() is called once per video frame.
 
     Args:
-        log: The discrete action log with decisions
-        total_frames: Total number of frames in the episode
-        episode_data: Optional Parquet DataFrame for anchor estimation
-        joint_index: Joint index for anchor detection (default 0 = shoulder_pan)
-        fps: Video FPS for anchor offset calculation
+        log: The discrete action log with decisions (must have frame_index)
+        total_frames: Total number of frames in the episode (for validation)
 
     Returns:
         List of (frame_index, discrete_action) tuples
+
+    Raises:
+        ValueError: If decisions are missing the frame_index field
     """
     if not log.decisions:
         return []
 
-    # Check if decisions have timestamps
-    has_timestamps = all("timestamp" in d for d in log.decisions)
-
-    if has_timestamps and len(log.decisions) >= 2:
-        first_decision_time = log.decisions[0]["timestamp"]
-        last_decision_time = log.decisions[-1]["timestamp"]
-        log_span = last_decision_time - first_decision_time
-
-        # Estimate frame range using Parquet anchor if available
-        first_frame = 0
-        last_frame = total_frames - 1
-
-        if episode_data is not None and log_span > 0:
-            first_frame, last_frame = _estimate_decision_frame_range(
-                log, episode_data, joint_index, total_frames, fps
-            )
-
-        # Map all decisions proportionally within [first_frame, last_frame]
-        frame_range = last_frame - first_frame
-        decision_frames = []
-        for decision in log.decisions:
-            elapsed = decision["timestamp"] - first_decision_time
-            frac = elapsed / log_span if log_span > 0 else 0.0
-            frame_idx = first_frame + round(frac * frame_range)
-            frame_idx = max(0, min(total_frames - 1, frame_idx))
-            decision_frames.append((frame_idx, decision["discrete_action"]))
-
-        return decision_frames
-
-    # Fallback: even distribution (no timestamps available)
-    num_decisions = len(log.decisions)
-    if total_frames < num_decisions + 1:
-        num_decisions = total_frames - 1
+    # Require frame_index in all decisions
+    missing = [i for i, d in enumerate(log.decisions) if "frame_index" not in d]
+    if missing:
+        raise ValueError(
+            f"Discrete action log is missing 'frame_index' field in {len(missing)} "
+            f"decision(s) (first at index {missing[0]}). "
+            f"Re-record with the updated SimpleJointPolicy that logs frame indices."
+        )
 
     decision_frames = []
-    for i, decision in enumerate(log.decisions[:num_decisions]):
-        frame_idx = int(i * (total_frames - 1) / num_decisions)
+    for decision in log.decisions:
+        frame_idx = decision["frame_index"]
+        if frame_idx < 0 or frame_idx >= total_frames:
+            print(f"  Warning: frame_index {frame_idx} out of range [0, {total_frames}), clamping")
+            frame_idx = max(0, min(total_frames - 1, frame_idx))
         decision_frames.append((frame_idx, decision["discrete_action"]))
 
     return decision_frames
@@ -776,12 +673,9 @@ def convert_episode(
 
     # Decision-boundary format: record observations only at action decision boundaries
     if action_log and action_log.decisions:
-        # Map action decisions to frame indices using Parquet-anchored mapping
+        # Map action decisions to frame indices using logged frame indices
         decision_frames = get_decision_frame_indices(
             action_log, total_frames,
-            episode_data=episode_data,
-            joint_index=config.joint_index,
-            fps=reader.fps,
         )
 
         # Trim trailing no-op actions (action=0) from the end

@@ -151,13 +151,33 @@ def inject_discrete_action_log_dir():
     print(f"Discrete action logs will be saved to: {log_dir}")
 
 
-def _create_motor_bus(robot_port: str):
+def _create_motor_bus(robot_port: str, robot_id: str = None):
     """Create a FeetechMotorsBus with SO-101 motor configuration.
+
+    If robot_id is provided, loads calibration from the default calibration
+    directory so that sync_read/sync_write use normalized positions.
 
     Returns a connected bus. Caller is responsible for disconnecting.
     """
+    import json
+    from pathlib import Path
     from lerobot.motors.feetech import FeetechMotorsBus
-    from lerobot.motors import Motor, MotorNormMode
+    from lerobot.motors import Motor, MotorNormMode, MotorCalibration
+
+    calibration = None
+    if robot_id:
+        cal_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration" / "robots" / "so101_follower"
+        cal_path = cal_dir / f"{robot_id}.json"
+        if cal_path.is_file():
+            with open(cal_path) as f:
+                cal_dict = json.load(f)
+            calibration = {
+                motor: MotorCalibration(**cal_data)
+                for motor, cal_data in cal_dict.items()
+            }
+            print(f"  Loaded calibration from {cal_path}")
+        else:
+            print(f"  Warning: No calibration file found at {cal_path}")
 
     bus = FeetechMotorsBus(
         port=robot_port,
@@ -169,6 +189,7 @@ def _create_motor_bus(robot_port: str):
             "wrist_roll": Motor(5, "sts3215", MotorNormMode.RANGE_M100_100),
             "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
         },
+        calibration=calibration,
     )
     bus.connect()
     return bus
@@ -181,18 +202,28 @@ SO101_JOINT_NAMES = [
 ]
 
 
-def _wait_for_settle(bus, joint_name: str, timeout: float = 5.0,
+def _wait_for_settle(bus, joint_name: str, start_pos: float,
+                     timeout: float = 5.0,
                      threshold: float = 0.5, stable_count: int = 5,
-                     poll_interval: float = 0.010) -> float:
-    """Poll Present_Position until the joint stops moving.
+                     poll_interval: float = 0.010,
+                     departure_threshold: float = 0.5) -> float:
+    """Poll Present_Position until the joint moves and then stops.
+
+    Two-phase approach:
+    1. Wait for departure: poll until position differs from start_pos by
+       more than departure_threshold (confirms servo started moving).
+    2. Wait for settle: poll until position range over stable_count
+       consecutive reads is below threshold.
 
     Args:
         bus: Connected FeetechMotorsBus
         joint_name: Motor bus joint name (e.g. "shoulder_pan")
-        timeout: Max wait time in seconds
+        start_pos: Position before the move command was sent
+        timeout: Max wait time in seconds (applies across both phases)
         threshold: Position range (in motor units) to consider settled
         stable_count: Number of consecutive stable reads required
         poll_interval: Seconds between position polls
+        departure_threshold: Min distance from start_pos to confirm movement started
 
     Returns:
         Elapsed time until settled, or timeout value if not settled.
@@ -200,11 +231,21 @@ def _wait_for_settle(bus, joint_name: str, timeout: float = 5.0,
     import time
 
     start = time.time()
+    departed = False
     recent = []
 
     while time.time() - start < timeout:
         time.sleep(poll_interval)
         pos = bus.sync_read("Present_Position")[joint_name]
+
+        # Phase 1: detect that movement has started
+        if not departed:
+            if abs(pos - start_pos) > departure_threshold:
+                departed = True
+                recent = []  # reset for phase 2
+            continue
+
+        # Phase 2: wait for position to stabilize
         recent.append(pos)
 
         if len(recent) > stable_count:
@@ -214,11 +255,15 @@ def _wait_for_settle(bus, joint_name: str, timeout: float = 5.0,
             if max(recent) - min(recent) < threshold:
                 return time.time() - start
 
+    if not departed:
+        print(f"    Warning: servo never departed from start_pos={start_pos:.1f} "
+              f"(timeout={timeout}s)")
     return timeout
 
 
 def calibrate_action_duration(robot_port: str, joint_name: str,
-                              position_delta: float) -> float:
+                              position_delta: float,
+                              robot_id: str = None) -> float:
     """Measure servo settling time to determine optimal action_duration.
 
     Sends a test movement command and polls Present_Position to detect
@@ -229,12 +274,11 @@ def calibrate_action_duration(robot_port: str, joint_name: str,
         robot_port: Serial port (e.g. "COM8")
         joint_name: Policy joint name (e.g. "shoulder_pan.pos")
         position_delta: Movement magnitude to test with
+        robot_id: Robot ID for loading calibration file
 
     Returns:
         Calibrated action_duration in seconds
     """
-    import time
-
     # Map policy joint name (e.g. "shoulder_pan.pos") to motor bus name
     motor_name = joint_name.replace(".pos", "")
     if motor_name not in SO101_JOINT_NAMES:
@@ -246,33 +290,51 @@ def calibrate_action_duration(robot_port: str, joint_name: str,
     print(f"  Position delta: {position_delta}")
 
     try:
-        bus = _create_motor_bus(robot_port)
+        bus = _create_motor_bus(robot_port, robot_id)
 
         # Read current position
-        current_pos = bus.sync_read("Present_Position")[motor_name]
-        print(f"  Current position: {current_pos:.1f}")
+        origin_pos = bus.sync_read("Present_Position")[motor_name]
+        print(f"  Starting position: {origin_pos:.1f}")
 
-        # Send test movement (+position_delta)
-        target_pos = current_pos + position_delta
-        target_pos = max(-100, min(100, target_pos))
-        print(f"  Moving to: {target_pos:.1f} (+{position_delta})")
+        settle_times = []
 
-        bus.sync_write("Goal_Position", {motor_name: target_pos})
-        forward_time = _wait_for_settle(bus, motor_name)
-        final_pos = bus.sync_read("Present_Position")[motor_name]
-        print(f"  Forward settle time: {forward_time:.3f}s (reached {final_pos:.1f})")
+        def _move_and_log(label, before_pos, target_pos):
+            """Execute a movement, wait for settle, and log positions."""
+            target_pos = max(-100, min(100, target_pos))
+            expected_delta = target_pos - before_pos
+            print(f"  [{label}] Before: {before_pos:.1f} | Target: {target_pos:.1f} "
+                  f"(delta={expected_delta:+.1f})")
+            bus.sync_write("Goal_Position", {motor_name: target_pos})
+            settle_time = _wait_for_settle(bus, motor_name, before_pos)
+            after_pos = bus.sync_read("Present_Position")[motor_name]
+            actual_delta = after_pos - before_pos
+            err = abs(actual_delta - expected_delta)
+            match = "YES" if err < 1.0 else "NO"
+            print(f"           After:  {after_pos:.1f} | Actual delta: {actual_delta:+.1f} "
+                  f"| Match: {match} (err={err:.1f})")
+            print(f"           Settle time: {settle_time:.3f}s")
+            settle_times.append(settle_time)
+            return after_pos
 
-        # Return to original position
-        bus.sync_write("Goal_Position", {motor_name: current_pos})
-        return_time = _wait_for_settle(bus, motor_name)
-        print(f"  Return settle time: {return_time:.3f}s")
+        # Test 1: Move positive (+position_delta)
+        pos = _move_and_log("MOVE+", origin_pos, origin_pos + position_delta)
+
+        # Test 2: Return to origin
+        pos = _move_and_log("RETURN", pos, origin_pos)
+
+        # Test 3: Move negative (-position_delta)
+        pos = _move_and_log("MOVE-", pos, origin_pos - position_delta)
+
+        # Test 4: Return to origin
+        pos = _move_and_log("RETURN", pos, origin_pos)
 
         bus.disconnect()
 
-        # Use the longer of forward/return with 20% safety margin
-        measured = max(forward_time, return_time)
+        # Use the worst-case settle time with 20% safety margin
+        measured = max(settle_times)
         calibrated = round(measured * 1.2, 2)
-        print(f"  Measured: {measured:.3f}s -> calibrated: {calibrated:.2f}s (1.2x margin)")
+        print(f"  Settle times: {[f'{t:.3f}s' for t in settle_times]}")
+        print(f"  Worst case: {measured:.3f}s -> calibrated: {calibrated:.2f}s (1.2x margin)")
         print(f"=================================\n")
         return calibrated
 
@@ -286,137 +348,174 @@ def calibrate_action_duration(robot_port: str, joint_name: str,
 def verify_calibration_with_canvases(robot_port: str, joint_name: str,
                                      position_delta: float,
                                      action_duration: float,
-                                     camera_indices: list) -> bool:
-    """Run a short test sequence and show sample canvases for verification.
+                                     robot_id: str = None) -> bool:
+    """Verify calibrated action_duration using the full recording pipeline.
 
-    Executes [move+, stay, move-, stay] with the calibrated action_duration,
-    captures camera frames at each decision boundary, and displays canvases
-    with colored separators for visual verification.
+    Runs the real pipeline end-to-end:
+    1. Records a short test episode via lerobot-record subprocess
+    2. Converts to explorer format via convert_lerobot_to_explorer.py
+    3. Builds canvases using the same code path as staged_training.py
+    4. Displays canvases for user approval
 
     Args:
         robot_port: Serial port (e.g. "COM8")
         joint_name: Policy joint name (e.g. "shoulder_pan.pos")
         position_delta: Movement magnitude
         action_duration: Calibrated action duration to test
-        camera_indices: List of camera indices to capture from
+        robot_id: Robot ID for loading calibration file
 
     Returns:
-        True if user approves, False if user wants to abort/retry
+        True if user approves, False if user wants to retry with longer duration
     """
+    import subprocess
+    import tempfile
+    import shutil
+    import os
     import time
-    import cv2
+    import traceback
     import numpy as np
+    from pathlib import Path
 
-    motor_name = joint_name.replace(".pos", "")
-    test_actions = [1, 0, 2, 0]  # move+, stay, move-, stay
-    action_colors = {
-        0: (0, 0, 255),    # RED (BGR) = stay
-        1: (0, 255, 0),    # GREEN (BGR) = move+
-        2: (255, 0, 0),    # BLUE (BGR) = move-
-    }
-    action_names = {0: "STAY", 1: "MOVE+", 2: "MOVE-"}
-    sep_width = 4
+    cameras_str = parse_arg("robot.cameras")
+    camera_keys = _parse_camera_keys()
 
     print(f"\n=== Calibration Verification ===")
-    print(f"  Running test sequence: {[action_names[a] for a in test_actions]}")
+    print(f"  Running full pipeline: record → convert → build canvases")
     print(f"  Action duration: {action_duration}s")
+    print(f"  Test sequence: [MOVE+, STAY, MOVE-, STAY]")
+
+    temp_repo = f"_temp/eval_calibration_verify_{int(time.time())}_{os.getpid()}"
+    dataset_path = Path.home() / ".cache" / "huggingface" / "lerobot" / temp_repo
+    temp_session_dir = None
 
     try:
-        bus = _create_motor_bus(robot_port)
+        # === Step A: Record via lerobot-record subprocess ===
+        print(f"\n  Step 1/3: Recording test episode...")
+        cmd = [
+            sys.executable, os.path.abspath(__file__),
+            f"--robot.type=so101_follower",
+            f"--robot.port={robot_port}",
+        ]
+        if robot_id:
+            cmd.append(f"--robot.id={robot_id}")
+        if cameras_str:
+            cmd.append(f"--robot.cameras={cameras_str}")
+        cmd.extend([
+            "--policy.type=simple_joint",
+            f"--policy.joint_name={joint_name}",
+            f"--policy.action_duration={action_duration}",
+            f"--policy.position_delta={position_delta}",
+            "--policy.action_sequence=[1, 0, 2, 0]",
+            f"--dataset.repo_id={temp_repo}",
+            "--dataset.num_episodes=1",
+            "--dataset.single_task=Calibration verification",
+            "--dataset.push_to_hub=false",
+            "--skip-calibration",
+            "--skip-verification",
+        ])
 
-        # Open cameras
-        caps = []
-        for idx in camera_indices:
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY)
-            if cap.isOpened():
-                caps.append(cap)
-            else:
-                print(f"  Warning: Could not open camera {idx}")
+        result = subprocess.run(cmd, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(f"lerobot-record subprocess failed with code {result.returncode}")
 
-        if not caps:
-            print(f"  No cameras available, skipping visual verification")
-            bus.disconnect()
-            return True
+        if not dataset_path.exists():
+            raise RuntimeError(f"Dataset not found at {dataset_path}")
 
-        def capture_frame():
-            """Capture and resize a frame from the first available camera."""
-            for cap in caps:
-                ret, frame = cap.read()
-                if ret:
-                    return cv2.resize(frame, (224, 224))
-            return np.zeros((224, 224, 3), dtype=np.uint8)
+        # === Step B: Convert via convert_lerobot_to_explorer.py ===
+        print(f"\n  Step 2/3: Converting to explorer format...")
+        temp_session_dir = tempfile.mkdtemp(prefix="cal_verify_session_")
+        converter_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "convert_lerobot_to_explorer.py")
+        convert_cmd = [
+            sys.executable, converter_script,
+            "--lerobot-path", str(dataset_path),
+            "--output-dir", temp_session_dir,
+            "--cameras", *camera_keys,
+            "--joint-name", joint_name,
+            "--action-duration", str(action_duration),
+        ]
+        if len(camera_keys) > 1:
+            convert_cmd.extend(["--stack-cameras", "vertical"])
 
-        # Capture initial observation
-        time.sleep(0.3)  # Let camera warm up
-        frames = [capture_frame()]
-        actions_taken = []
+        result = subprocess.run(convert_cmd, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(f"Converter subprocess failed with code {result.returncode}")
 
-        # Execute test sequence
-        current_pos = bus.sync_read("Present_Position")[motor_name]
+        # Find the generated session directory
+        session_subdirs = [d for d in os.listdir(temp_session_dir)
+                           if os.path.isdir(os.path.join(temp_session_dir, d))]
+        if not session_subdirs:
+            raise RuntimeError(f"No session directory found in {temp_session_dir}")
+        session_path = os.path.join(temp_session_dir, session_subdirs[0])
 
-        for action in test_actions:
-            # Compute target
-            if action == 1:
-                target = current_pos + position_delta
-            elif action == 2:
-                target = current_pos - position_delta
-            else:
-                target = current_pos
-            target = max(-100, min(100, target))
+        # === Step C: Build canvases via staged_training.py code path ===
+        print(f"\n  Step 3/3: Building canvases...")
+        from session_explorer_lib import (
+            load_session_events, extract_observations, extract_actions,
+            prebuild_all_canvases
+        )
+        import config
 
-            # Execute action
-            bus.sync_write("Goal_Position", {motor_name: target})
-            actions_taken.append(action)
+        events = load_session_events(session_path)
+        observations = extract_observations(events, session_path)
+        actions = extract_actions(events)
 
-            # Wait for action_duration
-            time.sleep(action_duration)
+        canvas_cache, detected_frame_size = prebuild_all_canvases(
+            session_path, observations, actions,
+            config.AutoencoderConcatPredictorWorldModelConfig,
+        )
 
-            # Capture result frame
-            frames.append(capture_frame())
-            current_pos = bus.sync_read("Present_Position")[motor_name]
+        if not canvas_cache:
+            raise RuntimeError("No canvases were built from the verification recording")
 
-        # Return to original position
-        bus.sync_write("Goal_Position", {motor_name: bus.sync_read("Present_Position")[motor_name]})
-        bus.disconnect()
+        # === Step D: Display canvases ===
+        import cv2
 
-        # Release cameras
-        for cap in caps:
-            cap.release()
+        # Select canvases to show: first, middle, last
+        sorted_indices = sorted(canvas_cache.keys())
+        display_indices = [sorted_indices[0]]
+        if len(sorted_indices) > 2:
+            display_indices.append(sorted_indices[len(sorted_indices) // 2])
+        if len(sorted_indices) > 1:
+            display_indices.append(sorted_indices[-1])
 
-        # Build verification canvas: frame | separator | frame | separator | ...
-        canvas_parts = []
-        for i, frame in enumerate(frames):
-            canvas_parts.append(frame)
-            if i < len(actions_taken):
-                sep = np.zeros((224, sep_width, 3), dtype=np.uint8)
-                color = action_colors[actions_taken[i]]
-                sep[:, :] = color
-                canvas_parts.append(sep)
+        # Stack selected canvases vertically
+        canvas_images = []
+        for idx in display_indices:
+            canvas = canvas_cache[idx]['canvas']
+            # Convert RGB (from build_canvas) to BGR for cv2.imwrite
+            canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+            canvas_images.append(canvas_bgr)
 
-        canvas = np.hstack(canvas_parts)
+        composite = np.vstack(canvas_images)
 
-        # Add labels at the top
+        # Add label at top
         label_height = 30
-        labeled = np.zeros((224 + label_height, canvas.shape[1], 3), dtype=np.uint8)
-        labeled[label_height:, :] = canvas
+        labeled = np.zeros((composite.shape[0] + label_height, composite.shape[1], 3),
+                           dtype=np.uint8)
+        labeled[label_height:, :] = composite
+        label_text = (f"action_duration={action_duration}s | "
+                      f"{len(observations)} frames | "
+                      f"showing canvas indices {display_indices}")
+        cv2.putText(labeled, label_text, (5, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-        # Add action labels above separators
-        x = 224  # Start after first frame
-        for i, action in enumerate(actions_taken):
-            label = action_names[action]
-            color = action_colors[action]
-            cv2.putText(labeled, label, (x - 10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            x += sep_width + 224
+        # Save and open
+        preview_path = os.path.join(tempfile.gettempdir(), "calibration_verification.png")
+        cv2.imwrite(preview_path, labeled)
+        print(f"\n  Saved verification image to: {preview_path}")
+        print(f"  GREEN separators = MOVE+ | BLUE separators = MOVE- | RED separators = STAY")
+        print(f"  Movement should be visible across GREEN/BLUE separators, not RED")
+        os.startfile(preview_path)
 
-        # Display
-        cv2.imshow("Calibration Verification", labeled)
-        print(f"\n  GREEN/BLUE separators: arm should have MOVED between frames")
-        print(f"  RED separators: arm should show NO movement between frames")
-        print(f"\n  Press any key to close the preview window.")
-
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+        # === Step E: Clean up temp data (before prompting user) ===
+        shutil.rmtree(str(dataset_path), ignore_errors=True)
+        # Also clean parent _temp/ dir if empty
+        temp_parent = dataset_path.parent
+        if temp_parent.exists() and not any(temp_parent.iterdir()):
+            temp_parent.rmdir()
+        shutil.rmtree(temp_session_dir, ignore_errors=True)
+        temp_session_dir = None  # Mark as cleaned
 
         # Ask user
         while True:
@@ -437,12 +536,18 @@ def verify_calibration_with_canvases(robot_port: str, joint_name: str,
 
     except Exception as e:
         print(f"  Verification failed: {e}")
+        traceback.print_exc()
+        # Clean up on failure
+        shutil.rmtree(str(dataset_path), ignore_errors=True)
+        if temp_session_dir:
+            shutil.rmtree(temp_session_dir, ignore_errors=True)
         print(f"  Proceeding with calibrated duration anyway.")
         print(f"=================================\n")
         return True
 
 
-def return_arm_to_start(robot_port: str, starting_positions: dict):
+def return_arm_to_start(robot_port: str, starting_positions: dict,
+                        robot_id: str = None):
     """Move the arm back to its starting position.
 
     Uses low-level motor bus access to avoid triggering calibration.
@@ -451,7 +556,7 @@ def return_arm_to_start(robot_port: str, starting_positions: dict):
 
     try:
         print("\nReturning arm to starting position...")
-        bus = _create_motor_bus(robot_port)
+        bus = _create_motor_bus(robot_port, robot_id)
 
         # Get current positions
         current_positions = bus.sync_read("Present_Position")
@@ -510,15 +615,19 @@ def has_flag(name: str) -> bool:
     return False
 
 
-def _parse_camera_indices() -> list:
-    """Extract camera indices from the robot.cameras CLI arg."""
+def _parse_camera_keys() -> list:
+    """Extract camera key names from the robot.cameras CLI arg.
+
+    Parses YAML-like camera config to get key names like 'base_0_rgb',
+    'left_wrist_0_rgb'. These are needed by convert_lerobot_to_explorer.py.
+    """
     import re
     cameras_str = parse_arg("robot.cameras")
     if not cameras_str:
-        return [0]  # Default to camera 0
-    # Extract index_or_path values from the YAML-like camera config
-    indices = re.findall(r'index_or_path:\s*(\d+)', cameras_str)
-    return [int(i) for i in indices] if indices else [0]
+        return ["base_0_rgb"]
+    # Extract key names: "key_name: {type: ...}"
+    keys = re.findall(r'(\w+)\s*:\s*\{', cameras_str)
+    return keys if keys else ["base_0_rgb"]
 
 
 if __name__ == "__main__":
@@ -530,27 +639,27 @@ if __name__ == "__main__":
 
     # Get robot port and policy parameters
     robot_port = parse_arg("robot.port")
+    robot_id = parse_arg("robot.id")
     joint_name = parse_arg("policy.joint_name") or "shoulder_pan.pos"
     position_delta_str = parse_arg("policy.position_delta")
-    action_duration_explicit = parse_arg("policy.action_duration")
 
-    # Auto-calibrate action_duration if not explicitly set
-    if (robot_port and not skip_calibration
-            and action_duration_explicit is None and position_delta_str):
+    # Auto-calibrate action_duration
+    if robot_port and not skip_calibration and position_delta_str:
         position_delta = float(position_delta_str)
 
-        # Calibration loop (supports retry with longer duration)
+        # Calibration using motor position settling
         calibrated_duration = calibrate_action_duration(
-            robot_port, joint_name, position_delta
+            robot_port, joint_name, position_delta, robot_id
         )
 
-        # Visual verification with sample canvases
+        # Visual verification via full pipeline (record → convert → canvas)
         if not skip_verification:
-            camera_indices = _parse_camera_indices()
+            input(f"\n  Calibrated action_duration={calibrated_duration}s. "
+                  f"Press Enter to start verification...")
             while True:
                 approved = verify_calibration_with_canvases(
                     robot_port, joint_name, position_delta,
-                    calibrated_duration, camera_indices
+                    calibrated_duration, robot_id
                 )
                 if approved:
                     break
@@ -559,6 +668,8 @@ if __name__ == "__main__":
                 print(f"  Retrying with action_duration={calibrated_duration}s")
 
         # Inject calibrated duration and flag into CLI args
+        # Remove any explicit --policy.action_duration from argv (calibration overrides it)
+        sys.argv = [arg for arg in sys.argv if not arg.startswith("--policy.action_duration=")]
         sys.argv.append(f"--policy.action_duration={calibrated_duration}")
         sys.argv.append("--policy.calibrated_action_duration=true")
         print(f"Using calibrated action_duration={calibrated_duration}s")
@@ -580,4 +691,4 @@ if __name__ == "__main__":
     finally:
         # Return arm to starting position after recording
         if robot_port and starting_positions:
-            return_arm_to_start(robot_port, starting_positions)
+            return_arm_to_start(robot_port, starting_positions, robot_id)

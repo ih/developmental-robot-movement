@@ -47,23 +47,23 @@ This repository contains research code for developmental robot movement with a c
 - **LeRobot custom policy**: `lerobot_policy_simple_joint` package for single-joint control with 3 discrete actions
 - **Action space**: Action 0 (stay), Action 1 (move positive by position_delta), Action 2 (move negative by position_delta)
 - **Action parameters**: `action_duration` controls how long each discrete action lasts (default 0.5s, can be auto-calibrated), `position_delta` controls movement magnitude (default 0.1 radians)
-- **Servo auto-calibration**: `run_lerobot_record.py` can automatically measure servo settling time to determine optimal `action_duration`, ensuring the recorded timing matches actual robot movement
-  - Sends test movement, polls `Present_Position` at 10ms intervals until stable (range < 0.5 units for 50ms)
-  - Applies 1.2x safety margin to measured settling time
-  - Visual verification: runs test sequence [MOVE+, STAY, MOVE-, STAY] with canvas preview showing colored separators
-  - Skip with `--skip-calibration` (uses default 0.5s) or `--skip-verification` (calibrates but no visual check)
+- **Servo auto-calibration**: `run_lerobot_record.py` automatically measures servo settling time to determine optimal `action_duration`, ensuring the recorded timing matches actual robot movement
+  - Two-phase settle detection: waits for departure from start position, then waits for position to stabilize (range < 0.5 units for 50ms)
+  - Runs 4 test movements (move+, return, move-, return) and uses worst-case settle time with 1.2x safety margin
+  - Loads motor calibration from disk for normalized position reads
+  - Visual verification: runs full pipeline (record → convert → build canvases) and displays result for user approval
+  - Always runs calibration regardless of explicit `--policy.action_duration` (calibration overrides it)
+  - Skip with `--skip-calibration` or `--skip-verification` (calibrates but no visual check)
 - **Configurable joint**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
 - **Policy modes**: Random exploration (infinite), fixed action sequences (execute once, no wrapping), or deterministic (always stay)
 - **Discrete action logging**: Automatically records exact discrete actions during `lerobot-record` sessions to JSONL logs in `meta/discrete_action_logs/` directory (included in Hub uploads)
   - Log header contains all recording parameters (joint_name, action_duration, position_delta, etc.)
-  - Each log entry contains timestamp and discrete action chosen
-  - Enables 100% accurate action reconstruction without velocity-based approximation
+  - Each log entry contains timestamp, discrete action chosen, and video frame index (1:1 with `select_action()` calls)
+  - Frame index enables exact frame-to-action correspondence without estimation
 - **Dataset converter**: `convert_lerobot_to_explorer.py` converts LeRobot v3.0 datasets to concat_world_model_explorer format
   - **Hub download support**: Converter can download datasets directly via HuggingFace repo_id (e.g., `username/dataset-name`)
   - **Automatic parameter extraction**: Reads action_duration and position_delta from log header when available
-  - **Parquet-anchored mapping**: Uses per-frame action/state data to find exact video frame of first MOVE action, anchoring the proportional mapping to ground truth
-  - **Timestamp-based matching**: Uses precise frame-to-action matching via log timestamps
-  - **Backward compatible**: Falls back to even distribution for datasets without timestamps
+  - **Frame-index-based mapping**: Uses `frame_index` field logged by the policy for exact frame-to-action correspondence (no estimation needed)
 - **Dual-camera support**: Stacks base_0_rgb (224×224) and left_wrist_0_rgb (224×224) vertically for 448×224 combined frames
 - **Compatible with concat_world_model_explorer**: Converted sessions can be loaded and visualized in the world model explorer
 
@@ -259,7 +259,7 @@ python convert_lerobot_to_explorer.py \
 - Converter automatically downloads dataset from HuggingFace Hub
 - Reads `action_duration` and `position_delta` from discrete action log header
 - No need to manually specify recording parameters
-- Uses timestamp-based matching for frame-to-action pairing
+- Uses frame-index-based mapping for exact frame-to-action pairing
 
 **Alternative** (local dataset with manual parameters):
 ```bash
@@ -525,8 +525,8 @@ Required Python packages:
 - `run_lerobot_record.py`: Wrapper script for lerobot-record with Windows camera patches, auto-calculated episode timing, and servo auto-calibration
   - **Windows compatibility**: DSHOW camera backend and synchronous read patches
   - **Auto episode timing**: Calculates episode_time_s from action_sequence length + 5s buffer
-  - **Servo auto-calibration**: Measures actual servo settling time to set optimal `action_duration` before recording
-  - **Visual verification**: Runs test sequence with canvas preview for manual timing verification
+  - **Servo auto-calibration**: Two-phase settle detection (departure + stabilization) with 4-movement test and calibration file loading
+  - **Visual verification**: Full pipeline verification (record → convert → build canvases) for manual timing approval
   - **Discrete action logging**: Injects log directory into policy config via CLI args
   - **Debug output**: Prints full lerobot-record command with all parameters before execution
   - **CLI flags**: `--skip-calibration`, `--skip-verification` to bypass calibration steps

@@ -60,14 +60,15 @@ The concat world model uses a unique approach to visual prediction:
 - **LeRobot integration**: Custom policy package for SO-101 follower arm control
 - **Single-joint control**: 3 discrete actions (stay, move positive, move negative) per joint
 - **Configurable joint**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
-- **Servo auto-calibration**: Measures actual servo settling time to set optimal `action_duration` before recording
-  - Polls `Present_Position` at 10ms intervals until stable, applies 1.2x safety margin
-  - Visual verification with test sequence canvases (colored separators show movement vs stay)
+- **Servo auto-calibration**: Two-phase settle detection (departure + stabilization) with 4-movement test and motor calibration loading
+  - Runs move+, return, move-, return sequence; uses worst-case settle time with 1.2x safety margin
+  - Full pipeline verification (record → convert → build canvases) for visual timing approval
+  - Always runs calibration regardless of explicit `--policy.action_duration`
   - Skip with `--skip-calibration` or `--skip-verification` flags
 - **Dual-camera support**: Stacks base_0_rgb and left_wrist_0_rgb cameras vertically for 448x224 combined frames
-- **Discrete action logging**: Automatic JSONL logs for 100% accurate action reconstruction
+- **Discrete action logging**: Automatic JSONL logs with frame index for exact frame-to-action correspondence
 - **Dataset converter**: Convert LeRobot v3.0 datasets to concat_world_model_explorer format
-  - Parquet-anchored frame mapping: uses per-frame action/state data to anchor proportional mapping to ground truth
+  - Frame-index-based mapping: uses logged frame indices for exact frame-to-action correspondence
 
 ### Action Selectors
 
@@ -190,8 +191,8 @@ python run_lerobot_record.py \
     --dataset.single_task="Single joint movement"
 ```
 
-When `--policy.action_duration` is omitted, the wrapper auto-calibrates by measuring servo settling time.
-Use `--skip-calibration` to use the default 0.5s, or `--skip-verification` to calibrate without the visual preview.
+The wrapper always auto-calibrates by measuring servo settling time (overrides any explicit `--policy.action_duration`).
+Use `--skip-calibration` to skip calibration entirely, or `--skip-verification` to calibrate without the visual preview.
 
 #### Convert LeRobot Dataset to Explorer Format
 ```bash

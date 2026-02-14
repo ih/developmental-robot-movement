@@ -66,6 +66,7 @@ class SimpleJointPolicy(PreTrainedPolicy):
         self._last_state: Optional[Tensor] = None
         self._target_position: Optional[float] = None
         self._sequence_completed = False  # Track if action sequence has completed
+        self._frame_counter = 0  # Counts select_action calls (1:1 with video frames)
 
         # Create a dummy parameter so PyTorch recognizes this as a module
         # This is needed for device placement
@@ -84,6 +85,7 @@ class SimpleJointPolicy(PreTrainedPolicy):
         self._last_state = None
         self._target_position = None
         self._sequence_completed = False  # Reset sequence completion for new episode
+        self._frame_counter = 0
 
         # Reset random generator if seed was provided
         if self.config.random_seed is not None:
@@ -127,12 +129,14 @@ class SimpleJointPolicy(PreTrainedPolicy):
                 "random_seed": self.config.random_seed
             }) + "\n")
 
-    def _log_discrete_action(self, timestamp: float, discrete_action: int):
+    def _log_discrete_action(self, timestamp: float, discrete_action: int,
+                             frame_index: int):
         """Log a discrete action decision to the log file.
 
         Args:
             timestamp: When the action decision was made
             discrete_action: The discrete action chosen (0, 1, or 2)
+            frame_index: Video frame index (select_action call count)
         """
         if not self.config.discrete_action_log_path:
             return
@@ -141,7 +145,8 @@ class SimpleJointPolicy(PreTrainedPolicy):
             f.write(json.dumps({
                 "type": "action",
                 "timestamp": timestamp,
-                "discrete_action": discrete_action
+                "discrete_action": discrete_action,
+                "frame_index": frame_index
             }) + "\n")
 
     def _compute_action(self, batch: Dict[str, Tensor]) -> Tensor:
@@ -174,6 +179,8 @@ class SimpleJointPolicy(PreTrainedPolicy):
         # action_duration should be calibrated to include servo settling time.
         current_time = time.time()
         action_changed = False
+        frame_index = self._frame_counter
+        self._frame_counter += 1
 
         if self._action_start_time is not None:
             elapsed = current_time - self._action_start_time
@@ -191,8 +198,9 @@ class SimpleJointPolicy(PreTrainedPolicy):
         # Compute target position when action changes
         # This allows smooth motion instead of choppy per-frame increments
         if action_changed:
-            # Log the discrete action decision
-            self._log_discrete_action(current_time, self._current_action)
+            # Log the discrete action decision with video frame index
+            self._log_discrete_action(current_time, self._current_action,
+                                      frame_index)
 
             current_pos = state[0, self.config.joint_index].item()
 
