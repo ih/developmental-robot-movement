@@ -541,9 +541,19 @@ def verify_calibration_with_canvases(robot_port: str, joint_name: str,
         shutil.rmtree(str(dataset_path), ignore_errors=True)
         if temp_session_dir:
             shutil.rmtree(temp_session_dir, ignore_errors=True)
-        print(f"  Proceeding with calibrated duration anyway.")
-        print(f"=================================\n")
-        return True
+        # Ask user what to do instead of proceeding silently
+        while True:
+            response = input("\n  Verification failed. [r/n] "
+                             "(r=retry, n=abort): ").strip().lower()
+            if response in ("r", "retry"):
+                print(f"=================================\n")
+                return False  # Signal retry (caller will increase duration 25%)
+            elif response in ("n", "no"):
+                print(f"  Aborting.")
+                print(f"=================================\n")
+                sys.exit(1)
+            else:
+                print("  Please enter 'r' or 'n'")
 
 
 def return_arm_to_start(robot_port: str, starting_positions: dict,
@@ -654,6 +664,8 @@ if __name__ == "__main__":
 
         # Visual verification via full pipeline (record → convert → canvas)
         if not skip_verification:
+            import time as _time
+            _time.sleep(2)  # Let COM port settle after calibration
             input(f"\n  Calibrated action_duration={calibrated_duration}s. "
                   f"Press Enter to start verification...")
             while True:
