@@ -144,14 +144,14 @@ class StagedTrainingConfig:
     stop_on_divergence: bool = True  # App default
     divergence_gap: float = 0.002  # App default
     divergence_ratio: float = 1.5  # App default
-    divergence_patience: int = 20  # App default
-    divergence_min_updates: int = 5  # App default
+    divergence_patience: int = 50  # App default
+    divergence_min_updates: int = 10  # App default
     val_spike_threshold: float = 2.0  # App default
     val_spike_window: int = 15  # App default
     val_spike_frequency: float = 0.75  # App default
 
     # Validation plateau early stopping
-    val_plateau_patience: int = 100  # Stop if val loss hasn't improved in N updates (0 = disabled)
+    val_plateau_patience: int = 250  # Stop if val loss hasn't improved in N updates (0 = disabled)
     val_plateau_min_delta: float = 0.0001  # Minimum improvement to count as "better"
 
     # Learning rate (app defaults)
@@ -173,7 +173,7 @@ class StagedTrainingConfig:
     selected_frame_offset: int = 3  # App default for frame selection
 
     # Stage settings
-    runs_per_stage: int = 1  # CLI parameter
+    runs_per_stage: int = 5  # CLI parameter
     serial_runs: bool = True  # Run runs_per_stage serially instead of in parallel
     clean_old_checkpoints: bool = True  # Clean old auto-saved checkpoints before starting
 
