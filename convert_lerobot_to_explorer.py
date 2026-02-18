@@ -203,6 +203,7 @@ class ConversionConfig:
     frame_size: Tuple[int, int]  # (H, W) for single camera
     shard_size: int
     session_prefix: str
+    combine_episodes: bool = False  # Combine all episodes into a single session
 
 
 class LeRobotV3Reader:
@@ -796,6 +797,230 @@ def convert_episode(
     return True
 
 
+def convert_combined(reader: LeRobotV3Reader, config: ConversionConfig):
+    """Convert all episodes into a single combined session.
+
+    Episodes are concatenated sequentially with a stay action (action 0) inserted
+    between episodes as a transition marker. This is designed for multi-height
+    recordings where each episode is at a different shoulder_lift height.
+    """
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_name = f"{config.session_prefix}_combined_{timestamp_str}"
+
+    writer = SessionWriter(
+        output_dir=config.output_dir,
+        session_name=session_name,
+        shard_size=config.shard_size
+    )
+
+    # Load all discrete action logs to get per-episode metadata
+    dataset_path = Path(config.lerobot_path)
+    log_dir = dataset_path / "meta" / "discrete_action_logs"
+    episode_logs = []
+    height_targets = []
+
+    if log_dir.exists():
+        log_files = sorted(log_dir.glob("episode_*.jsonl"))
+        for lf in log_files:
+            log = load_discrete_action_log(lf)
+            episode_logs.append(log)
+            if log and log.header.get("height_target") is not None:
+                height_targets.append(log.header["height_target"])
+
+    # Use first episode's log for base parameters
+    first_log = next((l for l in episode_logs if l is not None), None)
+    action_duration = first_log.action_duration if first_log else config.action_duration
+
+    # Define action space
+    action_space = [
+        {"action": 0, "duration": 0.0},
+        {"action": 1, "duration": action_duration},
+        {"action": 2, "duration": action_duration},
+    ]
+
+    writer.set_metadata(
+        robot_type="so101_follower",
+        action_space=action_space,
+        extra_meta={
+            "source": "lerobot_v3",
+            "source_path": str(config.lerobot_path),
+            "joint_name": first_log.joint_name if first_log else config.joint_name,
+            "joint_index": config.joint_index,
+            "action_duration": action_duration,
+            "position_delta": first_log.position_delta if first_log else None,
+            "used_discrete_action_log": first_log is not None,
+            "cameras": config.cameras,
+            "stack_mode": config.stack_cameras,
+            "combined_episodes": True,
+            "num_episodes": reader.total_episodes,
+            "height_targets": height_targets if height_targets else None,
+        }
+    )
+
+    running_timestamp = 0.0
+    episodes_converted = 0
+
+    for ep_idx, episode_info in enumerate(
+        tqdm(list(reader.iterate_episodes()), desc="Combining episodes")
+    ):
+        episode_idx = episode_info["episode_index"]
+        length = episode_info["length"]
+
+        if length == 0:
+            print(f"  Skipping episode {episode_idx}: no frames")
+            continue
+
+        # Determine chunk and offset
+        chunk_idx = episode_idx // reader.chunks_size
+
+        # Load data for the chunk
+        all_data = reader.get_data_chunk(chunk_idx)
+        if all_data.empty:
+            continue
+
+        episode_data = all_data[all_data["episode_index"] == episode_idx]
+        if len(episode_data) == 0:
+            continue
+
+        # Load video extractors
+        extractors = {}
+        for camera in config.cameras:
+            video_path = reader.get_video_path(camera, chunk_idx)
+            if video_path is None:
+                continue
+            extractors[camera] = VideoFrameExtractor(str(video_path))
+            extractors[camera].load_all_frames()
+
+        if not extractors:
+            continue
+
+        # Get action log for this episode
+        action_log = episode_logs[episode_idx] if episode_idx < len(episode_logs) else None
+        ep_action_duration = action_log.action_duration if action_log else action_duration
+
+        # Find video offset
+        video_offset = 0
+        if "frame_index" in episode_data.columns:
+            video_offset = episode_data["frame_index"].iloc[0]
+
+        first_camera = config.cameras[0]
+        total_frames = (extractors[first_camera].total_frames
+                        if first_camera in extractors else len(episode_data))
+
+        def get_combined_frame(frame_idx: int) -> Optional[np.ndarray]:
+            camera_frames = []
+            for camera in config.cameras:
+                if camera not in extractors:
+                    continue
+                frame = extractors[camera].get_frame(frame_idx)
+                if frame is not None:
+                    resized = resize_frame(frame, config.frame_size)
+                    camera_frames.append(resized)
+            if not camera_frames:
+                return None
+            return stack_frames(camera_frames, config.stack_cameras)
+
+        # Insert transition stay action between episodes (not before first)
+        if episodes_converted > 0:
+            writer.add_action(
+                {"action": 0, "duration": 0.0},
+                running_timestamp
+            )
+            running_timestamp += ep_action_duration
+
+        # Decision-boundary format (with discrete action log)
+        if action_log and action_log.decisions:
+            decision_frames = get_decision_frame_indices(action_log, total_frames)
+
+            all_frame_indices = [f[0] for f in decision_frames]
+
+            # Trim trailing no-op actions
+            while decision_frames and decision_frames[-1][1] == 0:
+                decision_frames.pop()
+
+            if not decision_frames:
+                for ext in extractors.values():
+                    ext.close()
+                continue
+
+            # Record initial observation
+            first_frame_idx = decision_frames[0][0] + video_offset
+            combined_frame = get_combined_frame(first_frame_idx)
+            if combined_frame is not None:
+                writer.add_observation(combined_frame, running_timestamp)
+
+            # Record actions and resulting observations
+            for i, (frame_idx, discrete_action) in enumerate(decision_frames):
+                action_dict = {
+                    "action": discrete_action,
+                    "duration": ep_action_duration if discrete_action != 0 else 0.0
+                }
+                running_timestamp += ep_action_duration * 0.5
+                writer.add_action(action_dict, running_timestamp)
+                running_timestamp += ep_action_duration * 0.5
+
+                if i + 1 < len(all_frame_indices):
+                    next_frame_idx = all_frame_indices[i + 1] + video_offset
+                else:
+                    next_frame_idx = total_frames - 1 + video_offset
+
+                combined_frame = get_combined_frame(next_frame_idx)
+                if combined_frame is not None:
+                    writer.add_observation(combined_frame, running_timestamp)
+
+        else:
+            # Velocity-based fallback
+            dt = 1.0 / reader.fps
+            for i, (_, row) in enumerate(episode_data.iterrows()):
+                frame_idx = i + video_offset
+                timestamp_val = row.get("timestamp", i * dt)
+                if hasattr(timestamp_val, 'item'):
+                    timestamp_val = timestamp_val.item()
+
+                combined_frame = get_combined_frame(frame_idx)
+                if combined_frame is None:
+                    continue
+
+                writer.add_observation(combined_frame, running_timestamp)
+
+                state = row.get("observation.state")
+                action_continuous = row.get("action")
+
+                if state is not None and action_continuous is not None:
+                    if hasattr(state, 'tolist'):
+                        state = np.array(state)
+                    elif isinstance(state, list):
+                        state = np.array(state)
+
+                    if hasattr(action_continuous, 'tolist'):
+                        action_continuous = np.array(action_continuous)
+                    elif isinstance(action_continuous, list):
+                        action_continuous = np.array(action_continuous)
+
+                    current_pos = state[config.joint_index]
+                    target_pos = action_continuous[config.joint_index]
+
+                    discrete_action = discretize_action(
+                        current_pos, target_pos, dt, config.velocity_threshold
+                    )
+
+                    action_dict = {
+                        "action": discrete_action,
+                        "duration": ep_action_duration if discrete_action != 0 else 0.0
+                    }
+                    running_timestamp += dt
+                    writer.add_action(action_dict, running_timestamp)
+
+        # Close extractors for this episode
+        for ext in extractors.values():
+            ext.close()
+
+        episodes_converted += 1
+
+    writer.finalize()
+    print(f"\nCombined {episodes_converted} episodes into: {writer.session_dir}")
+
+
 def convert_dataset(config: ConversionConfig):
     """Convert LeRobot dataset to explorer format."""
     print(f"Loading LeRobot dataset from {config.lerobot_path}")
@@ -806,7 +1031,12 @@ def convert_dataset(config: ConversionConfig):
     print(f"Stack mode: {config.stack_cameras}")
     print(f"Joint: {config.joint_name} (index {config.joint_index})")
 
-    # Convert each episode
+    if config.combine_episodes:
+        print(f"Mode: combining all episodes into single session")
+        convert_combined(reader, config)
+        return
+
+    # Convert each episode separately
     successful = 0
     for episode_info in tqdm(list(reader.iterate_episodes()), desc="Converting episodes"):
         if convert_episode(reader, episode_info, config, config.output_dir):
@@ -883,6 +1113,12 @@ def main():
         default="session_so101",
         help="Prefix for session names"
     )
+    parser.add_argument(
+        "--combine-episodes",
+        action="store_true",
+        default=False,
+        help="Combine all episodes into a single session (for multi-height recordings)"
+    )
 
     args = parser.parse_args()
 
@@ -909,6 +1145,7 @@ def main():
         frame_size=tuple(args.frame_size),
         shard_size=args.shard_size,
         session_prefix=args.session_prefix,
+        combine_episodes=args.combine_episodes,
     )
 
     convert_dataset(config)

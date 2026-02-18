@@ -57,18 +57,22 @@ The concat world model uses a unique approach to visual prediction:
 
 ### SO-101 Robot Arm
 
-- **LeRobot integration**: Custom policy package for SO-101 follower arm control
-- **Single-joint control**: 3 discrete actions (stay, move positive, move negative) per joint
-- **Configurable joint**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
+- **LeRobot integration**: Custom policy package for SO-101 follower arm control with two policy types:
+  - **SimpleJoint** (`simple_joint`): Controls a single joint with 3 discrete actions (stay, move+, move-) per episode
+  - **MultiSecondaryJoint** (`multi_secondary_joint`): Controls a primary joint within each episode while a secondary joint randomly changes position between episodes (for multi-height recordings)
+- **Shared base class**: `BaseJointPolicy` provides common functionality (action timing, discrete action logging, sequence/random modes) for both policy types
+- **Configurable joints**: Control any SO-101 joint (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper)
 - **Servo auto-calibration**: Two-phase settle detection (departure + stabilization) with 4-movement test and motor calibration loading
   - Runs move+, return, move-, return sequence; uses worst-case settle time with 1.2x safety margin
   - Full pipeline verification (record → convert → build canvases) for visual timing approval
   - Always runs calibration regardless of explicit `--policy.action_duration`
   - Skip with `--skip-calibration` or `--skip-verification` flags
+- **MultiSecondaryJoint reset phase**: `run_lerobot_record.py` patches LeRobot's `record_loop` to handle the reset phase between episodes — physically moves the secondary joint servo to the new target and waits `reset_time_s` for settling; auto-sets `reset_time_s = 3 × action_duration` for secondary joint policies
 - **Dual-camera support**: Stacks base_0_rgb and left_wrist_0_rgb cameras vertically for 448x224 combined frames
-- **Discrete action logging**: Automatic JSONL logs with frame index for exact frame-to-action correspondence
+- **Discrete action logging**: Automatic JSONL logs with frame index for exact frame-to-action correspondence; MultiSecondaryJoint logs also include `height_target` for the secondary joint position
 - **Dataset converter**: Convert LeRobot v3.0 datasets to concat_world_model_explorer format
   - Frame-index-based mapping: uses logged frame indices for exact frame-to-action correspondence
+  - `--combine-episodes`: Combines all episodes into a single session (designed for multi-height recordings where each episode is at a different secondary joint position)
 
 ### Action Selectors
 
@@ -196,14 +200,23 @@ Use `--skip-calibration` to skip calibration entirely, or `--skip-verification` 
 
 #### Convert LeRobot Dataset to Explorer Format
 ```bash
+# Convert each episode as a separate session (default)
 python convert_lerobot_to_explorer.py \
     --lerobot-path ${HF_USER}/so101-single-joint \
     --output-dir saved/sessions/so101 \
     --cameras base_0_rgb left_wrist_0_rgb \
     --stack-cameras vertical
+
+# Combine all episodes into one session (for multi-height recordings)
+python convert_lerobot_to_explorer.py \
+    --lerobot-path ${HF_USER}/so101-multi-height \
+    --output-dir saved/sessions/so101 \
+    --cameras base_0_rgb left_wrist_0_rgb \
+    --stack-cameras vertical \
+    --combine-episodes
 ```
 
-The converter downloads from HuggingFace Hub and reads action parameters from discrete action logs automatically.
+The converter downloads from HuggingFace Hub and reads action parameters from discrete action logs automatically. Use `--combine-episodes` to concatenate all episodes into a single session with stay-action transitions between them.
 
 ### Interactive Testing
 
@@ -373,9 +386,13 @@ Required Python packages:
 - `jetbot_remote_client.py`: Low-level JetBot RPyC client
 - `toroidal_dot_env.py`: Simulated toroidal environment
 - `toroidal_dot_interface.py`: ToroidalDotRobot implementation
-- `lerobot_policy_simple_joint/`: LeRobot custom policy for SO-101 single-joint control
-- `run_lerobot_record.py`: Wrapper for lerobot-record with servo auto-calibration, visual verification, and auto-calculated episode timing
-- `convert_lerobot_to_explorer.py`: Dataset converter for LeRobot v3.0 to explorer format
+- `lerobot_policy_simple_joint/`: LeRobot custom policy package for SO-101 joint control
+  - `base_joint_policy.py`: Shared base class (`BaseJointPolicy`) for discrete joint control policies
+  - `configuration_simple_joint.py` / `modeling_simple_joint.py`: `SimpleJointPolicy` — single joint, 3 discrete actions
+  - `configuration_multi_secondary_joint.py` / `modeling_multi_secondary_joint.py`: `MultiSecondaryJointPolicy` — primary joint within episodes, secondary joint changes between episodes
+  - `processor_simple_joint.py` / `processor_multi_secondary_joint.py`: Identity pre/post processors
+- `run_lerobot_record.py`: Wrapper for lerobot-record with servo auto-calibration, visual verification, auto-calculated episode timing, and `record_loop` patch for MultiSecondaryJoint reset phase handling
+- `convert_lerobot_to_explorer.py`: Dataset converter for LeRobot v3.0 to explorer format with `--combine-episodes` support
 
 ### Models
 - `models/__init__.py`: Module exports

@@ -30,11 +30,88 @@ if platform.system() == "Windows":
 
     OpenCVCamera.async_read = _patched_async_read
 
-# Import the custom policy to trigger registration before lerobot parses args
+# Import custom policies to trigger registration before lerobot parses args
 # Use explicit submodule imports to bypass namespace package shadowing when
 # running from the project root (outer directory lacks __init__.py)
 from lerobot_policy_simple_joint.configuration_simple_joint import SimpleJointConfig  # noqa: F401
 from lerobot_policy_simple_joint.modeling_simple_joint import SimpleJointPolicy  # noqa: F401
+from lerobot_policy_simple_joint.configuration_multi_secondary_joint import MultiSecondaryJointConfig  # noqa: F401
+from lerobot_policy_simple_joint.modeling_multi_secondary_joint import MultiSecondaryJointPolicy  # noqa: F401
+
+# Patch lerobot record_loop to fix infinite loop during reset phase.
+# Bug: when no policy/teleop is provided (reset between episodes), the `continue`
+# on the "no policy" branch skips the timestamp update, so the while loop never
+# exits. Fix: handle reset phase ourselves - call policy.get_reset_motor_targets(),
+# command those motors via the robot's connected bus, then sleep.
+import logging as _logging
+import time as _time_module
+import lerobot.scripts.lerobot_record as _record_mod
+
+_original_record_loop = _record_mod.record_loop
+_reset_state = {}  # Stores policy reference between episode and reset calls
+
+
+def _patched_record_loop(*args, **kwargs):
+    """Patch for lerobot record_loop infinite loop during reset phase.
+
+    The bug: when policy=None and teleop=None (reset between episodes),
+    `continue` at line 368 skips the timestamp update at line 398, causing
+    `while timestamp < control_time_s` to loop forever.
+
+    This patch:
+    1. Stores the policy reference during episode recording calls
+    2. During reset calls: calls policy.reset() to select new targets, then
+       calls policy.get_reset_motor_targets() to get motors to command,
+       sends those commands via the robot's connected bus, and sleeps
+    3. The policy's _secondary_target_locked flag preserves the new target
+       across the subsequent episode reset() call (prevents double-reset)
+    """
+    policy = kwargs.get('policy')
+    teleop = kwargs.get('teleop')
+    dataset = kwargs.get('dataset')
+    control_time_s = kwargs.get('control_time_s', 0)
+
+    # Episode recording call - store policy reference for reset phase
+    if policy is not None:
+        _reset_state['policy'] = policy
+
+    # Reset phase (no policy, no teleop, no dataset) - handle ourselves
+    if policy is None and teleop is None and dataset is None and control_time_s > 0:
+        stored_policy = _reset_state.get('policy')
+        robot = kwargs.get('robot')
+
+        if stored_policy is not None and hasattr(stored_policy, 'get_reset_motor_targets'):
+            old_secondary = stored_policy._current_secondary_target
+            stored_policy.reset()
+            motor_targets = stored_policy.get_reset_motor_targets()
+
+            if motor_targets and robot is not None and hasattr(robot, 'bus'):
+                try:
+                    robot.bus.sync_write("Goal_Position", motor_targets)
+                    new_secondary = stored_policy._current_secondary_target
+                    delta_str = ""
+                    if old_secondary is not None and new_secondary is not None:
+                        signed = new_secondary - old_secondary
+                        delta_str = f"  (delta={signed:+.1f})"
+                    _logging.info(
+                        f"Reset: commanding {motor_targets}{delta_str}, "
+                        f"waiting {control_time_s:.1f}s to settle"
+                    )
+                except Exception as e:
+                    _logging.warning(f"Reset servo command failed: {e}")
+
+            # Lock target so next episode's reset() preserves it
+            stored_policy._secondary_target_locked = True
+        else:
+            _logging.info(f"Reset phase: waiting {control_time_s:.1f}s...")
+
+        _time_module.sleep(control_time_s)
+        return
+
+    return _original_record_loop(*args, **kwargs)
+
+
+_record_mod.record_loop = _patched_record_loop
 
 # Now run lerobot-record
 from lerobot.scripts.lerobot_record import record
@@ -149,6 +226,29 @@ def inject_discrete_action_log_dir():
 
     sys.argv.append(f"--policy.discrete_action_log_dir={log_dir}")
     print(f"Discrete action logs will be saved to: {log_dir}")
+
+
+def inject_reset_time_for_multi_secondary():
+    """For multi_secondary_joint policy, inject reset_time_s for secondary servo settling.
+
+    The reset_time_s gives the secondary joint servo time to reach its new target
+    position between episodes. Uses 3x action_duration as a conservative default.
+    """
+    policy_type = parse_arg("policy.type")
+    if policy_type != "multi_secondary_joint":
+        return
+
+    if parse_arg("dataset.reset_time_s") is not None:
+        return  # User already specified it
+
+    action_duration_str = parse_arg("policy.action_duration")
+    action_duration = float(action_duration_str) if action_duration_str else 0.5
+
+    # Use 3x action_duration as conservative settling time for secondary joint
+    reset_time = max(3.0, action_duration * 3)
+    sys.argv.append(f"--dataset.reset_time_s={reset_time}")
+    print(f"Auto-set reset_time_s={reset_time:.1f}s for secondary joint settling "
+          f"between episodes")
 
 
 def _create_motor_bus(robot_port: str, robot_id: str = None):
@@ -591,16 +691,17 @@ def return_arm_to_start(robot_port: str, starting_positions: dict,
         print(f"Warning: Could not return arm to start position: {e}")
 
 
-def capture_starting_position(robot_port: str) -> dict:
-    """Capture the arm's starting position before recording.
-
-    Skipped for now - the return-to-start feature requires calibration.
-    The main recording will handle calibration properly.
-    """
-    # Skip position capture to avoid calibration issues
-    # The robot will be calibrated during the main recording
-    print("Note: Starting position capture skipped (handled by main recording)")
-    return {}
+def capture_starting_position(robot_port: str, robot_id: str = None) -> dict:
+    """Capture all motor positions before recording starts."""
+    try:
+        bus = _create_motor_bus(robot_port, robot_id)
+        positions = bus.sync_read("Present_Position")
+        bus.disconnect()
+        print(f"  Captured starting positions: {positions}")
+        return positions
+    except Exception as e:
+        print(f"  Warning: Could not capture starting position: {e}")
+        return {}
 
 
 def print_command_line():
@@ -688,11 +789,12 @@ if __name__ == "__main__":
 
     calculate_and_inject_episode_time()
     inject_discrete_action_log_dir()
+    inject_reset_time_for_multi_secondary()
 
     # Capture starting position
     starting_positions = {}
     if robot_port:
-        starting_positions = capture_starting_position(robot_port)
+        starting_positions = capture_starting_position(robot_port, robot_id)
 
     # Print full command for debugging
     print_command_line()

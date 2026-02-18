@@ -1,7 +1,8 @@
-"""LeRobot SimpleJoint Policy Package.
+"""LeRobot Joint Policy Package.
 
-A simple non-learned policy for controlling a single joint of the SO-101 robot arm
-with 3 discrete actions (stay, move positive, move negative).
+Discrete joint control policies for the SO-101 robot arm:
+- SimpleJoint: Controls a single joint with 3 discrete actions
+- MultiHeightJoint: Controls shoulder_pan at varying shoulder_lift heights across episodes
 
 Usage:
     # Install the package
@@ -28,11 +29,15 @@ except ImportError:
 
 from .configuration_simple_joint import SimpleJointConfig
 from .modeling_simple_joint import SimpleJointPolicy
+from .configuration_multi_secondary_joint import MultiSecondaryJointConfig
+from .modeling_multi_secondary_joint import MultiSecondaryJointPolicy
 from .processor_simple_joint import make_simple_joint_pre_post_processors
 
 __all__ = [
     "SimpleJointConfig",
     "SimpleJointPolicy",
+    "MultiSecondaryJointConfig",
+    "MultiSecondaryJointPolicy",
     "make_simple_joint_pre_post_processors",
 ]
 
