@@ -81,11 +81,26 @@ class BaseJointPolicy(PreTrainedPolicy):
         # Set up per-episode log file if log directory is configured
         if self.config.discrete_action_log_dir:
             log_dir = Path(self.config.discrete_action_log_dir)
+
+            # Clean up previous header-only (spurious) log file from double-reset.
+            # During multi-episode recording, reset() is called twice per episode
+            # transition: once by the reset-phase patch and once by LeRobot. The
+            # first call creates a header-only log that we should remove.
+            prev_path = getattr(self, '_last_log_path', None)
+            if prev_path:
+                prev = Path(prev_path)
+                if prev.exists():
+                    with open(prev) as f:
+                        line_count = sum(1 for _ in f)
+                    if line_count <= 1:  # Header only, no action entries
+                        prev.unlink()
+
             existing = sorted(log_dir.glob("episode_*.jsonl"))
             episode_num = len(existing)
             self.config.discrete_action_log_path = str(
                 log_dir / f"episode_{episode_num:06d}.jsonl"
             )
+            self._last_log_path = self.config.discrete_action_log_path
             self._write_log_header()
 
     def _get_log_header_extra(self) -> dict:

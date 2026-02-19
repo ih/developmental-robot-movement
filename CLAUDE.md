@@ -60,10 +60,12 @@ This repository contains research code for developmental robot movement with a c
   - Log header contains all recording parameters (joint_name, action_duration, position_delta, etc.)
   - Each log entry contains timestamp, discrete action chosen, and video frame index (1:1 with `select_action()` calls)
   - Frame index enables exact frame-to-action correspondence without estimation
+  - **Spurious log cleanup**: During multi-episode recording, `reset()` is called twice per episode transition (once by the reset-phase patch, once by LeRobot). `BaseJointPolicy.reset()` detects and removes previous header-only (spurious) log files before creating new ones
 - **Dataset converter**: `convert_lerobot_to_explorer.py` converts LeRobot v3.0 datasets to concat_world_model_explorer format
   - **Hub download support**: Converter can download datasets directly via HuggingFace repo_id (e.g., `username/dataset-name`)
   - **Automatic parameter extraction**: Reads action_duration and position_delta from log header when available
   - **Frame-index-based mapping**: Uses `frame_index` field logged by the policy for exact frame-to-action correspondence (no estimation needed)
+  - **Decision-bearing log filtering**: `load_decision_bearing_logs()` filters out header-only spurious log files, using only logs with actual action decisions for episode-to-log matching
 - **Dual-camera support**: Stacks base_0_rgb (224×224) and left_wrist_0_rgb (224×224) vertically for 448×224 combined frames
 - **Compatible with concat_world_model_explorer**: Converted sessions can be loaded and visualized in the world model explorer
 

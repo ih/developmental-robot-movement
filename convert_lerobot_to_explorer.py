@@ -146,6 +146,29 @@ def load_discrete_action_log(log_path: Path) -> Optional[DiscreteActionLog]:
     return DiscreteActionLog(header=header, decisions=decisions)
 
 
+def load_decision_bearing_logs(log_dir: Path) -> List[DiscreteActionLog]:
+    """Load action logs from a directory, filtering out header-only (spurious) files.
+
+    During multi-episode recording, the reset-phase patch calls policy.reset()
+    between episodes, creating spurious header-only log files. This function
+    returns only logs that contain actual action decisions, in file-sorted order.
+
+    Args:
+        log_dir: Path to discrete_action_logs directory
+
+    Returns:
+        List of DiscreteActionLog objects that have at least one decision entry,
+        ordered by filename. Index 0 = first real episode, index 1 = second, etc.
+    """
+    log_files = sorted(log_dir.glob("episode_*.jsonl"))
+    result = []
+    for lf in log_files:
+        log = load_discrete_action_log(lf)
+        if log and log.decisions:
+            result.append(log)
+    return result
+
+
 def get_decision_frame_indices(
     log: DiscreteActionLog,
     total_frames: int,
@@ -594,14 +617,16 @@ def convert_episode(
         return False
 
     # Try to load discrete action log from meta/discrete_action_logs/
+    # Filter to decision-bearing logs only (skips spurious header-only files
+    # created by double-reset during multi-episode recording)
     dataset_path = Path(config.lerobot_path)
     log_dir = dataset_path / "meta" / "discrete_action_logs"
     action_log = None
 
     if log_dir.exists():
-        log_files = sorted(log_dir.glob("episode_*.jsonl"))
-        if episode_idx < len(log_files):
-            action_log = load_discrete_action_log(log_files[episode_idx])
+        real_logs = load_decision_bearing_logs(log_dir)
+        if episode_idx < len(real_logs):
+            action_log = real_logs[episode_idx]
             if action_log:
                 print(f"  Using discrete action log: {len(action_log.decisions)} decisions")
                 print(f"    Recording params: duration={action_log.action_duration}s, "
@@ -649,9 +674,11 @@ def convert_episode(
     dt = 1.0 / reader.fps
 
     # Find video offset for this episode
-    # LeRobot stores video offset in the data
+    # LeRobot v3 frame_index is 0-based per episode; use the global index column
     video_offset = 0
-    if "frame_index" in episode_data.columns:
+    if "index" in episode_data.columns:
+        video_offset = episode_data["index"].iloc[0]
+    elif "frame_index" in episode_data.columns:
         video_offset = episode_data["frame_index"].iloc[0]
 
     # Get total frames from first camera extractor
@@ -710,6 +737,7 @@ def convert_episode(
         # Record initial observation (at first decision)
         first_frame_idx = decision_frames[0][0] + video_offset
         combined_frame = get_combined_frame(first_frame_idx)
+        last_valid_frame = combined_frame
         if combined_frame is not None:
             writer.add_observation(combined_frame, 0.0)
 
@@ -727,12 +755,15 @@ def convert_episode(
             if i + 1 < len(all_frame_indices):
                 next_frame_idx = all_frame_indices[i + 1] + video_offset
             else:
-                # After last action, use the last available frame
-                next_frame_idx = total_frames - 1 + video_offset
+                # After last action, use the last frame of this episode
+                next_frame_idx = min(video_offset + length - 1, total_frames - 1)
 
             combined_frame = get_combined_frame(next_frame_idx)
+            if combined_frame is None:
+                combined_frame = last_valid_frame
             if combined_frame is not None:
                 writer.add_observation(combined_frame, (i + 1) * action_duration)
+                last_valid_frame = combined_frame
 
     else:
         # Fallback: velocity-based discretization (frame-level format)
@@ -813,18 +844,17 @@ def convert_combined(reader: LeRobotV3Reader, config: ConversionConfig):
         shard_size=config.shard_size
     )
 
-    # Load all discrete action logs to get per-episode metadata
+    # Load discrete action logs, filtering out spurious header-only files
+    # created by double-reset during multi-episode recording
     dataset_path = Path(config.lerobot_path)
     log_dir = dataset_path / "meta" / "discrete_action_logs"
     episode_logs = []
     height_targets = []
 
     if log_dir.exists():
-        log_files = sorted(log_dir.glob("episode_*.jsonl"))
-        for lf in log_files:
-            log = load_discrete_action_log(lf)
-            episode_logs.append(log)
-            if log and log.header.get("height_target") is not None:
+        episode_logs = load_decision_bearing_logs(log_dir)
+        for log in episode_logs:
+            if log.header.get("height_target") is not None:
                 height_targets.append(log.header["height_target"])
 
     # Use first episode's log for base parameters
@@ -894,13 +924,16 @@ def convert_combined(reader: LeRobotV3Reader, config: ConversionConfig):
         if not extractors:
             continue
 
-        # Get action log for this episode
-        action_log = episode_logs[episode_idx] if episode_idx < len(episode_logs) else None
+        # Get action log for this episode (ep_idx is the sequential episode counter)
+        action_log = episode_logs[ep_idx] if ep_idx < len(episode_logs) else None
         ep_action_duration = action_log.action_duration if action_log else action_duration
 
         # Find video offset
+        # LeRobot v3 frame_index is 0-based per episode; use the global index column
         video_offset = 0
-        if "frame_index" in episode_data.columns:
+        if "index" in episode_data.columns:
+            video_offset = episode_data["index"].iloc[0]
+        elif "frame_index" in episode_data.columns:
             video_offset = episode_data["frame_index"].iloc[0]
 
         first_camera = config.cameras[0]
@@ -946,6 +979,7 @@ def convert_combined(reader: LeRobotV3Reader, config: ConversionConfig):
             # Record initial observation
             first_frame_idx = decision_frames[0][0] + video_offset
             combined_frame = get_combined_frame(first_frame_idx)
+            last_valid_frame = combined_frame
             if combined_frame is not None:
                 writer.add_observation(combined_frame, running_timestamp)
 
@@ -962,11 +996,15 @@ def convert_combined(reader: LeRobotV3Reader, config: ConversionConfig):
                 if i + 1 < len(all_frame_indices):
                     next_frame_idx = all_frame_indices[i + 1] + video_offset
                 else:
-                    next_frame_idx = total_frames - 1 + video_offset
+                    # After last action, use the last frame of this episode
+                    next_frame_idx = min(video_offset + length - 1, total_frames - 1)
 
                 combined_frame = get_combined_frame(next_frame_idx)
+                if combined_frame is None:
+                    combined_frame = last_valid_frame
                 if combined_frame is not None:
                     writer.add_observation(combined_frame, running_timestamp)
+                    last_valid_frame = combined_frame
 
         else:
             # Velocity-based fallback

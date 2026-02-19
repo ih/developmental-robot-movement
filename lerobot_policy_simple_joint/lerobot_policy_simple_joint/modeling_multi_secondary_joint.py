@@ -38,7 +38,7 @@ class MultiSecondaryJointPolicy(BaseJointPolicy):
         super().__init__(config, **kwargs)
         self._current_secondary_target: Optional[float] = None
         self._secondary_target_locked: bool = False
-        self._current_episode: int = 0
+        self._current_episode: int = 1
         self._secondary_rng = random.Random(config.random_seed)
 
     def reset(self):
