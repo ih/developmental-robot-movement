@@ -23,6 +23,17 @@ from models.vit_autoencoder import MaskedAutoencoderViT
 from models.base_autoencoder import BaseAutoencoder
 from config import TRANSFORM
 
+# Module-level cache for VGG perceptual loss (not part of any nn.Module's state_dict)
+_perceptual_loss_cache = {}
+
+def _get_perceptual_loss(device):
+    """Get or create a cached VGGPerceptualLoss for the given device."""
+    key = str(device)
+    if key not in _perceptual_loss_cache:
+        from models.perceptual_loss import VGGPerceptualLoss
+        _perceptual_loss_cache[key] = VGGPerceptualLoss(device=device)
+    return _perceptual_loss_cache[key]
+
 # ------------------------------
 # Canvas building utilities
 # ------------------------------
@@ -37,7 +48,7 @@ def _ensure_hw(img: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
     """Resize numpy RGB image to (H,W) using PIL (keeps 3 channels)."""
     H, W = size
     pil = Image.fromarray(_to_uint8(img))
-    pil = pil.resize((W, H), resample=Image.BILINEAR)
+    pil = pil.resize((W, H), resample=Image.LANCZOS)
     return np.array(pil, dtype=np.uint8)
 
 def _separator_color_for_action(action: dict) -> Tuple[int,int,int]:
@@ -428,12 +439,41 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
 
         # Extract values from loss dict
         loss = loss_dict['loss_hybrid']
+        loss_hybrid_only = loss.item()  # Pure hybrid loss before perceptual is added
         loss_plain = loss_dict['loss_plain']
         focal_loss = loss_dict['loss_focal']
         loss_standard = loss_dict['loss_standard'].item()
         focal_weight_mean = loss_dict['focal_weight_mean']
         focal_weight_max = loss_dict['focal_weight_max']
         alpha = Config.FOCAL_LOSS_ALPHA
+
+        # --- PERCEPTUAL LOSS (VGG feature space) ---
+        perceptual_loss_value = 0.0
+        if Config.PERCEPTUAL_LOSS_WEIGHT > 0:
+            # Use module-level cache (not stored on self, so VGG weights stay out of state_dict)
+            perceptual_fn = _get_perceptual_loss(canvas_tensor.device)
+
+            # Unpatchify predictions and target to get full canvas images
+            pred_img = self.unpatchify(pred_patches)    # [B, 3, H, W_canvas]
+            target_img = canvas_tensor                   # [B, 3, H, W_canvas]
+
+            # Extract last frame slot from both
+            canvas_w = target_img.shape[3]
+            num_frames = Config.CANVAS_HISTORY_SIZE
+            sep_w = Config.SEPARATOR_WIDTH
+            frame_w = (canvas_w - (num_frames - 1) * sep_w) // num_frames
+            last_frame_start = canvas_w - frame_w
+
+            pred_last_frame = pred_img[:, :, :, last_frame_start:]
+            target_last_frame = target_img[:, :, :, last_frame_start:]
+
+            # Clamp predictions to [0, 1] for VGG (predictions may be slightly out of range)
+            pred_last_frame = pred_last_frame.clamp(0, 1)
+
+            # Compute perceptual loss on the last frame slot
+            p_loss = perceptual_fn(pred_last_frame, target_last_frame)
+            perceptual_loss_value = p_loss.item()
+            loss = loss + Config.PERCEPTUAL_LOSS_WEIGHT * p_loss
 
         # --- PER-SAMPLE LOSSES (for loss-weighted sampling) ---
         per_sample_losses = None
@@ -487,7 +527,7 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             'mask_token_norm': gnorm(mask_tok),
             'qkv_weight_norm': gnorm(qkv_w),
             # Loss diagnostics
-            'loss_hybrid': loss.item(),             # Hybrid loss (used for training)
+            'loss_hybrid': loss_hybrid_only,          # Pure hybrid loss (without perceptual)
             'loss_plain': loss_plain.item(),        # Plain MSE component
             'loss_focal': focal_loss.item(),        # Focal MSE component
             'loss_standard': loss_standard,         # Standard unweighted loss (for comparison)
@@ -499,13 +539,16 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             'focal_weight_max': focal_weight_max,
             'focal_beta': Config.FOCAL_BETA,
             'focal_alpha': alpha,
+            # Perceptual loss
+            'loss_perceptual': perceptual_loss_value,
+            'perceptual_weight': Config.PERCEPTUAL_LOSS_WEIGHT,
         }
 
         optimizer.step()
 
         if return_per_sample_losses:
-            return float(loss.detach().cpu()), grad_diagnostics, per_sample_losses
-        return float(loss.detach().cpu()), grad_diagnostics
+            return loss_hybrid_only, grad_diagnostics, per_sample_losses
+        return loss_hybrid_only, grad_diagnostics
 
     def forward_with_patch_mask(self, imgs: torch.Tensor, patch_mask: torch.Tensor, return_attn: bool = False):
         """

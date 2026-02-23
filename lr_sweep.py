@@ -860,32 +860,55 @@ def run_lr_sweep_phase(
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_run_trial_worker, args): args for args in trial_args}
 
-        for i, future in enumerate(as_completed(futures)):
-            args = futures[future]
-            lr = args[0]
-            seed = args[1]
-            completion_time = datetime.now().strftime('%H:%M:%S')
-            try:
-                result = future.result()
-                all_trials[lr].append(result)
-                print(f"[LR SWEEP] [{i+1}/{len(trial_args)}] [{completion_time}] Phase {phase}: "
-                      f"LR={lr:.2e} seed={seed} -> {result.status} "
-                      f"(best_val={result.best_val_loss:.6f}, time={result.wall_time_sec:.1f}s)")
-            except Exception as e:
-                print(f"[LR SWEEP] [{i+1}/{len(trial_args)}] [{completion_time}] Phase {phase}: "
-                      f"LR={lr:.2e} seed={seed} FAILED: {e}")
-                # Create error result
-                all_trials[lr].append(LRTrialResult(
-                    lr=lr, seed=seed, phase=phase, status=f"error: {e}",
-                    wall_time_sec=0, samples_trained=0, time_to_best_val_sec=0,
-                    samples_to_best_val=0, best_val_loss=float('inf'),
-                    final_val_loss=float('inf'), best_train_loss=float('inf'),
-                    final_train_loss=float('inf'), loss_history=[],
-                ))
+        # Timeout = (per-trial budget + 5 min buffer) * num_trials
+        # Generous enough for all trials to run sequentially if needed
+        phase_timeout_sec = (time_budget_min * 60 + 300) * len(trial_args)
+        completed_count = 0
+        try:
+            for i, future in enumerate(as_completed(futures, timeout=phase_timeout_sec)):
+                completed_count += 1
+                args = futures[future]
+                lr = args[0]
+                seed = args[1]
+                completion_time = datetime.now().strftime('%H:%M:%S')
+                try:
+                    result = future.result()
+                    all_trials[lr].append(result)
+                    print(f"[LR SWEEP] [{i+1}/{len(trial_args)}] [{completion_time}] Phase {phase}: "
+                          f"LR={lr:.2e} seed={seed} -> {result.status} "
+                          f"(best_val={result.best_val_loss:.6f}, time={result.wall_time_sec:.1f}s)")
+                except Exception as e:
+                    print(f"[LR SWEEP] [{i+1}/{len(trial_args)}] [{completion_time}] Phase {phase}: "
+                          f"LR={lr:.2e} seed={seed} FAILED: {e}")
+                    # Create error result
+                    all_trials[lr].append(LRTrialResult(
+                        lr=lr, seed=seed, phase=phase, status=f"error: {e}",
+                        wall_time_sec=0, samples_trained=0, time_to_best_val_sec=0,
+                        samples_to_best_val=0, best_val_loss=float('inf'),
+                        final_val_loss=float('inf'), best_train_loss=float('inf'),
+                        final_train_loss=float('inf'), loss_history=[],
+                    ))
 
-            # Save intermediate state
-            if save_state:
-                save_sweep_state(output_dir, phase, stage_num, all_trials)
+                # Save intermediate state
+                if save_state:
+                    save_sweep_state(output_dir, phase, stage_num, all_trials)
+        except TimeoutError:
+            # Cancel hung workers and record them as timeouts
+            print(f"\n[LR SWEEP] TIMEOUT: {completed_count}/{len(trial_args)} trials completed, "
+                  f"cancelling remaining workers")
+            for future, args in futures.items():
+                if not future.done():
+                    lr, seed = args[0], args[1]
+                    print(f"[LR SWEEP] TIMEOUT: LR={lr:.2e} seed={seed} - worker hung, cancelling")
+                    future.cancel()
+                    all_trials[lr].append(LRTrialResult(
+                        lr=lr, seed=seed, phase=phase, status="timeout_hung",
+                        wall_time_sec=time_budget_min * 60, samples_trained=0,
+                        time_to_best_val_sec=0, samples_to_best_val=0,
+                        best_val_loss=float('inf'), final_val_loss=float('inf'),
+                        best_train_loss=float('inf'), final_train_loss=float('inf'),
+                        loss_history=[],
+                    ))
 
     # Force GPU memory cleanup after all workers complete
     cleanup_gpu_memory()

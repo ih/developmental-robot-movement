@@ -2321,15 +2321,15 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                     # Fallback to training session evaluation
                     print(f"[DEBUG] Validation evaluation failed, falling back to training evaluation")
                     status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
-                    current_loss = stats['hybrid']['mean'] if stats else 0
+                    current_loss = stats['hybrid']['mean'] if stats else float('inf')
             except Exception as e:
                 print(f"[DEBUG] Error loading best checkpoint: {e}, falling back to training evaluation")
                 status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
-                current_loss = stats['hybrid']['mean'] if stats else 0
+                current_loss = stats['hybrid']['mean'] if stats else float('inf')
         else:
             # Normal mode: run evaluation on training session
             status_msg, fig_loss, fig_dist, stats_text, stats = evaluate_full_session()
-            current_loss = stats['hybrid']['mean'] if stats else 0
+            current_loss = stats['hybrid']['mean'] if stats else float('inf')
 
         final_lr = state.world_model.ae_optimizer.param_groups[0]['lr']
         cumulative_metrics['samples_seen'].append(samples_seen)

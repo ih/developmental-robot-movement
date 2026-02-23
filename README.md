@@ -25,6 +25,8 @@ The concat world model uses a unique approach to visual prediction:
 - **Frame concatenation**: History frames are concatenated horizontally with colored action separators
 - **Targeted masking**: Next-frame slot is fully masked (MASK_RATIO = 1.0) for inpainting-based prediction
 - **MAE-native training**: Optimizes only masked patches using the MaskedAutoencoderViT architecture
+- **Hybrid loss**: Combines plain MSE and focal MSE for edge-aware training
+- **VGG perceptual loss**: Optional VGG16 feature-space loss for sharper predictions (`PERCEPTUAL_LOSS_WEIGHT` in config, 0.0 = disabled)
 - **Action encoding**: Actions encoded as thin colored separators between frames (e.g., red for stay, green for move)
 - **Non-square canvases**: Handles non-square concatenated images (e.g., 224x688 for 3 frames + 2 separators)
 - **Multi-resolution support**: Automatic frame size detection from loaded sessions (e.g., 448x224 for SO-101 dual-camera stacking)
@@ -315,8 +317,8 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 **Reports:**
 - Per-stage reports: `saved/staged_training_reports/{session}/stage{N}_run{M}/report.html`
 - Baseline reports: `saved/staged_training_reports/{session}/stage{N}_baseline_run{M}/report.html`
-- Final summary: `saved/staged_training_reports/{session}/final_report_{date}.html` (dated, e.g., `final_report_2026_feb_07.html`)
-- Also copied to: `docs/final_report_{date}.html` for easy access
+- Final summary: `saved/staged_training_reports/{session}/final_report_{run_id}_{date}.html` (e.g., `final_report_shoulder_session_multiheight_2026_feb_19.html`)
+- Also copied to: `docs/final_report_{run_id}_{date}.html` for easy access
 - Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, multi-run statistics (when `runs_per_stage > 1`), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
 
 ## Dependencies
@@ -400,6 +402,7 @@ Required Python packages:
 - `models/vit_autoencoder.py`: MaskedAutoencoderViT with powerful transformer encoder/decoder
 - `models/autoencoder_concat_predictor.py`: Canvas building and TargetedMAEWrapper for masked inpainting
 - `models/canvas_dataset.py`: PyTorch Dataset and DataLoader for high-performance batch training
+- `models/perceptual_loss.py`: VGG16 perceptual loss module for sharper predictions (optional, controlled by `PERCEPTUAL_LOSS_WEIGHT`)
 
 ### Action Selection and Recording
 - `toroidal_action_selectors.py`: Action selector factories (constant and sequence selectors)

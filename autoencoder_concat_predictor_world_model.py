@@ -82,7 +82,7 @@ class AutoencoderConcatPredictorWorldModel:
             img_width=canvas_width,
             patch_size=Config.PATCH_SIZE,
             embed_dim=256,
-            decoder_embed_dim=128,
+            decoder_embed_dim=256,
         ).to(self.device)
 
         # Create optimizer with parameter groups for weight decay

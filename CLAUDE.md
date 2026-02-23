@@ -158,10 +158,15 @@ This repository contains research code for developmental robot movement with a c
 
 ### Neural Vision System
 - **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful transformer encoder and decoder
-- **Symmetric architecture**: Decoder uses transformer blocks with same depth and attention heads as encoder by default (configurable via `decoder_depth` and `decoder_num_heads` parameters)
+- **Symmetric architecture**: Encoder and decoder both use 256-dim embeddings, 5 transformer blocks, 4 attention heads (configurable via `decoder_depth` and `decoder_num_heads` parameters)
 - **Dynamic masking**: Randomized mask ratios for better generalization (shared config: MASK_RATIO_MIN and MASK_RATIO_MAX)
 - **Targeted masking for prediction**: Full masking (MASK_RATIO = 1.0) of next-frame slot for inpainting-based prediction
 - **MAE-native optimization**: Trains only on masked patches for efficient learning
+- **Hybrid loss**: Combines plain MSE and focal MSE (`FOCAL_LOSS_ALPHA * plain + (1-alpha) * focal`) for edge-aware training
+- **VGG perceptual loss**: Optional VGG16 feature-space loss for sharper predictions (`PERCEPTUAL_LOSS_WEIGHT` in config, 0.0 = disabled)
+  - Lazily loads pretrained VGG16 on first use (no overhead when disabled)
+  - Computes L1 loss on relu1_2, relu2_2, relu3_3 features of the predicted vs target last frame
+  - Module: `models/perceptual_loss.py`
 - **Quality gating**: Single training step per iteration with reconstruction threshold
 - **Non-square image support**: Handles concatenated canvases with non-square dimensions
 
@@ -429,8 +434,8 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 **Reports:**
 - Per-stage reports: `saved/staged_training_reports/{session}/stage{N}_run{M}/report.html`
 - Baseline reports: `saved/staged_training_reports/{session}/stage{N}_baseline_run{M}/report.html`
-- Final summary: `saved/staged_training_reports/{session}/final_report_{date}.html` (dated, e.g., `final_report_2026_feb_07.html`)
-- Also copied to: `docs/final_report_{date}.html` for easy access
+- Final summary: `saved/staged_training_reports/{session}/final_report_{run_id}_{date}.html` (e.g., `final_report_shoulder_session_multiheight_2026_feb_19.html`)
+- Also copied to: `docs/final_report_{run_id}_{date}.html` for easy access
 - Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, multi-run statistics (when runs_per_stage > 1), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
 
 ### Recording Sessions
@@ -540,6 +545,7 @@ Required Python packages:
 - `models/vit_autoencoder.py`: MaskedAutoencoderViT with powerful transformer encoder and decoder
 - `models/autoencoder_concat_predictor.py`: Canvas building utilities, TargetedMAEWrapper, and GPU-accelerated mask generation
 - `models/canvas_dataset.py`: PyTorch Dataset and DataLoader utilities for high-performance batch training with pinned memory and CUDA streams
+- `models/perceptual_loss.py`: VGG16 perceptual loss module for sharper predictions (optional, controlled by `PERCEPTUAL_LOSS_WEIGHT`)
 
 ### Action Selection and Recording
 - `toroidal_action_selectors.py`: Action selector factories for toroidal dot environment (constant, sequence, and random duration selectors)

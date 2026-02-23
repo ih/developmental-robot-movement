@@ -86,8 +86,8 @@ class PlateauSweepConfig:
     enabled: bool = True
 
     # Plateau detection parameters
-    plateau_ema_alpha: float = 0.9  # EMA smoothing for validation loss (higher = more responsive)
-    plateau_improvement_threshold: float = 0.0005  # 0.5% relative improvement required
+    plateau_ema_alpha: float = 0.85  # EMA smoothing for validation loss (higher = more responsive)
+    plateau_improvement_threshold: float = 0.0015  # 0.5% relative improvement required
     plateau_patience: int = 25  # Updates without improvement before triggering sweep
 
     # Cooldown after sweep (prevents immediate re-triggering)
@@ -126,7 +126,7 @@ class StagedTrainingConfig:
 
     # Core training (app defaults)
     total_samples: int = 10000000  # App default (used when stage_samples_multiplier=0)
-    batch_size: int = 1  # App default
+    batch_size: int = 8  # Matches config.py BATCH_SIZE
 
     # Dynamic sample budget for staged training
     stage_samples_multiplier: int = 100000000000  # total_samples = num_valid_frames * multiplier

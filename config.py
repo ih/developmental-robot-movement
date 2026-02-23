@@ -64,8 +64,11 @@ class AutoencoderConcatPredictorWorldModelConfig:
     LR_MIN_RATIO = 0.001           # Minimum LR as ratio of base LR
 
     # Focal loss parameters (for loss dilution)
-    FOCAL_BETA = 5              # Temperature for exponential weighting (try 5-15)
+    FOCAL_BETA = 5             # Temperature for exponential weighting (try 5-15)
     FOCAL_LOSS_ALPHA = 0.1          # Blend ratio: alpha * plain_mse + (1-alpha) * focal_mse
+
+    # Perceptual loss (VGG feature space loss for sharper predictions)
+    PERCEPTUAL_LOSS_WEIGHT = 0    # Weight for perceptual loss (0.0 = disabled, no VGG loaded)
 
     # Gradio UI parameters
     GRADIO_UPDATE_INTERVAL = 1      # Update visualization every N iterations during training

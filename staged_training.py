@@ -726,10 +726,11 @@ def run_stage_training(
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                    # Reload model with winning checkpoint weights
-                    # This fixes both memory (fresh model) and correctness (sweep's optimized weights)
-                    if new_checkpoint:
-                        setup_world_model(train_session, new_checkpoint, cfg)
+                    # Reload model -- use winning checkpoint if available, else fall back to pre-sweep checkpoint
+                    # Model was freed for GPU memory, so it must be restored regardless of sweep outcome
+                    restore_checkpoint = new_checkpoint or checkpoint_for_sweep
+                    if restore_checkpoint:
+                        setup_world_model(train_session, restore_checkpoint, cfg)
                         state.validation_session_state = val_session
 
                     # Calculate improvement from sweep
@@ -1840,7 +1841,7 @@ def generate_final_report(
     # Generate dated filename with deduplication for same-day reports
     # Pattern: final_report_2026_feb_07.html, final_report_2026_feb_07_2.html, etc.
     date_str = datetime.now().strftime("%Y_%b_%d").lower()
-    base_filename = f"final_report_{date_str}"
+    base_filename = f"final_report_{run_id}_{date_str}"
 
     # Check docs folder for existing reports with same date to determine suffix
     docs_dir = Path(__file__).parent / "docs"
@@ -1898,6 +1899,16 @@ def generate_final_report(
         <td>{format_duration(total_stage_time)}</td>
     </tr>
     """
+
+    # Add initial sweep info (from all_sweep_results, which tracks upfront LR sweeps)
+    initial_sweep_note = ""
+    if all_sweep_results:
+        sweep_notes = []
+        for sr in all_sweep_results:
+            sweep_notes.append(
+                f"Stage {sr.stage_num}: selected LR {sr.selected_lr:.2e} in {format_duration(sr.total_wall_time_sec)}"
+            )
+        initial_sweep_note = f'<p><strong>Initial LR Sweep:</strong> {"; ".join(sweep_notes)}</p>'
 
     # Build plateau sweep details (default mode - sweeps triggered on plateau during training)
     lr_details_html = generate_plateau_sweep_summary_html(completed_stages)
@@ -2456,6 +2467,7 @@ def generate_final_report(
             </tr>
             {timing_rows}
         </table>
+        {initial_sweep_note}
     </section>
 
     {f'<section id="plateau-sweeps"><h2>Plateau Sweep Details</h2>{lr_details_html}</section>' if total_plateau_sweeps > 0 else ""}
@@ -2813,7 +2825,7 @@ def run_staged_training(
         main_training_elapsed = time.time() - main_training_start
 
         # Select best checkpoint from all runs (filter out failed runs with no checkpoint)
-        valid_results = [r for r in stage_results if r.best_checkpoint_path]
+        valid_results = [r for r in stage_results if r.best_checkpoint_path and "nan" not in r.stop_reason]
         if not valid_results:
             print(f"\nERROR: All runs failed for stage {stage_num}. Cannot continue.")
             print("Failed runs:")
