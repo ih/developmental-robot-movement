@@ -7,11 +7,13 @@ from .base_autoencoder import BaseAutoencoder
 
 # Autoencoder implementations
 from .vit_autoencoder import MaskedAutoencoderViT
+from .vit_decoder_only import DecoderOnlyViT
 
 # Canvas-based concat predictor utilities
 from .autoencoder_concat_predictor import (
     build_canvas,
     TargetedMAEWrapper,
+    TargetedDecoderOnlyWrapper,
     canvas_to_tensor
 )
 
@@ -20,8 +22,10 @@ __all__ = [
     'BaseAutoencoder',
     # Autoencoder implementations
     'MaskedAutoencoderViT',
+    'DecoderOnlyViT',
     # Canvas utilities
     'build_canvas',
     'TargetedMAEWrapper',
+    'TargetedDecoderOnlyWrapper',
     'canvas_to_tensor'
 ]

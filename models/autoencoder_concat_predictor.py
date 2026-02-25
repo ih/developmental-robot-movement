@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw
 
 # Local imports from the user's repo
 from models.vit_autoencoder import MaskedAutoencoderViT
+from models.vit_decoder_only import DecoderOnlyViT
 from models.base_autoencoder import BaseAutoencoder
 from config import TRANSFORM
 
@@ -374,13 +375,15 @@ def compute_randomized_patch_mask_for_last_slot_gpu(
 
 
 # ------------------------------
-# MAE targeted-mask forward (adds a helper around the provided ViT MAE)
+# Shared training mixin for targeted masking models
 # ------------------------------
 
-class TargetedMAEWrapper(MaskedAutoencoderViT):
+class TargetedTrainingMixin:
     """
-    Extends MaskedAutoencoderViT with a method to pass a *custom* binary mask over patches.
-    True in `patch_mask` means the patch is hidden from the encoder and must be inpainted.
+    Mixin providing train_on_canvas for any model that implements
+    forward_with_patch_mask(), patchify(), and unpatchify().
+
+    Expected attributes on self: decoder_pred, decoder_blocks, mask_token.
     """
     def train_on_canvas(self, canvas_tensor: torch.Tensor, patch_mask: torch.Tensor, optimizer,
                         return_per_sample_losses: bool = False):
@@ -506,15 +509,14 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
         # Current LR
         curr_lr = optimizer.param_groups[0]['lr']
 
-        # Decoder head (directly sets pixel values)
-        # decoder_pred is a Linear layer, not a sequence
+        # Prediction head (directly sets pixel values)
         head_w = getattr(self.decoder_pred, 'weight', None)
         head_b = getattr(self.decoder_pred, 'bias', None)
 
         # Mask token (what masked positions start from)
         mask_tok = getattr(self, 'mask_token', None)
 
-        # First decoder block weights (does attention mix anything?)
+        # First transformer block weights (decoder_blocks for MAE, blocks for decoder-only)
         dec_blk = self.decoder_blocks[0] if hasattr(self, 'decoder_blocks') and len(self.decoder_blocks) > 0 else None
         qkv_w = getattr(getattr(dec_blk, 'attn', None), 'qkv', None) if dec_blk is not None else None
         qkv_w = getattr(qkv_w, 'weight', None) if qkv_w is not None else None
@@ -550,6 +552,17 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
             return loss_hybrid_only, grad_diagnostics, per_sample_losses
         return loss_hybrid_only, grad_diagnostics
 
+
+# ------------------------------
+# MAE targeted-mask forward (encoder-decoder architecture)
+# ------------------------------
+
+class TargetedMAEWrapper(TargetedTrainingMixin, MaskedAutoencoderViT):
+    """
+    Extends MaskedAutoencoderViT with a method to pass a *custom* binary mask over patches.
+    True in `patch_mask` means the patch is hidden from the encoder and must be inpainted.
+    Inherits train_on_canvas from TargetedTrainingMixin.
+    """
     def forward_with_patch_mask(self, imgs: torch.Tensor, patch_mask: torch.Tensor, return_attn: bool = False):
         """
         imgs: [B,3,H,W]
@@ -640,6 +653,20 @@ class TargetedMAEWrapper(MaskedAutoencoderViT):
         if return_attn:
             return pred, latent, attn_weights, patch_mask
         return pred, latent  # pred is per-patch predictions in *original* order
+
+
+# ------------------------------
+# Decoder-only targeted wrapper
+# ------------------------------
+
+class TargetedDecoderOnlyWrapper(TargetedTrainingMixin, DecoderOnlyViT):
+    """
+    Decoder-only ViT with targeted masking for canvas-based prediction.
+    forward_with_patch_mask is inherited from DecoderOnlyViT.
+    train_on_canvas is inherited from TargetedTrainingMixin.
+    """
+    pass
+
 
 # ------------------------------
 # Loss calculation utilities

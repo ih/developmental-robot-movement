@@ -784,7 +784,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                           plateau_sweep_patience=10,
                           plateau_sweep_cooldown_updates=10,
                           plateau_sweep_max_sweeps=3,
-                          plateau_sweep_count=0):
+                          plateau_sweep_count=0,
+                          prior_auto_saved_checkpoints=None):
     """
     Run batch training with periodic full-session evaluation.
 
@@ -1243,7 +1244,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     best_loss = float('inf')
 
     # Track auto-saved checkpoints for this training run (list of tuples: (loss, filepath))
-    auto_saved_checkpoints = []
+    # Inherit from prior generator run if available (e.g., after plateau sweep restart)
+    auto_saved_checkpoints = list(prior_auto_saved_checkpoints) if prior_auto_saved_checkpoints else []
 
     # Divergence tracking for early stopping
     divergence_count = 0
@@ -2707,8 +2709,8 @@ def run_batch_comparison(batch_sizes_str, total_samples):
                     patch_size=config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
                     num_frame_slots=num_frames,
                     sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
-                    mask_ratio_min=config.MASK_RATIO_MIN,
-                    mask_ratio_max=config.MASK_RATIO_MAX,
+                    mask_ratio_min=config.TRAIN_MASK_RATIO_MIN,
+                    mask_ratio_max=config.TRAIN_MASK_RATIO_MAX,
                     batch_size=len(batch_canvases),
                     device=state.device,
                 )

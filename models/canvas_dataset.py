@@ -126,8 +126,8 @@ class CanvasCollateFn:
             patch_size=self.config.PATCH_SIZE,
             num_frame_slots=num_frames,
             sep_width=self.config.SEPARATOR_WIDTH,
-            mask_ratio_min=getattr(self.config, 'MASK_RATIO_MIN', 1.0),
-            mask_ratio_max=getattr(self.config, 'MASK_RATIO_MAX', 1.0),
+            mask_ratio_min=getattr(self.config, 'TRAIN_MASK_RATIO_MIN', 1.0),
+            mask_ratio_max=getattr(self.config, 'TRAIN_MASK_RATIO_MAX', 1.0),
             batch_size=batch_size,
             device=mask_device,
         )

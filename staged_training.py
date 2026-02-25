@@ -602,6 +602,7 @@ def run_stage_training(
 
     # Run batch training generator (with sweep loop if plateau_sweep_enabled)
     training_complete = False
+    carried_checkpoints = []  # Carry auto_saved_checkpoints across generator restarts
     try:
         while not training_complete:
             generator = training.run_world_model_batch(
@@ -665,6 +666,7 @@ def run_stage_training(
                 plateau_sweep_cooldown_updates=cfg.plateau_sweep.cooldown_updates if plateau_sweep_enabled else 10,
                 plateau_sweep_max_sweeps=cfg.plateau_sweep.max_sweeps_per_stage if plateau_sweep_enabled else 3,
                 plateau_sweep_count=consecutive_sweep_count,
+                prior_auto_saved_checkpoints=carried_checkpoints,
             )
 
             # Consume generator and collect results
@@ -708,6 +710,10 @@ def run_stage_training(
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
+                    # Snapshot existing checkpoints so we can clean up sweep-created ones afterward
+                    checkpoint_dir = state.get_checkpoint_dir_for_session(train_session["session_dir"])
+                    pre_sweep_files = set(Path(checkpoint_dir).glob("best_model_auto_*.pth"))
+
                     # Run plateau-triggered sweep (uses phase budgets from lr_sweep config)
                     sweep_start_time = time.time()
                     new_lr, new_checkpoint, sweep_best_val = run_plateau_triggered_sweep(
@@ -725,6 +731,22 @@ def run_stage_training(
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+
+                    # Clean up sweep trial checkpoints (workers save to shared dir)
+                    post_sweep_files = set(Path(checkpoint_dir).glob("best_model_auto_*.pth"))
+                    sweep_created = post_sweep_files - pre_sweep_files
+                    winning_path = Path(new_checkpoint) if new_checkpoint else None
+                    deleted_count = 0
+                    for f in sweep_created:
+                        if winning_path and f.resolve() == winning_path.resolve():
+                            continue
+                        try:
+                            f.unlink()
+                            deleted_count += 1
+                        except Exception as e:
+                            print(f"[SWEEP CLEANUP] Failed to delete {f.name}: {e}")
+                    if deleted_count > 0:
+                        print(f"[SWEEP CLEANUP] Deleted {deleted_count} trial checkpoint(s), kept winner: {winning_path.name if winning_path else 'none'}")
 
                     # Reload model -- use winning checkpoint if available, else fall back to pre-sweep checkpoint
                     # Model was freed for GPU memory, so it must be restored regardless of sweep outcome
@@ -815,6 +837,10 @@ def run_stage_training(
                         if fig is not None:
                             plt.close(fig)
 
+            # Carry forward auto_saved_checkpoints for next generator restart
+            if state.cumulative_metrics and state.cumulative_metrics.get("auto_saved_checkpoints"):
+                carried_checkpoints = state.cumulative_metrics["auto_saved_checkpoints"]
+
             # If no sweep was triggered, training is complete
             if not sweep_triggered:
                 training_complete = True
@@ -873,6 +899,7 @@ def run_stage_training(
             "optimizer_state_dict": state.world_model.ae_optimizer.state_dict(),
             "scheduler_state_dict": state.world_model.ae_scheduler.state_dict(),
             "scheduler_type": type(state.world_model.ae_scheduler).__name__,
+            "model_type": config.AutoencoderConcatPredictorWorldModelConfig.MODEL_TYPE,
             "samples_seen": starting_samples + total_samples_trained,
             "loss": best_loss if best_loss != float("inf") else 0,
             "config": {
@@ -1043,10 +1070,36 @@ def generate_config_html(cfg: StagedTrainingConfig) -> str:
 
     all_params_html = f"""
         <details>
-            <summary style="cursor: pointer; color: #1976D2; font-weight: bold; margin-top: 15px;">All Configuration Parameters ({len(all_params)} parameters)</summary>
+            <summary style="cursor: pointer; color: #1976D2; font-weight: bold; margin-top: 15px;">All Staged Training Parameters ({len(all_params)} parameters)</summary>
             <table style="margin-top: 10px;">
                 <tr><th>Parameter</th><th>Value</th></tr>
                 {all_rows}
+            </table>
+        </details>"""
+
+    # Build world model architecture config table
+    from config import AutoencoderConcatPredictorWorldModelConfig as WMConfig
+    import config as cfg_module
+    wm_rows = ""
+    for attr in sorted(vars(WMConfig)):
+        if attr.startswith('_'):
+            continue
+        val = getattr(WMConfig, attr)
+        wm_rows += f"""
+            <tr><td><code>{attr}</code></td><td>{val}</td></tr>"""
+    # Add module-level mask ratio configs
+    for attr in ['MASK_RATIO_MIN', 'MASK_RATIO_MAX', 'TRAIN_MASK_RATIO_MIN', 'TRAIN_MASK_RATIO_MAX']:
+        val = getattr(cfg_module, attr, None)
+        if val is not None:
+            wm_rows += f"""
+            <tr><td><code>{attr}</code></td><td>{val}</td></tr>"""
+
+    wm_config_html = f"""
+        <details>
+            <summary style="cursor: pointer; color: #1976D2; font-weight: bold; margin-top: 15px;">World Model Architecture (config.py)</summary>
+            <table style="margin-top: 10px;">
+                <tr><th>Parameter</th><th>Value</th></tr>
+                {wm_rows}
             </table>
         </details>"""
 
@@ -1055,6 +1108,7 @@ def generate_config_html(cfg: StagedTrainingConfig) -> str:
         <h2>Configuration</h2>
         {changes_html}
         {all_params_html}
+        {wm_config_html}
     </section>
 """
 
@@ -1839,22 +1893,25 @@ def generate_final_report(
         Path to generated report
     """
     # Generate dated filename with deduplication for same-day reports
-    # Pattern: final_report_2026_feb_07.html, final_report_2026_feb_07_2.html, etc.
+    # Short name in output_dir (run_id already in parent directory path, avoids Windows MAX_PATH)
+    # Full name with run_id only for docs/ copy where it's needed for identification
     date_str = datetime.now().strftime("%Y_%b_%d").lower()
-    base_filename = f"final_report_{run_id}_{date_str}"
+    local_base = f"final_report_{date_str}"
+    docs_base = f"final_report_{run_id}_{date_str}"
 
-    # Check docs folder for existing reports with same date to determine suffix
     docs_dir = Path(__file__).parent / "docs"
     docs_dir.mkdir(exist_ok=True)
 
-    # Find next available number
+    # Dedup based on docs directory
     counter = 1
-    report_filename = f"{base_filename}.html"
-    while (docs_dir / report_filename).exists():
+    docs_filename = f"{docs_base}.html"
+    local_filename = f"{local_base}.html"
+    while (docs_dir / docs_filename).exists():
         counter += 1
-        report_filename = f"{base_filename}_{counter}.html"
+        docs_filename = f"{docs_base}_{counter}.html"
+        local_filename = f"{local_base}_{counter}.html"
 
-    report_path = output_dir / report_filename
+    report_path = output_dir / local_filename
 
     # Calculate total elapsed time
     total_elapsed = time.time() - overall_start_time
@@ -2507,12 +2564,13 @@ def generate_final_report(
 </body>
 </html>"""
 
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(html_content)
 
     # Copy to docs folder for easy access (only for final reports)
     if is_final:
-        docs_copy_path = docs_dir / report_filename
+        docs_copy_path = docs_dir / docs_filename
         shutil.copy(report_path, docs_copy_path)
         print(f"[REPORT] Report updated: {report_path}")
         print(f"[REPORT] Copied to: {docs_copy_path}")
@@ -3102,10 +3160,104 @@ def run_staged_training(
     print("=" * 60)
     print(f"Output directory: {output_path}")
     print(f"Final report: {final_report_path}")
-    print(f"Also available at: docs/{Path(final_report_path).name}")
 
     # Clear partial report state on normal completion
     _partial_report_state = None
+
+
+def regenerate_report_from_artifacts(output_dir: str, original_session_path: str):
+    """Regenerate final report from saved training artifacts.
+
+    Reconstructs StageResult/StageTiming from saved metrics.json and summary.json,
+    loads the original session and best checkpoint, and generates the final HTML report.
+    """
+    output_path = Path(output_dir)
+
+    # Load config
+    config_path = output_path / "config.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"No config.yaml found in {output_dir}")
+    cfg = StagedTrainingConfig.from_yaml(str(config_path))
+    run_id = cfg.run_id
+
+    # Load summary
+    summary_path = output_path / "summary.json"
+    if not summary_path.exists():
+        raise FileNotFoundError(f"No summary.json found in {output_dir}")
+    with open(summary_path) as f:
+        summary = json.load(f)
+
+    print(f"Regenerating report for run_id: {run_id}")
+    print(f"Loading original session: {original_session_path}")
+    original_session = load_session_for_training(original_session_path)
+
+    # Reconstruct completed_stages from saved metrics
+    completed_stages = []
+    all_timings = []
+    all_stage_runs = {}
+
+    for stage_info in summary["staged"]["stages"]:
+        stage_num = stage_info["stage"]
+        run_results = []
+
+        for run_dir in sorted(output_path.glob(f"stage{stage_num}_run*")):
+            if "baseline" in run_dir.name:
+                continue
+            metrics_file = run_dir / "metrics.json"
+            if not metrics_file.exists():
+                continue
+            with open(metrics_file) as f:
+                metrics = json.load(f)
+
+            result = StageResult(
+                stage_num=stage_num,
+                run_num=metrics["run_num"],
+                is_baseline=False,
+                best_checkpoint_path=metrics["best_checkpoint"],
+                best_loss=metrics["best_loss"],
+                stop_reason=metrics["stop_reason"],
+                elapsed_time=metrics["elapsed_time_seconds"],
+                total_samples_trained=metrics["total_samples_trained"],
+                cumulative_metrics={},
+                final_train_loss=metrics.get("train_eval_stats", {}).get("hybrid", {}).get("mean", 0),
+                final_val_loss=metrics.get("val_eval_stats", {}).get("hybrid", {}).get("mean"),
+            )
+            run_results.append(result)
+
+        if run_results:
+            best_run = min(run_results, key=lambda r: r.best_loss)
+            completed_stages.append((stage_num, best_run, None))
+            all_stage_runs[stage_num] = run_results
+            all_timings.append(StageTiming(
+                stage_num=stage_num,
+                lr_sweep_total_sec=0,
+                lr_sweep_phase_a_sec=0,
+                lr_sweep_phase_b_sec=0,
+                lr_sweep_trial_count=0,
+                main_training_sec=stage_info.get("time", 0),
+                main_training_samples=stage_info.get("samples", 0),
+                total_stage_sec=stage_info.get("time", 0),
+            ))
+
+    if not completed_stages:
+        raise ValueError("No completed stages found in saved artifacts")
+
+    print(f"Reconstructed {len(completed_stages)} stage(s)")
+    total_time = summary.get("total_time_seconds", 0)
+
+    report_path = generate_final_report(
+        completed_stages=completed_stages,
+        all_sweep_results=[],
+        all_timings=all_timings,
+        output_dir=output_path,
+        run_id=run_id,
+        overall_start_time=time.time() - total_time,
+        original_session=original_session,
+        cfg=cfg,
+        is_final=True,
+        all_stage_runs=all_stage_runs,
+    )
+    print(f"\nReport regenerated: {report_path}")
 
 
 def main():
@@ -3225,8 +3377,20 @@ def main():
         "--checkpoint",
         help="Starting checkpoint path (optional, for resuming training)",
     )
+    parser.add_argument(
+        "--regenerate-report",
+        help="Regenerate final report from a completed run's output directory",
+    )
 
     args = parser.parse_args()
+
+    # Handle report regeneration mode (early return)
+    if args.regenerate_report:
+        original_path = args.original_session or args.root_session
+        if not original_path:
+            parser.error("--regenerate-report requires --root-session or --original-session")
+        regenerate_report_from_artifacts(args.regenerate_report, original_path)
+        return
 
     # Determine training mode and validate arguments
     if args.train_session and args.val_session:

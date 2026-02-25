@@ -7,8 +7,10 @@ TRANSFORM = transforms.Compose([
 ])
 
 # Shared Autoencoder Training Parameters
-MASK_RATIO_MIN = 1   # Minimum mask ratio for randomized masking
-MASK_RATIO_MAX = 1  # Maximum mask ratio for randomized masking
+MASK_RATIO_MIN = 1   # Eval/inference mask ratio (always full masking)
+MASK_RATIO_MAX = 1   # Eval/inference mask ratio (always full masking)
+TRAIN_MASK_RATIO_MIN = 0.5  # Training mask ratio minimum (variable masking for better gradients)
+TRAIN_MASK_RATIO_MAX = 1.0  # Training mask ratio maximum
 
 # Root auxiliary directory for checkpoints and recordings
 AUX_DIR = "saved"
@@ -54,7 +56,9 @@ class AutoencoderConcatPredictorWorldModelConfig:
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
 
     # Model architecture
+    MODEL_TYPE = "encoder_decoder" # "encoder_decoder" (MAE) or "decoder_only" (GPT-style single stack)
     PATCH_SIZE = 16                # Size of patches for Vision Transformer (WARNING: changing requires retraining)
+    DECODER_ONLY_DEPTH = 10        # Number of transformer blocks for decoder-only model
     BATCH_SIZE = 1                 # Training batch size (1=online learning, >1=mini-batch)
 
     # Optimizer parameters

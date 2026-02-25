@@ -579,11 +579,18 @@ def load_autoencoder_model(path, device):
         device: Torch device to load model on
 
     Returns:
-        Loaded MaskedAutoencoderViT model in eval mode
+        Loaded autoencoder model in eval mode (MaskedAutoencoderViT or DecoderOnlyViT)
     """
-    model = MaskedAutoencoderViT()
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
+    model_type = checkpoint.get("model_type", "encoder_decoder")
+
+    if model_type == "decoder_only":
+        from models.vit_decoder_only import DecoderOnlyViT
+        model = DecoderOnlyViT()
+    else:
+        model = MaskedAutoencoderViT()
+
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()

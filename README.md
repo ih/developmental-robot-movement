@@ -23,8 +23,12 @@ This repository contains research code for a canvas-based world model that learn
 The concat world model uses a unique approach to visual prediction:
 
 - **Frame concatenation**: History frames are concatenated horizontally with colored action separators
-- **Targeted masking**: Next-frame slot is fully masked (MASK_RATIO = 1.0) for inpainting-based prediction
-- **MAE-native training**: Optimizes only masked patches using the MaskedAutoencoderViT architecture
+- **Two model architectures** (`MODEL_TYPE` in config):
+  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks
+  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack, configurable depth via `DECODER_ONLY_DEPTH`)
+- **Variable mask ratio**: Training uses `TRAIN_MASK_RATIO_MIN/MAX` (0.5-1.0); eval/inference uses full masking (1.0)
+- **Targeted masking**: Next-frame slot is fully masked for inpainting-based prediction
+- **MAE-native training**: Optimizes only masked patches
 - **Hybrid loss**: Combines plain MSE and focal MSE for edge-aware training
 - **VGG perceptual loss**: Optional VGG16 feature-space loss for sharper predictions (`PERCEPTUAL_LOSS_WEIGHT` in config, 0.0 = disabled)
 - **Action encoding**: Actions encoded as thin colored separators between frames (e.g., red for stay, green for move)
@@ -277,6 +281,9 @@ python staged_training.py --root-session saved/sessions/so101/my_session --disab
 
 # Custom configuration via YAML
 python staged_training.py --root-session saved/sessions/so101/my_session --config my_config.yaml
+
+# Regenerate final report from saved artifacts (after crash or error)
+python staged_training.py --regenerate-report saved/staged_training_reports/{session}/{run_id} --root-session saved/sessions/so101/{session}
 ```
 
 **Features:**
@@ -296,6 +303,7 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - **Initial LR sweep** (`initial_sweep_enabled=True`): Runs an upfront LR sweep before each stage regardless of whether plateau sweeps are enabled; disable with `--disable-initial-sweep`
 - **Time budget control**: Optional per-stage time budget for main training
 - **Interrupt/crash recovery**: Catches `KeyboardInterrupt` and exceptions, recovers the interrupted stage from auto-saved checkpoints, and generates a partial report with all completed stages
+- **Report regeneration** (`--regenerate-report`): Regenerate final report from saved artifacts (config.yaml, summary.json, metrics.json) after crashes
 - **Baseline comparison**: Optionally run parallel baseline training (fresh weights each stage) to compare against staged training (weight carryover)
 - **Progressive reporting**: Final report updated after each stage for real-time progress visibility
 - **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, config diff vs last commit, full training loss timeline, multi-run statistics, LR sweep results (including plateau sweep history), staged vs baseline comparison, and inference visualizations
@@ -315,11 +323,11 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - Supports YAML config files for reproducible experiments
 
 **Reports:**
-- Per-stage reports: `saved/staged_training_reports/{session}/stage{N}_run{M}/report.html`
-- Baseline reports: `saved/staged_training_reports/{session}/stage{N}_baseline_run{M}/report.html`
-- Final summary: `saved/staged_training_reports/{session}/final_report_{run_id}_{date}.html` (e.g., `final_report_shoulder_session_multiheight_2026_feb_19.html`)
-- Also copied to: `docs/final_report_{run_id}_{date}.html` for easy access
-- Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, multi-run statistics (when `runs_per_stage > 1`), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
+- Per-stage reports: `saved/staged_training_reports/{session}/{run_id}/stage{N}_run{M}/report.html`
+- Baseline reports: `saved/staged_training_reports/{session}/{run_id}/stage{N}_baseline_run{M}/report.html`
+- Final summary: `saved/staged_training_reports/{session}/{run_id}/final_report_{date}.html` (short name; run_id in directory path)
+- Also copied to: `docs/final_report_{run_id}_{date}.html` for easy access (full name for identification)
+- Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, world model architecture config, multi-run statistics (when `runs_per_stage > 1`), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
 
 ## Dependencies
 
@@ -399,8 +407,9 @@ Required Python packages:
 ### Models
 - `models/__init__.py`: Module exports
 - `models/base_autoencoder.py`: Base class for autoencoders
-- `models/vit_autoencoder.py`: MaskedAutoencoderViT with powerful transformer encoder/decoder
-- `models/autoencoder_concat_predictor.py`: Canvas building and TargetedMAEWrapper for masked inpainting
+- `models/vit_autoencoder.py`: MaskedAutoencoderViT with encoder-decoder transformer architecture
+- `models/vit_decoder_only.py`: DecoderOnlyViT with GPT-style single transformer stack
+- `models/autoencoder_concat_predictor.py`: Canvas building, `TargetedTrainingMixin`, `TargetedMAEWrapper`, `TargetedDecoderOnlyWrapper`, and GPU-accelerated mask generation
 - `models/canvas_dataset.py`: PyTorch Dataset and DataLoader for high-performance batch training
 - `models/perceptual_loss.py`: VGG16 perceptual loss module for sharper predictions (optional, controlled by `PERCEPTUAL_LOSS_WEIGHT`)
 

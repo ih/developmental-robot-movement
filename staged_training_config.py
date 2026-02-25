@@ -225,22 +225,31 @@ class StagedTrainingConfig:
     def from_yaml(cls, yaml_path: str) -> "StagedTrainingConfig":
         """Load configuration from YAML file, merging with defaults."""
         with open(yaml_path, "r") as f:
-            overrides = yaml.safe_load(f) or {}
+            try:
+                overrides = yaml.safe_load(f) or {}
+            except yaml.constructor.ConstructorError:
+                # Handle legacy files saved with !!python/object: tags
+                f.seek(0)
+                overrides = yaml.unsafe_load(f) or {}
 
-        # Handle nested LRSweepConfig
-        if 'lr_sweep' in overrides and isinstance(overrides['lr_sweep'], dict):
-            overrides['lr_sweep'] = LRSweepConfig.from_dict(overrides['lr_sweep'])
-
-        # Handle nested PlateauSweepConfig
-        if 'plateau_sweep' in overrides and isinstance(overrides['plateau_sweep'], dict):
-            overrides['plateau_sweep'] = PlateauSweepConfig.from_dict(overrides['plateau_sweep'])
+        # Handle nested LRSweepConfig (from dict or already-loaded object)
+        if 'lr_sweep' in overrides:
+            if isinstance(overrides['lr_sweep'], dict):
+                overrides['lr_sweep'] = LRSweepConfig.from_dict(overrides['lr_sweep'])
+            elif isinstance(overrides['lr_sweep'], LRSweepConfig):
+                pass  # Already the right type
+        if 'plateau_sweep' in overrides:
+            if isinstance(overrides['plateau_sweep'], dict):
+                overrides['plateau_sweep'] = PlateauSweepConfig.from_dict(overrides['plateau_sweep'])
+            elif isinstance(overrides['plateau_sweep'], PlateauSweepConfig):
+                pass  # Already the right type
 
         return cls(**overrides)
 
     def to_yaml(self, yaml_path: str) -> None:
         """Save configuration to YAML file."""
         with open(yaml_path, "w") as f:
-            yaml.dump(self.__dict__, f, default_flow_style=False)
+            yaml.dump(self.to_dict(), f, default_flow_style=False)
 
     def to_dict(self) -> dict:
         """Convert to dictionary (serializable for multiprocessing)."""

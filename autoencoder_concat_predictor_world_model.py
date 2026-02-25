@@ -13,6 +13,7 @@ from typing import Optional, Callable, Tuple, Any
 from robot_interface import RobotInterface
 from models.autoencoder_concat_predictor import (
     TargetedMAEWrapper,
+    TargetedDecoderOnlyWrapper,
     build_canvas,
     canvas_to_tensor,
     compute_patch_mask_for_last_slot,
@@ -77,13 +78,23 @@ class AutoencoderConcatPredictorWorldModel:
         canvas_height = frame_height
         canvas_width = Config.CANVAS_HISTORY_SIZE * frame_width + (Config.CANVAS_HISTORY_SIZE - 1) * Config.SEPARATOR_WIDTH
 
-        self.autoencoder = TargetedMAEWrapper(
-            img_height=canvas_height,
-            img_width=canvas_width,
-            patch_size=Config.PATCH_SIZE,
-            embed_dim=256,
-            decoder_embed_dim=256,
-        ).to(self.device)
+        if Config.MODEL_TYPE == "decoder_only":
+            self.autoencoder = TargetedDecoderOnlyWrapper(
+                img_height=canvas_height,
+                img_width=canvas_width,
+                patch_size=Config.PATCH_SIZE,
+                embed_dim=256,
+                depth=Config.DECODER_ONLY_DEPTH,
+                num_heads=4,
+            ).to(self.device)
+        else:
+            self.autoencoder = TargetedMAEWrapper(
+                img_height=canvas_height,
+                img_width=canvas_width,
+                patch_size=Config.PATCH_SIZE,
+                embed_dim=256,
+                decoder_embed_dim=256,
+            ).to(self.device)
 
         # Create optimizer with parameter groups for weight decay
         param_groups = world_model_utils.create_param_groups(
@@ -152,8 +163,8 @@ class AutoencoderConcatPredictorWorldModel:
             patch_size=16,
             num_frame_slots=num_frames,
             sep_width=Config.SEPARATOR_WIDTH,
-            mask_ratio_min=config.MASK_RATIO_MIN,
-            mask_ratio_max=config.MASK_RATIO_MAX,
+            mask_ratio_min=config.TRAIN_MASK_RATIO_MIN,
+            mask_ratio_max=config.TRAIN_MASK_RATIO_MAX,
         ).to(self.device)
 
         # Store the mask for visualization (no extra computation cost)

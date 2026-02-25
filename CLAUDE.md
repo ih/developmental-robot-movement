@@ -157,9 +157,11 @@ This repository contains research code for developmental robot movement with a c
   - **File structure**: `saved/training_logs/{session}/run_{timestamp}/` with config, summaries, and raw metrics
 
 ### Neural Vision System
-- **MaskedAutoencoderViT**: Vision Transformer-based autoencoder with powerful transformer encoder and decoder
-- **Symmetric architecture**: Encoder and decoder both use 256-dim embeddings, 5 transformer blocks, 4 attention heads (configurable via `decoder_depth` and `decoder_num_heads` parameters)
-- **Dynamic masking**: Randomized mask ratios for better generalization (shared config: MASK_RATIO_MIN and MASK_RATIO_MAX)
+- **Two model architectures** (`MODEL_TYPE` in config):
+  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, 256-dim embeddings, 5 blocks each, 4 attention heads
+  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable depth via `DECODER_ONLY_DEPTH` (default 10), no separate encoder
+- **TargetedTrainingMixin**: Shared `train_on_canvas()` method extracted into mixin, inherited by both `TargetedMAEWrapper` (encoder-decoder) and `TargetedDecoderOnlyWrapper` (decoder-only)
+- **Variable mask ratio for training**: `TRAIN_MASK_RATIO_MIN` (0.5) and `TRAIN_MASK_RATIO_MAX` (1.0) for training; full masking (`MASK_RATIO_MIN/MAX = 1.0`) for eval/inference
 - **Targeted masking for prediction**: Full masking (MASK_RATIO = 1.0) of next-frame slot for inpainting-based prediction
 - **MAE-native optimization**: Trains only on masked patches for efficient learning
 - **Hybrid loss**: Combines plain MSE and focal MSE (`FOCAL_LOSS_ALPHA * plain + (1-alpha) * focal`) for edge-aware training
@@ -431,12 +433,17 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - Supports YAML config files for reproducible experiments
 - **Deprecated fields**: `val_plateau_patience`, `val_plateau_min_delta`, `plateau_factor`, `plateau_patience` (replaced by plateau_sweep when enabled)
 
+**Report regeneration** (from saved artifacts after crash/error):
+```bash
+python staged_training.py --regenerate-report saved/staged_training_reports/{session}/{run_id} --root-session saved/sessions/so101/{session}
+```
+
 **Reports:**
-- Per-stage reports: `saved/staged_training_reports/{session}/stage{N}_run{M}/report.html`
-- Baseline reports: `saved/staged_training_reports/{session}/stage{N}_baseline_run{M}/report.html`
-- Final summary: `saved/staged_training_reports/{session}/final_report_{run_id}_{date}.html` (e.g., `final_report_shoulder_session_multiheight_2026_feb_19.html`)
-- Also copied to: `docs/final_report_{run_id}_{date}.html` for easy access
-- Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, multi-run statistics (when runs_per_stage > 1), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
+- Per-stage reports: `saved/staged_training_reports/{session}/{run_id}/stage{N}_run{M}/report.html`
+- Baseline reports: `saved/staged_training_reports/{session}/{run_id}/stage{N}_baseline_run{M}/report.html`
+- Final summary: `saved/staged_training_reports/{session}/{run_id}/final_report_{date}.html` (short name; run_id is in directory path)
+- Also copied to: `docs/final_report_{run_id}_{date}.html` for easy access (full name for identification)
+- Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, world model architecture config, multi-run statistics (when runs_per_stage > 1), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
 
 ### Recording Sessions
 To create new sessions for exploration:
@@ -491,11 +498,13 @@ Required Python packages:
   - Divergence-based early stopping
   - Best checkpoint selection based on original session loss
   - Baseline comparison training (fresh weights each stage) for comparing against staged (weight carryover)
-  - Comprehensive HTML reports with training progress, staged vs baseline comparison, and inference visualizations
+  - Comprehensive HTML reports with training progress, staged vs baseline comparison, world model architecture config, and inference visualizations
   - Integrated LR sweep before each stage with parallel execution support
   - Direct session mode: train on specific train/val sessions without staged splits
   - Single stage mode: run only a specific stage from staged splits
   - Starting checkpoint support for resuming training
+  - `--regenerate-report`: Regenerate final report from saved artifacts (config.yaml, summary.json, per-run metrics.json)
+  - Sweep trial checkpoint cleanup: deletes trial checkpoints after sweep, keeps only the winner
 - `staged_training_config.py`: Dataclass configuration for staged training runs
   - All parameters match Gradio app defaults
   - `PlateauSweepConfig`: Plateau-triggered LR sweep configuration (enabled by default)
@@ -542,8 +551,9 @@ Required Python packages:
 ### Models
 - `models/__init__.py`: Module exports for clean imports
 - `models/base_autoencoder.py`: Base class for autoencoder implementations
-- `models/vit_autoencoder.py`: MaskedAutoencoderViT with powerful transformer encoder and decoder
-- `models/autoencoder_concat_predictor.py`: Canvas building utilities, TargetedMAEWrapper, and GPU-accelerated mask generation
+- `models/vit_autoencoder.py`: MaskedAutoencoderViT with encoder-decoder transformer architecture
+- `models/vit_decoder_only.py`: DecoderOnlyViT with GPT-style single transformer stack (no separate encoder)
+- `models/autoencoder_concat_predictor.py`: Canvas building utilities, `TargetedTrainingMixin`, `TargetedMAEWrapper`, `TargetedDecoderOnlyWrapper`, and GPU-accelerated mask generation
 - `models/canvas_dataset.py`: PyTorch Dataset and DataLoader utilities for high-performance batch training with pinned memory and CUDA streams
 - `models/perceptual_loss.py`: VGG16 perceptual loss module for sharper predictions (optional, controlled by `PERCEPTUAL_LOSS_WEIGHT`)
 

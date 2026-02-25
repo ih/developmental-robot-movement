@@ -86,6 +86,7 @@ def save_model_weights(checkpoint_name):
             # Preserve original peak LR for global schedule calculation when resuming
             'original_peak_lr': state.loaded_checkpoint_metadata.get('original_peak_lr')
                                 or state.world_model.ae_optimizer.param_groups[0]['lr'],
+            'model_type': config.AutoencoderConcatPredictorWorldModelConfig.MODEL_TYPE,
             'config': {
                 'frame_size': state.world_model.frame_size,  # Use actual frame_size from model, not global config
                 'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
@@ -136,7 +137,7 @@ def load_model_weights(checkpoint_name):
     # Handle fresh weights option - reinitialize model
     if checkpoint_name == FRESH_WEIGHTS_OPTION:
         try:
-            from models import TargetedMAEWrapper
+            from models import TargetedMAEWrapper, TargetedDecoderOnlyWrapper
 
             # Get current autoencoder dimensions
             old_ae = state.world_model.autoencoder
@@ -144,15 +145,27 @@ def load_model_weights(checkpoint_name):
             patch_size = old_ae.patch_size
             embed_dim = old_ae.embed_dim
 
-            # Create fresh autoencoder with same architecture
-            decoder_embed_dim = old_ae.decoder_embed.out_features
-            state.world_model.autoencoder = TargetedMAEWrapper(
-                img_height=img_height,
-                img_width=img_width,
-                patch_size=patch_size,
-                embed_dim=embed_dim,
-                decoder_embed_dim=decoder_embed_dim,
-            ).to(state.device)
+            # Create fresh autoencoder with same architecture as current model
+            if isinstance(old_ae, TargetedDecoderOnlyWrapper):
+                depth = len(old_ae.blocks)
+                num_heads = old_ae.blocks[0].attn.num_heads
+                state.world_model.autoencoder = TargetedDecoderOnlyWrapper(
+                    img_height=img_height,
+                    img_width=img_width,
+                    patch_size=patch_size,
+                    embed_dim=embed_dim,
+                    depth=depth,
+                    num_heads=num_heads,
+                ).to(state.device)
+            else:
+                decoder_embed_dim = old_ae.decoder_embed.out_features
+                state.world_model.autoencoder = TargetedMAEWrapper(
+                    img_height=img_height,
+                    img_width=img_width,
+                    patch_size=patch_size,
+                    embed_dim=embed_dim,
+                    decoder_embed_dim=decoder_embed_dim,
+                ).to(state.device)
 
             # Recreate optimizer with fresh state
             param_groups = world_model_utils.create_param_groups(
