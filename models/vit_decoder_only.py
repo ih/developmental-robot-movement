@@ -62,8 +62,20 @@ class DecoderOnlyViT(BaseAutoencoder):
         # Cache for attention re-run in decode()
         self._cached_patch_input = None
 
-        # Initialize positional embeddings
+        # Initialize positional embeddings and weights
         self._init_positional_embeddings()
+        self._init_weights()
+
+    # ------------------------------------------------------------------
+    # Weight initialization (MAE convention)
+    # ------------------------------------------------------------------
+    def _init_weights(self):
+        # Zero-init prediction head so initial outputs are near zero (stable for any embed_dim)
+        nn.init.zeros_(self.decoder_pred.weight)
+        nn.init.zeros_(self.decoder_pred.bias)
+        # Small normal init for learnable tokens
+        nn.init.normal_(self.cls_token, std=0.02)
+        nn.init.normal_(self.mask_token, std=0.02)
 
     # ------------------------------------------------------------------
     # Positional embedding utilities (2D sin-cos, same as MAE)

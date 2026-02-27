@@ -60,6 +60,18 @@ class MaskedAutoencoderViT(BaseAutoencoder):
 
         # Initialize fixed 2D sin-cos positional embeddings for encoder/decoder
         self._init_positional_embeddings()
+        self._init_weights()
+
+    # ----------------------------------------------------------------------
+    # Weight initialization (MAE convention)
+    # ----------------------------------------------------------------------
+    def _init_weights(self):
+        # Zero-init prediction head so initial outputs are near zero (stable for any embed_dim)
+        nn.init.zeros_(self.decoder_pred.weight)
+        nn.init.zeros_(self.decoder_pred.bias)
+        # Small normal init for learnable tokens
+        nn.init.normal_(self.cls_token, std=0.02)
+        nn.init.normal_(self.mask_token, std=0.02)
 
     # ----------------------------------------------------------------------
     # Positional embedding utilities (fixed 2D sin-cos, as in MAE)

@@ -83,17 +83,21 @@ class AutoencoderConcatPredictorWorldModel:
                 img_height=canvas_height,
                 img_width=canvas_width,
                 patch_size=Config.PATCH_SIZE,
-                embed_dim=256,
+                embed_dim=Config.EMBED_DIM,
                 depth=Config.DECODER_ONLY_DEPTH,
-                num_heads=4,
+                num_heads=Config.NUM_HEADS,
             ).to(self.device)
         else:
             self.autoencoder = TargetedMAEWrapper(
                 img_height=canvas_height,
                 img_width=canvas_width,
                 patch_size=Config.PATCH_SIZE,
-                embed_dim=256,
-                decoder_embed_dim=256,
+                embed_dim=Config.EMBED_DIM,
+                depth=Config.ENCODER_DEPTH,
+                num_heads=Config.NUM_HEADS,
+                decoder_embed_dim=Config.DECODER_EMBED_DIM,
+                decoder_depth=Config.DECODER_DEPTH,
+                decoder_num_heads=Config.DECODER_NUM_HEADS,
             ).to(self.device)
 
         # Create optimizer with parameter groups for weight decay

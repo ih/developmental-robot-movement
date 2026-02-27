@@ -184,6 +184,9 @@ class StagedTrainingConfig:
     # Run identification (set at runtime, saved for reference/reproducibility)
     run_id: Optional[str] = None  # Unique identifier for concurrent execution
 
+    # Reproducibility
+    seed: Optional[int] = None  # Base random seed for reproducibility (None = non-deterministic)
+
     # W&B (user override: enabled)
     enable_wandb: bool = True  # User specified (app default is False)
     wandb_project: str = "developmental-robot-movement"

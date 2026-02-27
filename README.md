@@ -23,10 +23,12 @@ This repository contains research code for a canvas-based world model that learn
 The concat world model uses a unique approach to visual prediction:
 
 - **Frame concatenation**: History frames are concatenated horizontally with colored action separators
-- **Two model architectures** (`MODEL_TYPE` in config):
-  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks
-  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack, configurable depth via `DECODER_ONLY_DEPTH`)
-- **Variable mask ratio**: Training uses `TRAIN_MASK_RATIO_MIN/MAX` (0.5-1.0); eval/inference uses full masking (1.0)
+- **Two model architectures** (`MODEL_TYPE` in config, default `"decoder_only"`):
+  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `EMBED_DIM`, `ENCODER_DEPTH`, `NUM_HEADS`, `DECODER_EMBED_DIM`, `DECODER_DEPTH`, `DECODER_NUM_HEADS`
+  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `EMBED_DIM`, `DECODER_ONLY_DEPTH`, `NUM_HEADS`
+- **Configurable model capacity**: All architecture dimensions (embedding, depth, heads) are configurable in `config.py` (defaults: `EMBED_DIM=384`, `NUM_HEADS=6`, `DECODER_ONLY_DEPTH=10`)
+- **Weight initialization**: MAE-convention zero-init on prediction head, normal-init (std=0.02) on learnable tokens for stable training at any embed_dim
+- **Full masking**: Both training and eval/inference use full masking (`MASK_RATIO = 1.0`)
 - **Targeted masking**: Next-frame slot is fully masked for inpainting-based prediction
 - **MAE-native training**: Optimizes only masked patches
 - **Hybrid loss**: Combines plain MSE and focal MSE for edge-aware training
@@ -282,6 +284,9 @@ python staged_training.py --root-session saved/sessions/so101/my_session --disab
 # Custom configuration via YAML
 python staged_training.py --root-session saved/sessions/so101/my_session --config my_config.yaml
 
+# Reproducible training with fixed seed
+python staged_training.py --root-session saved/sessions/so101/my_session --seed 42
+
 # Regenerate final report from saved artifacts (after crash or error)
 python staged_training.py --regenerate-report saved/staged_training_reports/{session}/{run_id} --root-session saved/sessions/so101/{session}
 ```
@@ -308,6 +313,7 @@ python staged_training.py --regenerate-report saved/staged_training_reports/{ses
 - **Progressive reporting**: Final report updated after each stage for real-time progress visibility
 - **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, config diff vs last commit, full training loss timeline, multi-run statistics, LR sweep results (including plateau sweep history), staged vs baseline comparison, and inference visualizations
 - **Best checkpoint selection**: Selects best checkpoint based on hybrid loss over original (full) session
+- **Reproducibility**: `--seed` flag sets a base random seed for deterministic training; seeds are derived per-run and propagated to all workers including LR sweep trials
 - **W&B integration**: Optional Weights & Biases logging with run_id in run names and baseline config tracking
 
 **Configuration** (`staged_training_config.py`):
@@ -319,6 +325,7 @@ python staged_training.py --regenerate-report saved/staged_training_reports/{ses
 - Baseline config: `enable_baseline` (default False), `baseline_runs_per_stage` (default 1)
 - `serial_runs` (default True): run multiple runs per stage serially instead of in parallel
 - `initial_sweep_enabled` (default True): upfront LR sweep before each stage (orthogonal to `plateau_sweep.enabled`)
+- `seed` (default None): base random seed for reproducibility; None = non-deterministic
 - Stage time budget: `stage_time_budget_min` (0 = unlimited)
 - Supports YAML config files for reproducible experiments
 
@@ -386,6 +393,7 @@ Required Python packages:
   - Parallel trial execution with multiprocessing
   - Data structures: `LRTrialResult`, `LRAggregatedResult`, `LRSweepPhaseResult`, `LRSweepStageResult`, `StageTiming`
   - Resume support for interrupted sweeps
+- `experiment_config.yaml`: Shared experiment configuration for capacity runs
 - `create_staged_splits.py`: Utility to create progressive train/validation splits from a session
   - Doubling data size at each stage (10, 20, 40, 80, ...)
   - Configurable train/validation ratio (default 70/30)

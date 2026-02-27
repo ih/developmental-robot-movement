@@ -157,11 +157,12 @@ This repository contains research code for developmental robot movement with a c
   - **File structure**: `saved/training_logs/{session}/run_{timestamp}/` with config, summaries, and raw metrics
 
 ### Neural Vision System
-- **Two model architectures** (`MODEL_TYPE` in config):
-  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, 256-dim embeddings, 5 blocks each, 4 attention heads
-  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable depth via `DECODER_ONLY_DEPTH` (default 10), no separate encoder
+- **Two model architectures** (`MODEL_TYPE` in config, default `"decoder_only"`):
+  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `EMBED_DIM` (384), `ENCODER_DEPTH` (5), `NUM_HEADS` (6), `DECODER_EMBED_DIM` (384), `DECODER_DEPTH` (8), `DECODER_NUM_HEADS` (6)
+  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `EMBED_DIM` (384), `DECODER_ONLY_DEPTH` (10), `NUM_HEADS` (6)
+- **Weight initialization**: MAE-convention `_init_weights()` on both architectures: zero-init prediction head (stable for any embed_dim), normal-init (std=0.02) for cls_token and mask_token
 - **TargetedTrainingMixin**: Shared `train_on_canvas()` method extracted into mixin, inherited by both `TargetedMAEWrapper` (encoder-decoder) and `TargetedDecoderOnlyWrapper` (decoder-only)
-- **Variable mask ratio for training**: `TRAIN_MASK_RATIO_MIN` (0.5) and `TRAIN_MASK_RATIO_MAX` (1.0) for training; full masking (`MASK_RATIO_MIN/MAX = 1.0`) for eval/inference
+- **Full masking for training**: `TRAIN_MASK_RATIO_MIN` (1.0) and `TRAIN_MASK_RATIO_MAX` (1.0) for both training and eval/inference
 - **Targeted masking for prediction**: Full masking (MASK_RATIO = 1.0) of next-frame slot for inpainting-based prediction
 - **MAE-native optimization**: Trains only on masked patches for efficient learning
 - **Hybrid loss**: Combines plain MSE and focal MSE (`FOCAL_LOSS_ALPHA * plain + (1-alpha) * focal`) for edge-aware training
@@ -390,6 +391,9 @@ python staged_training.py --root-session saved/sessions/so101/my_session --disab
 
 # Custom configuration file
 python staged_training.py --root-session saved/sessions/so101/my_session --config my_config.yaml
+
+# Reproducible training with fixed seed
+python staged_training.py --root-session saved/sessions/so101/my_session --seed 42
 ```
 
 **Features:**
@@ -418,6 +422,7 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - **Progressive reporting**: Final report is updated after each stage for real-time progress visibility
 - **Best checkpoint selection**: Selects best checkpoint based on hybrid loss over original (full) session
 - **W&B integration**: Optional Weights & Biases logging with run_id in run names and baseline config tracking
+- **Reproducibility**: `--seed` flag sets a base random seed; deterministic per-run seeds are derived via `derive_seed()`, propagated to all workers including LR sweep trials; enables `deterministic_cudnn` mode
 - **Concurrent execution**: Multiple instances can run with isolated checkpoints using `--run-id`
 
 **Configuration** (`staged_training_config.py`):
@@ -430,6 +435,7 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 - Stage time budget: `stage_time_budget_min` (0 = unlimited)
 - `serial_runs` (default True): run multiple runs per stage serially instead of in parallel
 - `initial_sweep_enabled` (default True): run upfront LR sweep before each stage (orthogonal to `plateau_sweep.enabled`)
+- `seed` (default None): base random seed for reproducibility; None = non-deterministic
 - Supports YAML config files for reproducible experiments
 - **Deprecated fields**: `val_plateau_patience`, `val_plateau_min_delta`, `plateau_factor`, `plateau_patience` (replaced by plateau_sweep when enabled)
 
@@ -510,6 +516,7 @@ Required Python packages:
   - `PlateauSweepConfig`: Plateau-triggered LR sweep configuration (enabled by default)
   - `LRSweepConfig`: Legacy upfront LR sweep configuration
   - Baseline config: `enable_baseline`, `baseline_runs_per_stage`
+  - Reproducibility: `seed` field for deterministic training across all runs and workers
   - YAML serialization support for reproducible experiments
 - `lr_sweep.py`: Time-budgeted learning rate optimization module
   - Two-phase search: Phase A (broad exploration) and Phase B (deep validation)
@@ -521,6 +528,7 @@ Required Python packages:
   - Data structures: `LRTrialResult`, `LRAggregatedResult`, `LRSweepPhaseResult`, `LRSweepStageResult`, `StageTiming`
   - Checkpoint path tracking for winning trials
   - Resume support for interrupted sweeps
+  - Deterministic seed derivation from base seed for reproducible sweeps
 - `create_staged_splits.py`: Utility to create progressive train/validation splits from a session
   - Doubling data size at each stage (10, 20, 40, 80, ...)
   - Configurable train/validation ratio (default 70/30)

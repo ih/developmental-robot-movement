@@ -103,6 +103,22 @@ from lr_sweep import (
 _partial_report_state = None
 
 
+def set_all_seeds(seed: int, deterministic_cudnn: bool = False):
+    """Set all random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if deterministic_cudnn:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def derive_seed(base_seed: int, stage_num: int, run_num: int, is_baseline: bool) -> int:
+    """Derive a deterministic per-run seed from a base seed."""
+    return hash((base_seed, stage_num, run_num, is_baseline)) % (2**32)
+
+
 @dataclass
 class StageResult:
     """Result from training a single stage/run."""
@@ -2620,6 +2636,8 @@ def run_staged_training(
     # Set instance_id for checkpoint naming (prevents collisions with concurrent runs)
     state.instance_id = run_id
     print(f"Run ID: {run_id}")
+    if cfg.seed is not None:
+        print(f"Reproducibility seed: {cfg.seed}")
 
     # Track overall training time
     overall_start_time = time.time()
@@ -2827,10 +2845,11 @@ def run_staged_training(
             stage_results = []
             for run_num in range(1, cfg.runs_per_stage + 1):
                 print(f"\n[TRAINING] Starting serial run {run_num}/{cfg.runs_per_stage}")
-                seed = hash((run_id, stage_num, run_num, False)) % (2**32)
-                torch.manual_seed(seed)
-                np.random.seed(seed)
-                random.seed(seed)
+                if cfg.seed is not None:
+                    seed = derive_seed(cfg.seed, stage_num, run_num, False)
+                else:
+                    seed = hash((run_id, stage_num, run_num, False)) % (2**32)
+                set_all_seeds(seed, deterministic_cudnn=(cfg.seed is not None))
 
                 # Reload sessions for each run to ensure clean state
                 run_train_session = load_session_for_training(train_path)
@@ -2853,6 +2872,9 @@ def run_staged_training(
                 print(f"[TRAINING] Serial run {run_num} complete: loss={result.best_loss:.6f}")
         else:
             # Single run - no parallelization overhead
+            if cfg.seed is not None:
+                seed = derive_seed(cfg.seed, stage_num, 1, False)
+                set_all_seeds(seed, deterministic_cudnn=True)
             run_output_dir = output_path / f"stage{stage_num}_run1"
             result = run_stage_training(
                 stage_num=stage_num,
@@ -3044,10 +3066,11 @@ def run_staged_training(
                 baseline_stage_results = []
                 for run_num in range(1, cfg.baseline_runs_per_stage + 1):
                     print(f"\n[BASELINE] Starting serial baseline run {run_num}/{cfg.baseline_runs_per_stage}")
-                    seed = hash((run_id, stage_num, run_num, True)) % (2**32)
-                    torch.manual_seed(seed)
-                    np.random.seed(seed)
-                    random.seed(seed)
+                    if cfg.seed is not None:
+                        seed = derive_seed(cfg.seed, stage_num, run_num, True)
+                    else:
+                        seed = hash((run_id, stage_num, run_num, True)) % (2**32)
+                    set_all_seeds(seed, deterministic_cudnn=(cfg.seed is not None))
 
                     run_train_session = load_session_for_training(train_path)
                     run_val_session = load_session_for_training(val_path)
@@ -3069,6 +3092,9 @@ def run_staged_training(
                     print(f"[BASELINE] Serial baseline run {run_num} complete: loss={result.best_loss:.6f}")
             else:
                 # Single run - no parallelization overhead
+                if cfg.seed is not None:
+                    seed = derive_seed(cfg.seed, stage_num, 1, True)
+                    set_all_seeds(seed, deterministic_cudnn=True)
                 run_output_dir = output_path / f"stage{stage_num}_baseline_run1"
                 result = run_stage_training(
                     stage_num=stage_num,
@@ -3378,6 +3404,12 @@ def main():
         help="Starting checkpoint path (optional, for resuming training)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Base random seed for reproducibility (default: None = non-deterministic)",
+    )
+    parser.add_argument(
         "--regenerate-report",
         help="Regenerate final report from a completed run's output directory",
     )
@@ -3454,6 +3486,8 @@ def main():
         cfg.stage_time_budget_min = args.stage_time_budget_min
     if args.disable_baseline:
         cfg.enable_baseline = False
+    if args.seed is not None:
+        cfg.seed = args.seed
 
     # Determine output directory (include run_id to prevent conflicts between concurrent runs)
     if args.output_dir:

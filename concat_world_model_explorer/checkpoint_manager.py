@@ -159,12 +159,20 @@ def load_model_weights(checkpoint_name):
                 ).to(state.device)
             else:
                 decoder_embed_dim = old_ae.decoder_embed.out_features
+                depth = len(old_ae.blocks)
+                num_heads = old_ae.blocks[0].attn.num_heads
+                decoder_depth = len(old_ae.decoder_blocks)
+                decoder_num_heads = old_ae.decoder_blocks[0].attn.num_heads
                 state.world_model.autoencoder = TargetedMAEWrapper(
                     img_height=img_height,
                     img_width=img_width,
                     patch_size=patch_size,
                     embed_dim=embed_dim,
+                    depth=depth,
+                    num_heads=num_heads,
                     decoder_embed_dim=decoder_embed_dim,
+                    decoder_depth=decoder_depth,
+                    decoder_num_heads=decoder_num_heads,
                 ).to(state.device)
 
             # Recreate optimizer with fresh state

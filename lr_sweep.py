@@ -34,6 +34,17 @@ except RuntimeError:
     pass
 
 
+def _set_all_seeds(seed: int, deterministic_cudnn: bool = False):
+    """Set all random seeds for reproducibility (worker-local version)."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if deterministic_cudnn:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
 # =============================================================================
 # Data Structures
 # =============================================================================
@@ -569,13 +580,12 @@ def run_lr_trial(
     )
     from concat_world_model_explorer import state, training
 
-    # Set random seeds
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
     # Reconstruct config with LR override (use from_dict to handle nested LRSweepConfig)
     cfg = StagedTrainingConfig.from_dict(cfg_dict)
+
+    # Set random seeds
+    _set_all_seeds(seed, deterministic_cudnn=(cfg.seed is not None))
+
     cfg.custom_lr = lr
     cfg.disable_lr_scaling = True
 
@@ -830,11 +840,16 @@ def run_lr_sweep_phase(
     # Build list of trial args (worker_index appended for GPU assignment)
     trial_args = []
     worker_index = 0
+    base_seed = cfg_dict.get('seed')
     for lr in lr_candidates:
-        for seed in range(seeds_per_lr):
-            trial_dir = output_dir / f"phase_{phase}" / f"lr_{lr:.2e}" / f"seed_{seed}"
+        for seed_idx in range(seeds_per_lr):
+            if base_seed is not None:
+                trial_seed = hash((base_seed, "sweep", stage_num, phase, lr, seed_idx)) % (2**32)
+            else:
+                trial_seed = seed_idx
+            trial_dir = output_dir / f"phase_{phase}" / f"lr_{lr:.2e}" / f"seed_{seed_idx}"
             trial_args.append((
-                lr, seed, phase, time_budget_min,
+                lr, trial_seed, phase, time_budget_min,
                 train_session_path, val_session_path,
                 starting_checkpoint, cfg_dict, str(trial_dir), run_id,
                 worker_index
@@ -1265,7 +1280,11 @@ def run_main_training_parallel(
     run_args = []
     for run_num in range(1, num_runs + 1):
         run_output_dir = output_dir / f"stage{stage_num}_{prefix}run{run_num}"
-        seed = hash((run_id, stage_num, run_num, is_baseline)) % (2**32)
+        base_seed = cfg_dict.get('seed')
+        if base_seed is not None:
+            seed = hash((base_seed, stage_num, run_num, is_baseline)) % (2**32)
+        else:
+            seed = hash((run_id, stage_num, run_num, is_baseline)) % (2**32)
 
         # Create modified config with selected LR
         run_cfg = cfg_dict.copy()
@@ -1348,13 +1367,11 @@ def _run_main_training_worker(args: tuple):
     else:
         print(f"[Training Worker {worker_id}] CUDA not available, using CPU")
 
-    # Set seeds
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
     # Reconstruct config (use from_dict to handle nested LRSweepConfig)
     cfg = StagedTrainingConfig.from_dict(cfg_dict)
+
+    # Set seeds
+    _set_all_seeds(seed, deterministic_cudnn=(cfg.seed is not None))
 
     # Load sessions
     train_session = load_session_for_training(train_session_path)

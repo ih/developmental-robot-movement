@@ -1,0 +1,36 @@
+batch_size: 8
+custom_lr: 0.0001
+disable_lr_scaling: true
+enable_wandb: true
+wandb_project: developmental-robot-movement
+runs_per_stage: 5
+serial_runs: true
+stage_time_budget_min: 180
+stage_samples_multiplier: 100000000000
+total_samples: 10000000
+update_interval: 250
+stop_on_divergence: true
+divergence_gap: 0.002
+divergence_ratio: 1.5
+divergence_patience: 50
+loss_weight_temperature: 0.5
+initial_sweep_enabled: true
+plateau_sweep:
+  enabled: true
+  plateau_patience: 25
+  plateau_improvement_threshold: 0.0015
+  cooldown_updates: 5
+  max_sweeps_per_stage: 2
+  min_sweep_improvement: 0.0
+  plateau_ema_alpha: 0.85
+lr_sweep:
+  lr_min: 1.0e-07
+  lr_max: 0.01
+  phase_a_num_candidates: 5
+  phase_a_seeds: 1
+  phase_a_survivor_count: 2
+  phase_a_time_budget_min: 3.0
+  phase_b_seeds: 3
+  phase_b_time_budget_min: 10.0
+  ranking_metric: median_best_val
+  save_sweep_state: true
