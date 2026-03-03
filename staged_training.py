@@ -58,6 +58,7 @@ import numpy as np
 import torch
 
 import config
+import world_model_utils
 from staged_training_config import StagedTrainingConfig
 from session_explorer_lib import (
     load_session_metadata,
@@ -487,13 +488,28 @@ def setup_world_model(
         frame_size=frame_size,
     )
 
-    # Load checkpoint state if provided
+    # Load checkpoint state if provided (supports depth growth)
     if checkpoint_path and checkpoint is not None:
-        state.world_model.autoencoder.load_state_dict(checkpoint["model_state_dict"])
+        growth_info = world_model_utils.load_state_dict_with_depth_growth(
+            state.world_model.autoencoder, checkpoint["model_state_dict"]
+        )
+        if growth_info['depth_changed']:
+            msg = f"Depth growth: encoder blocks {growth_info['blocks_saved']} -> {growth_info['blocks_current']}"
+            if growth_info['decoder_blocks_saved'] or growth_info['decoder_blocks_current']:
+                msg += f", decoder blocks {growth_info['decoder_blocks_saved']} -> {growth_info['decoder_blocks_current']}"
+            msg += f", loaded {growth_info['loaded_keys']} keys"
+            if growth_info['skipped_keys']:
+                msg += f", skipped {len(growth_info['skipped_keys'])} keys"
+            print(msg)
+        elif growth_info['skipped_keys']:
+            print(f"Checkpoint: loaded {growth_info['loaded_keys']} keys, skipped {len(growth_info['skipped_keys'])} keys (shape mismatch)")
 
         # Restore optimizer and scheduler if available
         if "optimizer_state_dict" in checkpoint:
-            state.world_model.ae_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            try:
+                state.world_model.ae_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            except (ValueError, KeyError) as e:
+                print(f"[CHECKPOINT] Skipping optimizer state (parameter group mismatch): {e}")
         if "scheduler_state_dict" in checkpoint:
             # Check scheduler type compatibility before loading
             checkpoint_scheduler_type = checkpoint.get("scheduler_type", "unknown")
@@ -946,6 +962,93 @@ def run_stage_training(
     )
 
 
+def save_run_metrics(result: StageResult, output_dir: Path) -> None:
+    """Save minimal per-run metrics immediately after training completes.
+
+    Creates a metrics.json with training-only data (no eval stats).
+    If generate_stage_report() runs later, it overwrites this with a richer
+    version that includes evaluation statistics.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics = {
+        "stage_num": result.stage_num,
+        "run_num": result.run_num,
+        "is_baseline": result.is_baseline,
+        "stop_reason": result.stop_reason,
+        "elapsed_time_seconds": result.elapsed_time,
+        "best_checkpoint": result.best_checkpoint_path,
+        "best_loss": result.best_loss,
+        "total_samples_trained": result.total_samples_trained,
+        "final_train_loss": result.final_train_loss,
+        "final_val_loss": result.final_val_loss,
+        "sweep_history": result.sweep_history,
+        "total_sweeps_triggered": result.total_sweeps_triggered,
+        "initial_lr": result.initial_lr,
+        "final_lr": result.final_lr,
+    }
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2, default=str)
+    print(f"  [SAVE] Metrics saved to {output_dir / 'metrics.json'}")
+
+
+def save_progressive_summary(
+    completed_stages: list[tuple[int, StageResult, Optional[StageResult]]],
+    output_dir: Path,
+    overall_start_time: float,
+    run_id: str,
+) -> None:
+    """Save a progressive summary.json after each stage completes.
+
+    Creates a partial summary for crash resilience. The final
+    generate_final_report(is_final=True) overwrites this with the
+    enriched version that includes original session evaluations.
+    """
+    total_elapsed = time.time() - overall_start_time
+
+    summary = {
+        "is_progressive": True,
+        "total_time_seconds": total_elapsed,
+        "run_id": run_id,
+        "staged": {
+            "stages": [
+                {
+                    "stage": stage_num,
+                    "train_loss": staged.best_loss,
+                    "time": staged.elapsed_time,
+                    "samples": staged.total_samples_trained,
+                    "stop_reason": staged.stop_reason,
+                    "checkpoint": staged.best_checkpoint_path,
+                }
+                for stage_num, staged, _ in completed_stages
+            ],
+        },
+    }
+
+    baseline_stages = [
+        (stage_num, baseline)
+        for stage_num, _, baseline in completed_stages
+        if baseline
+    ]
+    if baseline_stages:
+        summary["baseline"] = {
+            "stages": [
+                {
+                    "stage": stage_num,
+                    "train_loss": baseline.best_loss,
+                    "time": baseline.elapsed_time,
+                    "samples": baseline.total_samples_trained,
+                    "stop_reason": baseline.stop_reason,
+                    "checkpoint": baseline.best_checkpoint_path,
+                }
+                for stage_num, baseline in baseline_stages
+            ],
+        }
+
+    with open(output_dir / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"[SAVE] Progressive summary saved ({len(completed_stages)} stage(s))")
+
+
 def fig_to_base64(fig) -> str:
     """Convert matplotlib figure to base64 string."""
     if fig is None:
@@ -1381,9 +1484,11 @@ def evaluate_session_with_checkpoint(
 
     Returns (loss_over_time_fig, distribution_fig, stats_dict)
     """
-    # Load checkpoint
+    # Load checkpoint (supports depth growth)
     checkpoint = torch.load(checkpoint_path, map_location=state.device, weights_only=False)
-    state.world_model.autoencoder.load_state_dict(checkpoint["model_state_dict"])
+    world_model_utils.load_state_dict_with_depth_growth(
+        state.world_model.autoencoder, checkpoint["model_state_dict"]
+    )
 
     # Temporarily set session state
     old_session = state.session_state
@@ -1532,15 +1637,22 @@ def generate_stage_report(
         save_fig_to_file(fig_orig_loss, assets_dir / "hybrid_loss_original.png")
         images["loss_original"] = fig_to_base64(fig_orig_loss)
 
-    # Save metrics.json
+    # Save metrics.json (enriched version with eval stats, overwrites minimal save)
     metrics = {
         "stage_num": result.stage_num,
         "run_num": result.run_num,
+        "is_baseline": result.is_baseline,
         "stop_reason": result.stop_reason,
         "elapsed_time_seconds": result.elapsed_time,
         "best_checkpoint": result.best_checkpoint_path,
         "best_loss": result.best_loss,
         "total_samples_trained": result.total_samples_trained,
+        "final_train_loss": result.final_train_loss,
+        "final_val_loss": result.final_val_loss,
+        "sweep_history": result.sweep_history,
+        "total_sweeps_triggered": result.total_sweeps_triggered,
+        "initial_lr": result.initial_lr,
+        "final_lr": result.final_lr,
         "train_eval_stats": train_stats,
         "val_eval_stats": val_stats,
         "original_eval_stats": orig_stats,
@@ -2839,6 +2951,8 @@ def run_staged_training(
                 is_baseline=False,
                 time_budget_min=per_run_budget,
             )
+            for result in stage_results:
+                save_run_metrics(result, output_path / f"stage{stage_num}_run{result.run_num}")
         elif cfg.runs_per_stage > 1 and cfg.serial_runs:
             # Serial execution for multiple runs
             print(f"\n[TRAINING] Running {cfg.runs_per_stage} runs serially for stage {stage_num}")
@@ -2870,6 +2984,7 @@ def run_staged_training(
                 )
                 stage_results.append(result)
                 print(f"[TRAINING] Serial run {run_num} complete: loss={result.best_loss:.6f}")
+                save_run_metrics(result, run_output_dir)
         else:
             # Single run - no parallelization overhead
             if cfg.seed is not None:
@@ -2889,6 +3004,7 @@ def run_staged_training(
                 time_budget_min=main_training_budget if main_training_budget > 0 else 0,
             )
             stage_results = [result]
+            save_run_metrics(result, run_output_dir)
 
         # Generate reports AFTER all runs complete
         for result in stage_results:
@@ -2959,6 +3075,7 @@ def run_staged_training(
             is_final=False,
             all_stage_runs=all_stage_runs,
         )
+        save_progressive_summary(completed_stages, output_path, overall_start_time, run_id)
 
     # Run BASELINE training if enabled (fresh weights each stage)
     baseline_results = []
@@ -3060,6 +3177,8 @@ def run_staged_training(
                     is_baseline=True,
                     time_budget_min=baseline_per_run_budget,
                 )
+                for result in baseline_stage_results:
+                    save_run_metrics(result, output_path / f"stage{stage_num}_baseline_run{result.run_num}")
             elif cfg.baseline_runs_per_stage > 1 and cfg.serial_runs:
                 # Serial execution for multiple baseline runs
                 print(f"\n[BASELINE] Running {cfg.baseline_runs_per_stage} baseline runs serially for stage {stage_num}")
@@ -3090,6 +3209,7 @@ def run_staged_training(
                     )
                     baseline_stage_results.append(result)
                     print(f"[BASELINE] Serial baseline run {run_num} complete: loss={result.best_loss:.6f}")
+                    save_run_metrics(result, run_output_dir)
             else:
                 # Single run - no parallelization overhead
                 if cfg.seed is not None:
@@ -3109,6 +3229,7 @@ def run_staged_training(
                     time_budget_min=baseline_main_budget if baseline_main_budget > 0 else 0,
                 )
                 baseline_stage_results = [result]
+                save_run_metrics(result, run_output_dir)
 
             # Generate reports AFTER all baseline runs complete
             for result in baseline_stage_results:
@@ -3191,11 +3312,144 @@ def run_staged_training(
     _partial_report_state = None
 
 
+def _discover_stages_from_directories(output_path: Path) -> list[dict]:
+    """Infer stage structure from directory names when summary.json is missing."""
+    stage_nums = set()
+    stage_pattern = re.compile(r"^stage(\d+)_run\d+$")
+    for item in output_path.iterdir():
+        if item.is_dir():
+            match = stage_pattern.match(item.name)
+            if match and "baseline" not in item.name:
+                stage_nums.add(int(match.group(1)))
+    return [{"stage": n} for n in sorted(stage_nums)]
+
+
+def _reconstruct_run_from_checkpoints(
+    run_dir: Path, stage_num: int, run_id: str,
+) -> Optional[StageResult]:
+    """Reconstruct a StageResult from checkpoint files when metrics.json is missing.
+
+    Since checkpoint filenames don't encode run_num, all runs for the same
+    run_id will find the same best checkpoint. This is acceptable because
+    generate_final_report selects the overall best anyway.
+    """
+    run_match = re.match(r"stage\d+_(baseline_)?run(\d+)", run_dir.name)
+    if not run_match:
+        return None
+    is_baseline = run_match.group(1) is not None
+    run_num = int(run_match.group(2))
+
+    # Search all robot checkpoint directories for matching files
+    checkpoint_dir = None
+    for candidate_dir in [config.SO101_CHECKPOINT_DIR, config.TOROIDAL_DOT_CHECKPOINT_DIR, config.JETBOT_CHECKPOINT_DIR]:
+        candidate_path = Path(candidate_dir)
+        if candidate_path.exists() and list(candidate_path.glob(f"*{run_id}*")):
+            checkpoint_dir = candidate_path
+            break
+
+    if checkpoint_dir is None:
+        print(f"  WARNING: No checkpoint directory found for run_id={run_id}")
+        return None
+
+    checkpoints = list(checkpoint_dir.glob(f"*{run_id}*"))
+    if not checkpoints:
+        print(f"  WARNING: No checkpoints found for {run_dir.name}")
+        return None
+
+    # Parse checkpoint filenames to find best (reuses logic from interrupt recovery)
+    # Pattern: best_model_auto_{session}_{run_id}_{samples:08d}_{origin}_{type}_{loss:.6f}.pth
+    best_ckpt = None
+    best_loss = float("inf")
+    best_is_val = False
+    best_samples = 0
+    for ckpt in checkpoints:
+        parts = ckpt.stem.split("_")
+        try:
+            loss = float(parts[-1])
+            is_val = len(parts) >= 2 and parts[-2] == "val"
+            if best_ckpt is None or (is_val and not best_is_val) or \
+               (is_val == best_is_val and loss < best_loss):
+                best_loss = loss
+                best_ckpt = ckpt
+                best_is_val = is_val
+                # Try to get samples from filename (8-digit field before origin)
+                try:
+                    best_samples = int(parts[-4])
+                except (ValueError, IndexError):
+                    pass
+        except (ValueError, IndexError):
+            continue
+
+    if best_ckpt is None:
+        print(f"  WARNING: Could not parse any checkpoints for {run_dir.name}")
+        return None
+
+    # Try to read samples_seen from checkpoint metadata
+    samples_trained = best_samples
+    try:
+        ckpt_data = torch.load(str(best_ckpt), map_location="cpu", weights_only=True)
+        samples_trained = ckpt_data.get("samples_seen", best_samples)
+    except Exception:
+        pass
+
+    print(f"  Reconstructed {run_dir.name}: checkpoint={best_ckpt.name}, "
+          f"loss={best_loss:.6f}, samples={samples_trained}")
+
+    return StageResult(
+        stage_num=stage_num,
+        run_num=run_num,
+        is_baseline=is_baseline,
+        best_checkpoint_path=str(best_ckpt),
+        best_loss=best_loss,
+        stop_reason="reconstructed",
+        elapsed_time=0,
+        total_samples_trained=samples_trained,
+        cumulative_metrics={},
+        final_train_loss=best_loss,
+        final_val_loss=best_loss if best_is_val else None,
+    )
+
+
+def _load_run_result(
+    run_dir: Path, stage_num: int, stage_info: dict, run_id: str,
+) -> Optional[StageResult]:
+    """Load a run result from metrics.json, or reconstruct from checkpoints."""
+    metrics_file = run_dir / "metrics.json"
+
+    if metrics_file.exists():
+        with open(metrics_file) as f:
+            metrics = json.load(f)
+
+        return StageResult(
+            stage_num=stage_num,
+            run_num=metrics["run_num"],
+            is_baseline=metrics.get("is_baseline", False),
+            best_checkpoint_path=metrics["best_checkpoint"],
+            best_loss=metrics["best_loss"],
+            stop_reason=metrics["stop_reason"],
+            elapsed_time=metrics["elapsed_time_seconds"],
+            total_samples_trained=metrics["total_samples_trained"],
+            cumulative_metrics={},
+            final_train_loss=metrics.get("final_train_loss",
+                                         metrics.get("train_eval_stats", {}).get("hybrid", {}).get("mean", 0)),
+            final_val_loss=metrics.get("final_val_loss",
+                                       metrics.get("val_eval_stats", {}).get("hybrid", {}).get("mean")),
+            sweep_history=metrics.get("sweep_history", []),
+            total_sweeps_triggered=metrics.get("total_sweeps_triggered", 0),
+            initial_lr=metrics.get("initial_lr", 0.0),
+            final_lr=metrics.get("final_lr", 0.0),
+        )
+
+    # No metrics.json -- try to reconstruct from checkpoint files
+    return _reconstruct_run_from_checkpoints(run_dir, stage_num, run_id)
+
+
 def regenerate_report_from_artifacts(output_dir: str, original_session_path: str):
     """Regenerate final report from saved training artifacts.
 
-    Reconstructs StageResult/StageTiming from saved metrics.json and summary.json,
-    loads the original session and best checkpoint, and generates the final HTML report.
+    Reconstructs StageResult/StageTiming from saved metrics.json and summary.json.
+    If summary.json is missing, infers stage structure from directory names.
+    If per-run metrics.json is missing, reconstructs from checkpoint files.
     """
     output_path = Path(output_dir)
 
@@ -3206,49 +3460,45 @@ def regenerate_report_from_artifacts(output_dir: str, original_session_path: str
     cfg = StagedTrainingConfig.from_yaml(str(config_path))
     run_id = cfg.run_id
 
-    # Load summary
+    # Load summary (optional -- fall back to directory discovery)
     summary_path = output_path / "summary.json"
-    if not summary_path.exists():
-        raise FileNotFoundError(f"No summary.json found in {output_dir}")
-    with open(summary_path) as f:
-        summary = json.load(f)
+    summary = None
+    if summary_path.exists():
+        with open(summary_path) as f:
+            summary = json.load(f)
+        kind = "progressive" if summary.get("is_progressive") else "final"
+        print(f"Loaded {kind} summary.json")
+    else:
+        print("No summary.json found - inferring stage structure from directories")
 
     print(f"Regenerating report for run_id: {run_id}")
     print(f"Loading original session: {original_session_path}")
     original_session = load_session_for_training(original_session_path)
 
-    # Reconstruct completed_stages from saved metrics
+    # Determine stage list
+    if summary and "staged" in summary and "stages" in summary["staged"]:
+        stage_infos = summary["staged"]["stages"]
+    else:
+        stage_infos = _discover_stages_from_directories(output_path)
+
+    if not stage_infos:
+        raise ValueError(f"No stages found in {output_dir}")
+
+    # Reconstruct completed_stages from saved metrics or checkpoints
     completed_stages = []
     all_timings = []
     all_stage_runs = {}
 
-    for stage_info in summary["staged"]["stages"]:
+    for stage_info in stage_infos:
         stage_num = stage_info["stage"]
         run_results = []
 
         for run_dir in sorted(output_path.glob(f"stage{stage_num}_run*")):
             if "baseline" in run_dir.name:
                 continue
-            metrics_file = run_dir / "metrics.json"
-            if not metrics_file.exists():
-                continue
-            with open(metrics_file) as f:
-                metrics = json.load(f)
-
-            result = StageResult(
-                stage_num=stage_num,
-                run_num=metrics["run_num"],
-                is_baseline=False,
-                best_checkpoint_path=metrics["best_checkpoint"],
-                best_loss=metrics["best_loss"],
-                stop_reason=metrics["stop_reason"],
-                elapsed_time=metrics["elapsed_time_seconds"],
-                total_samples_trained=metrics["total_samples_trained"],
-                cumulative_metrics={},
-                final_train_loss=metrics.get("train_eval_stats", {}).get("hybrid", {}).get("mean", 0),
-                final_val_loss=metrics.get("val_eval_stats", {}).get("hybrid", {}).get("mean"),
-            )
-            run_results.append(result)
+            result = _load_run_result(run_dir, stage_num, stage_info, run_id)
+            if result:
+                run_results.append(result)
 
         if run_results:
             best_run = min(run_results, key=lambda r: r.best_loss)
@@ -3260,16 +3510,16 @@ def regenerate_report_from_artifacts(output_dir: str, original_session_path: str
                 lr_sweep_phase_a_sec=0,
                 lr_sweep_phase_b_sec=0,
                 lr_sweep_trial_count=0,
-                main_training_sec=stage_info.get("time", 0),
-                main_training_samples=stage_info.get("samples", 0),
-                total_stage_sec=stage_info.get("time", 0),
+                main_training_sec=stage_info.get("time", best_run.elapsed_time),
+                main_training_samples=stage_info.get("samples", best_run.total_samples_trained),
+                total_stage_sec=stage_info.get("time", best_run.elapsed_time),
             ))
 
     if not completed_stages:
         raise ValueError("No completed stages found in saved artifacts")
 
     print(f"Reconstructed {len(completed_stages)} stage(s)")
-    total_time = summary.get("total_time_seconds", 0)
+    total_time = summary.get("total_time_seconds", 0) if summary else 0
 
     report_path = generate_final_report(
         completed_stages=completed_stages,

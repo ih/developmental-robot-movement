@@ -56,22 +56,19 @@ class AutoencoderConcatPredictorWorldModelConfig:
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
 
     # Model architecture
-    MODEL_TYPE = "decoder_only" # "encoder_decoder" (MAE) or "decoder_only" (GPT-style single stack)
+    MODEL_TYPE = "encoder_decoder" # "encoder_decoder" (MAE) or "decoder_only" (GPT-style single stack)
     PATCH_SIZE = 16                # Size of patches for Vision Transformer (WARNING: changing requires retraining)
     BATCH_SIZE = 1                 # Training batch size (1=online learning, >1=mini-batch)
 
-    # Model capacity - shared
-    EMBED_DIM = 384                # Embedding dimension for encoder (and decoder-only)
-    NUM_HEADS = 6                  # Number of attention heads for encoder (and decoder-only)
-
-    # Model capacity - encoder-decoder
+    # Model capacity - encoder (encoder-decoder only)
+    ENCODER_EMBED_DIM = 256        # Embedding dimension for encoder
+    ENCODER_NUM_HEADS = 4          # Number of attention heads for encoder
     ENCODER_DEPTH = 5              # Number of transformer blocks in encoder
-    DECODER_EMBED_DIM = 384        # Embedding dimension for decoder (encoder-decoder only)
-    DECODER_DEPTH = 8              # Number of transformer blocks in decoder (encoder-decoder only)
-    DECODER_NUM_HEADS = 6          # Number of attention heads in decoder (encoder-decoder only)
 
-    # Model capacity - decoder-only
-    DECODER_ONLY_DEPTH = 10        # Number of transformer blocks for decoder-only model
+    # Model capacity - decoder (encoder-decoder decoder, or decoder-only single stack)
+    DECODER_EMBED_DIM = 128        # Embedding dimension for decoder
+    DECODER_NUM_HEADS = 4          # Number of attention heads in decoder
+    DECODER_DEPTH = 5              # Number of transformer blocks in decoder
 
     # Optimizer parameters
     AUTOENCODER_LR = 2e-4          # Learning rate for autoencoder training

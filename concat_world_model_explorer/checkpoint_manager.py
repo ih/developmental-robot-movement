@@ -91,6 +91,8 @@ def save_model_weights(checkpoint_name):
                 'frame_size': state.world_model.frame_size,  # Use actual frame_size from model, not global config
                 'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
                 'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+                'embed_dim': state.world_model.autoencoder.embed_dim,
+                'depth': len(state.world_model.autoencoder.blocks),
             }
         }
 
@@ -212,12 +214,11 @@ def load_model_weights(checkpoint_name):
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=state.device, weights_only=False)
 
-        # Load model state
-        if 'model_state_dict' in checkpoint:
-            state.world_model.autoencoder.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            # Fallback: assume entire checkpoint is the state dict
-            state.world_model.autoencoder.load_state_dict(checkpoint)
+        # Load model state (supports depth growth: loading shallower checkpoint into deeper model)
+        model_sd = checkpoint.get('model_state_dict', checkpoint)
+        growth_info = world_model_utils.load_state_dict_with_depth_growth(
+            state.world_model.autoencoder, model_sd
+        )
 
         # Track which components were loaded
         optimizer_loaded = False
@@ -332,6 +333,14 @@ def load_model_weights(checkpoint_name):
         status_msg += f"- Model weights: ✅\n"
         status_msg += f"- Optimizer state: {'✅' if optimizer_loaded else '❌ (skipped)'}\n"
         status_msg += f"- Scheduler state: {'✅' if scheduler_loaded else '❌ (skipped)'}\n"
+
+        # Show depth growth info if applicable
+        if growth_info['depth_changed']:
+            status_msg += f"\n**Depth Growth:**\n"
+            status_msg += f"- Blocks: {growth_info['blocks_saved']} -> {growth_info['blocks_current']}\n"
+            if growth_info['decoder_blocks_saved'] > 0 or growth_info['decoder_blocks_current'] > 0:
+                status_msg += f"- Decoder blocks: {growth_info['decoder_blocks_saved']} -> {growth_info['decoder_blocks_current']}\n"
+            status_msg += f"- New blocks initialized with zero-init residual (identity pass-through)\n"
 
         # Add warnings if any
         if warnings:

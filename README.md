@@ -23,10 +23,11 @@ This repository contains research code for a canvas-based world model that learn
 The concat world model uses a unique approach to visual prediction:
 
 - **Frame concatenation**: History frames are concatenated horizontally with colored action separators
-- **Two model architectures** (`MODEL_TYPE` in config, default `"decoder_only"`):
-  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `EMBED_DIM`, `ENCODER_DEPTH`, `NUM_HEADS`, `DECODER_EMBED_DIM`, `DECODER_DEPTH`, `DECODER_NUM_HEADS`
-  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `EMBED_DIM`, `DECODER_ONLY_DEPTH`, `NUM_HEADS`
-- **Configurable model capacity**: All architecture dimensions (embedding, depth, heads) are configurable in `config.py` (defaults: `EMBED_DIM=384`, `NUM_HEADS=6`, `DECODER_ONLY_DEPTH=10`)
+- **Two model architectures** (`MODEL_TYPE` in config, default `"encoder_decoder"`):
+  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `ENCODER_EMBED_DIM`, `ENCODER_DEPTH`, `ENCODER_NUM_HEADS`, `DECODER_EMBED_DIM`, `DECODER_DEPTH`, `DECODER_NUM_HEADS`
+  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `DECODER_EMBED_DIM`, `DECODER_DEPTH`, `DECODER_NUM_HEADS`
+- **Configurable model capacity**: Encoder and decoder dimensions are independently configurable in `config.py` (defaults: encoder `ENCODER_EMBED_DIM=256`, `ENCODER_NUM_HEADS=4`, `ENCODER_DEPTH=5`; decoder `DECODER_EMBED_DIM=128`, `DECODER_NUM_HEADS=4`, `DECODER_DEPTH=5`)
+- **Depth growth**: Checkpoints from shallower models can be loaded into deeper models — new blocks are zero-initialized for identity pass-through, preserving the prediction head's trained input distribution
 - **Weight initialization**: MAE-convention zero-init on prediction head, normal-init (std=0.02) on learnable tokens for stable training at any embed_dim
 - **Full masking**: Both training and eval/inference use full masking (`MASK_RATIO = 1.0`)
 - **Targeted masking**: Next-frame slot is fully masked for inpainting-based prediction
@@ -307,8 +308,10 @@ python staged_training.py --regenerate-report saved/staged_training_reports/{ses
 - **Serial runs** (`--serial-runs`, default): Runs `runs_per_stage` sequentially to reduce peak GPU memory; parallel mode still available
 - **Initial LR sweep** (`initial_sweep_enabled=True`): Runs an upfront LR sweep before each stage regardless of whether plateau sweeps are enabled; disable with `--disable-initial-sweep`
 - **Time budget control**: Optional per-stage time budget for main training
+- **Depth growth support**: Checkpoints from shallower models are automatically loaded into deeper models with zero-init identity blocks; optimizer state mismatches are handled gracefully
 - **Interrupt/crash recovery**: Catches `KeyboardInterrupt` and exceptions, recovers the interrupted stage from auto-saved checkpoints, and generates a partial report with all completed stages
-- **Report regeneration** (`--regenerate-report`): Regenerate final report from saved artifacts (config.yaml, summary.json, metrics.json) after crashes
+- **Progressive saves**: Per-run metrics.json saved immediately after each training run, progressive summary.json updated after each stage — enables report regeneration even from partial/crashed runs
+- **Report regeneration** (`--regenerate-report`): Regenerate final report from saved artifacts — works without summary.json (infers stages from directory names) and without metrics.json (reconstructs from checkpoint files)
 - **Baseline comparison**: Optionally run parallel baseline training (fresh weights each stage) to compare against staged training (weight carryover)
 - **Progressive reporting**: Final report updated after each stage for real-time progress visibility
 - **HTML reports**: Comprehensive reports with training progress, hybrid loss graphs, config diff vs last commit, full training loss timeline, multi-run statistics, LR sweep results (including plateau sweep history), staged vs baseline comparison, and inference visualizations

@@ -83,18 +83,18 @@ class AutoencoderConcatPredictorWorldModel:
                 img_height=canvas_height,
                 img_width=canvas_width,
                 patch_size=Config.PATCH_SIZE,
-                embed_dim=Config.EMBED_DIM,
-                depth=Config.DECODER_ONLY_DEPTH,
-                num_heads=Config.NUM_HEADS,
+                embed_dim=Config.DECODER_EMBED_DIM,
+                depth=Config.DECODER_DEPTH,
+                num_heads=Config.DECODER_NUM_HEADS,
             ).to(self.device)
         else:
             self.autoencoder = TargetedMAEWrapper(
                 img_height=canvas_height,
                 img_width=canvas_width,
                 patch_size=Config.PATCH_SIZE,
-                embed_dim=Config.EMBED_DIM,
+                embed_dim=Config.ENCODER_EMBED_DIM,
                 depth=Config.ENCODER_DEPTH,
-                num_heads=Config.NUM_HEADS,
+                num_heads=Config.ENCODER_NUM_HEADS,
                 decoder_embed_dim=Config.DECODER_EMBED_DIM,
                 decoder_depth=Config.DECODER_DEPTH,
                 decoder_num_heads=Config.DECODER_NUM_HEADS,

@@ -7,6 +7,7 @@ Provides shared functionality for model training, history management, and tensor
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 
 def to_model_tensor(frame_np, device):
@@ -200,3 +201,108 @@ def maintain_history_window(history_list, max_size):
     if len(history_list) > max_size:
         return history_list[-max_size:]
     return history_list
+
+
+def _detect_block_depth(state_dict, prefix):
+    """Detect the number of transformer blocks in a state dict by prefix (e.g. 'blocks')."""
+    indices = set()
+    for key in state_dict:
+        if key.startswith(prefix + '.'):
+            parts = key[len(prefix) + 1:].split('.', 1)
+            if parts[0].isdigit():
+                indices.add(int(parts[0]))
+    return max(indices) + 1 if indices else 0
+
+
+def _zero_init_block_residual(block):
+    """Zero-initialize output projections so the block acts as identity via residual."""
+    nn.init.zeros_(block.attn.proj.weight)
+    nn.init.zeros_(block.attn.proj.bias)
+    nn.init.zeros_(block.mlp.fc2.weight)
+    nn.init.zeros_(block.mlp.fc2.bias)
+
+
+def load_state_dict_with_depth_growth(model, state_dict, zero_init_new_blocks=True):
+    """
+    Load a state dict into a model that may have a different depth (number of layers).
+
+    Matching block weights (by index) are loaded. Extra blocks in the model
+    get zero-init residual paths so they approximate identity initially,
+    preserving the prediction head's trained input distribution.
+
+    Works for both decoder-only (single 'blocks' stack) and encoder-decoder
+    (separate 'blocks' encoder + 'decoder_blocks' decoder).
+
+    Args:
+        model: The target model (DecoderOnlyViT or MaskedAutoencoderViT)
+        state_dict: The saved state dict to load from
+        zero_init_new_blocks: If True, zero-init residual paths of new blocks
+
+    Returns:
+        dict with depth growth info:
+            'depth_changed': bool, whether any depth mismatch was detected
+            'blocks_saved': int, saved encoder/main block count
+            'blocks_current': int, current encoder/main block count
+            'decoder_blocks_saved': int, saved decoder block count (encoder-decoder only)
+            'decoder_blocks_current': int, current decoder block count (encoder-decoder only)
+            'loaded_keys': int, number of keys loaded
+            'skipped_keys': list of str, keys that couldn't be loaded
+    """
+    model_state = model.state_dict()
+
+    saved_blocks_depth = _detect_block_depth(state_dict, 'blocks')
+    current_blocks_depth = len(model.blocks)
+
+    # For decoder-only, decoder_blocks is an alias for blocks, so state dict
+    # has duplicate keys under both prefixes pointing to the same parameters.
+    # Detect true encoder-decoder by checking if decoder_blocks is a separate module.
+    has_separate_decoder = (
+        hasattr(model, 'decoder_blocks')
+        and model.decoder_blocks is not model.blocks
+    )
+
+    saved_decoder_depth = 0
+    current_decoder_depth = 0
+    if has_separate_decoder:
+        saved_decoder_depth = _detect_block_depth(state_dict, 'decoder_blocks')
+        current_decoder_depth = len(model.decoder_blocks)
+
+    # Build filtered state dict: only include keys present in model with matching shape
+    filtered = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key in model_state:
+            if model_state[key].shape == value.shape:
+                filtered[key] = value
+            else:
+                skipped.append(f"{key}: shape {value.shape} -> {model_state[key].shape}")
+        else:
+            skipped.append(key)
+
+    # Load matching weights
+    model.load_state_dict(filtered, strict=False)
+
+    # Zero-init residual paths for new main/encoder blocks
+    if zero_init_new_blocks and current_blocks_depth > saved_blocks_depth:
+        for i in range(saved_blocks_depth, current_blocks_depth):
+            _zero_init_block_residual(model.blocks[i])
+
+    # Zero-init residual paths for new decoder blocks (encoder-decoder only)
+    if zero_init_new_blocks and has_separate_decoder and current_decoder_depth > saved_decoder_depth:
+        for i in range(saved_decoder_depth, current_decoder_depth):
+            _zero_init_block_residual(model.decoder_blocks[i])
+
+    depth_changed = (
+        current_blocks_depth != saved_blocks_depth
+        or (has_separate_decoder and current_decoder_depth != saved_decoder_depth)
+    )
+
+    return {
+        'depth_changed': depth_changed,
+        'blocks_saved': saved_blocks_depth,
+        'blocks_current': current_blocks_depth,
+        'decoder_blocks_saved': saved_decoder_depth,
+        'decoder_blocks_current': current_decoder_depth,
+        'loaded_keys': len(filtered),
+        'skipped_keys': skipped,
+    }

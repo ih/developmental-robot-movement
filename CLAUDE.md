@@ -105,7 +105,7 @@ This repository contains research code for developmental robot movement with a c
   - `inference.py`: Single-frame inference without training
   - `evaluation.py`: Full-session evaluation with comprehensive statistics
   - `training.py`: Batch training with 4-phase performance optimizations
-  - `checkpoint_manager.py`: Model checkpoint save/load with metadata
+  - `checkpoint_manager.py`: Model checkpoint save/load with metadata and depth-growth-aware loading
   - `attention.py`: Decoder attention visualization with multiple modes
   - `visualization.py`: Plotting and display utilities
   - `utils.py`: Shared helper functions
@@ -157,9 +157,10 @@ This repository contains research code for developmental robot movement with a c
   - **File structure**: `saved/training_logs/{session}/run_{timestamp}/` with config, summaries, and raw metrics
 
 ### Neural Vision System
-- **Two model architectures** (`MODEL_TYPE` in config, default `"decoder_only"`):
-  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `EMBED_DIM` (384), `ENCODER_DEPTH` (5), `NUM_HEADS` (6), `DECODER_EMBED_DIM` (384), `DECODER_DEPTH` (8), `DECODER_NUM_HEADS` (6)
-  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `EMBED_DIM` (384), `DECODER_ONLY_DEPTH` (10), `NUM_HEADS` (6)
+- **Two model architectures** (`MODEL_TYPE` in config, default `"encoder_decoder"`):
+  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `ENCODER_EMBED_DIM` (256), `ENCODER_DEPTH` (5), `ENCODER_NUM_HEADS` (4), `DECODER_EMBED_DIM` (128), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (4)
+  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `DECODER_EMBED_DIM` (128), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (4)
+- **Depth growth**: `load_state_dict_with_depth_growth()` in `world_model_utils.py` loads checkpoints from shallower models into deeper models — new blocks are zero-initialized (identity pass-through via residual) to preserve the prediction head's trained input distribution
 - **Weight initialization**: MAE-convention `_init_weights()` on both architectures: zero-init prediction head (stable for any embed_dim), normal-init (std=0.02) for cls_token and mask_token
 - **TargetedTrainingMixin**: Shared `train_on_canvas()` method extracted into mixin, inherited by both `TargetedMAEWrapper` (encoder-decoder) and `TargetedDecoderOnlyWrapper` (decoder-only)
 - **Full masking for training**: `TRAIN_MASK_RATIO_MIN` (1.0) and `TRAIN_MASK_RATIO_MAX` (1.0) for both training and eval/inference
@@ -417,6 +418,8 @@ python staged_training.py --root-session saved/sessions/so101/my_session --seed 
 - **Serial runs** (`--serial-runs`, default): Runs `runs_per_stage` sequentially to reduce peak GPU memory; parallel mode still available
 - **Initial LR sweep** (`initial_sweep_enabled=True`): Runs an upfront LR sweep before each stage regardless of whether plateau sweeps are enabled; disable with `--disable-initial-sweep`
 - **Time budget control**: Optional per-stage time budget for main training
+- **Depth growth support**: Checkpoints from shallower models are loaded into deeper models via `load_state_dict_with_depth_growth()` — new blocks get zero-init residual (identity pass-through); optimizer state mismatches are handled gracefully
+- **Progressive saves**: `save_run_metrics()` saves per-run metrics.json immediately after each training run; `save_progressive_summary()` updates summary.json after each stage for crash resilience
 - **Interrupt/crash recovery**: Catches `KeyboardInterrupt` and exceptions, recovers the interrupted stage from auto-saved checkpoints on disk, and generates a partial report with all completed stages
 - **HTML reports**: Generates comprehensive reports with training progress, inference visualizations, staged vs baseline comparison, LR sweep results (including plateau sweep history), config diff vs last commit, full training loss timeline, multi-run statistics, and evaluation metrics
 - **Progressive reporting**: Final report is updated after each stage for real-time progress visibility
@@ -495,7 +498,7 @@ Required Python packages:
   - `utils.py`: Shared helper functions
   - `training_logger.py`: Multi-tier training diagnostics logger with automatic summarization
 - `config.py`: Shared configuration, image transforms, robot-specific directories, and world model parameters
-- `world_model_utils.py`: Utility functions for training and tensor operations
+- `world_model_utils.py`: Utility functions for training, tensor operations, and depth-growth-aware checkpoint loading (`load_state_dict_with_depth_growth()`)
 - `analyze_training_logs.py`: Standalone tool for analyzing ongoing or completed training runs with batch composition, loss trajectory, and gradient diagnostics
 
 ### Staged Training
@@ -509,7 +512,12 @@ Required Python packages:
   - Direct session mode: train on specific train/val sessions without staged splits
   - Single stage mode: run only a specific stage from staged splits
   - Starting checkpoint support for resuming training
-  - `--regenerate-report`: Regenerate final report from saved artifacts (config.yaml, summary.json, per-run metrics.json)
+  - `--regenerate-report`: Regenerate final report from saved artifacts — works without summary.json (infers stages from directory names) and without metrics.json (reconstructs from checkpoint files)
+  - `save_run_metrics()`: Saves per-run metrics.json immediately after training completes
+  - `save_progressive_summary()`: Updates summary.json after each stage for crash resilience
+  - `_discover_stages_from_directories()`: Infers stage structure from directory names when summary.json is missing
+  - `_reconstruct_run_from_checkpoints()`: Reconstructs StageResult from checkpoint files when metrics.json is missing
+  - Depth-growth-aware checkpoint loading via `world_model_utils.load_state_dict_with_depth_growth()`
   - Sweep trial checkpoint cleanup: deletes trial checkpoints after sweep, keeps only the winner
 - `staged_training_config.py`: Dataclass configuration for staged training runs
   - All parameters match Gradio app defaults
