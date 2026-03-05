@@ -157,12 +157,24 @@ This repository contains research code for developmental robot movement with a c
   - **File structure**: `saved/training_logs/{session}/run_{timestamp}/` with config, summaries, and raw metrics
 
 ### Neural Vision System
-- **Two model architectures** (`MODEL_TYPE` in config, default `"encoder_decoder"`):
+- **Three model architectures** (`MODEL_TYPE` in config):
   - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `ENCODER_EMBED_DIM` (256), `ENCODER_DEPTH` (5), `ENCODER_NUM_HEADS` (4), `DECODER_EMBED_DIM` (128), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (4)
   - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `DECODER_EMBED_DIM` (128), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (4)
-- **Depth growth**: `load_state_dict_with_depth_growth()` in `world_model_utils.py` loads checkpoints from shallower models into deeper models — new blocks are zero-initialized (identity pass-through via residual) to preserve the prediction head's trained input distribution
-- **Weight initialization**: MAE-convention `_init_weights()` on both architectures: zero-init prediction head (stable for any embed_dim), normal-init (std=0.02) for cls_token and mask_token
-- **TargetedTrainingMixin**: Shared `train_on_canvas()` method extracted into mixin, inherited by both `TargetedMAEWrapper` (encoder-decoder) and `TargetedDecoderOnlyWrapper` (decoder-only)
+  - **Latent diffusion / DiT** (`"dit"`): DiffusionViT operating in VAE latent space with adaLN-Zero timestep conditioning, configurable via `DIT_EMBED_DIM` (256), `DIT_DEPTH` (12), `DIT_NUM_HEADS` (4), `DIT_LATENT_PATCH_SIZE` (2)
+- **VAE/encoder backends** (for DiT model type, `VAE_TYPE` in config):
+  - **Custom CanvasVAE** (`"custom"`): Trainable CNN encoder-decoder, configurable latent channels (`VAE_LATENT_CHANNELS=4`) and compression (`VAE_COMPRESSION_FACTOR=8`), supports VAE (KL) or RAE (L2) modes
+  - **Pretrained SD VAE** (`"pretrained_sd"`): Stable Diffusion AutoencoderKL (4-channel latent, 8x compression), frozen encoder+decoder
+  - **Pretrained FLUX VAE** (`"pretrained_flux"`): FLUX AutoencoderKL (16-channel latent, 8x compression), frozen encoder+decoder
+  - **DINOv2 encoder** (`"dinov2"`): Frozen DINOv2 ViT encoder with trainable CNN decoder (768-channel features, 14x compression), auto-adjusts `SEPARATOR_WIDTH=14` for divisibility
+  - Train custom VAEs with `train_vae.py`, compare DiT backends with `run_dit_comparison.py`
+- **Diffusion training modes** (`DIT_TRAINING_MODE`):
+  - **Conditional** (`"conditional"`): Noise added only to masked latent patches; unmasked patches passed clean as conditioning context. Mask token used for masked patches.
+  - **Unconditional** (`"unconditional"`): Noise added to all latent patches; at inference uses RePaint-style harmonization (replace unmasked patches with known values at each denoising step). No mask token needed.
+- **Diffusion schedule**: `DIT_NUM_TRAIN_TIMESTEPS=1000`, `DIT_NUM_INFERENCE_STEPS=50` (DDIM), `DIT_BETA_START=0.0001`, `DIT_BETA_END=0.02`, `DIT_BETA_SCHEDULE="linear"` (or `"cosine"`)
+- **LatentDiffusionWrapper** (`models/latent_diffusion.py`): Wraps frozen VAE + trainable DiT, implements `train_on_canvas()` (diffusion loss on masked latent patches) and `forward_with_patch_mask()` (iterative DDIM denoising with RePaint inpainting). Maps pixel-space patch masks to latent-space masks accounting for VAE compression factor.
+- **Depth growth**: `load_state_dict_with_depth_growth()` in `world_model_utils.py` loads checkpoints from shallower models into deeper models — new blocks are zero-initialized (identity pass-through via residual) to preserve the prediction head's trained input distribution. Works for all three architectures including DiT (handles adaLN_modulation parameters).
+- **Weight initialization**: MAE-convention `_init_weights()` on all architectures: zero-init prediction head (stable for any embed_dim), normal-init (std=0.02) for cls_token and mask_token
+- **TargetedTrainingMixin**: Shared `train_on_canvas()` method extracted into mixin, inherited by both `TargetedMAEWrapper` (encoder-decoder) and `TargetedDecoderOnlyWrapper` (decoder-only). LatentDiffusionWrapper implements its own `train_on_canvas()` for diffusion loss.
 - **Full masking for training**: `TRAIN_MASK_RATIO_MIN` (1.0) and `TRAIN_MASK_RATIO_MAX` (1.0) for both training and eval/inference
 - **Targeted masking for prediction**: Full masking (MASK_RATIO = 1.0) of next-frame slot for inpainting-based prediction
 - **MAE-native optimization**: Trains only on masked patches for efficient learning
@@ -185,7 +197,7 @@ This repository contains research code for developmental robot movement with a c
 
 ### Configuration
 - **config.py**: Contains image transforms, constants, and world model parameters
-- **AutoencoderConcatPredictorWorldModelConfig class**: Configuration for canvas-based world model (frame size, separator width, canvas history size, reconstruction threshold, optimizer parameters)
+- **AutoencoderConcatPredictorWorldModelConfig class**: Configuration for canvas-based world model (frame size, separator width, canvas history size, reconstruction threshold, optimizer parameters, model architecture selection, VAE/DiT parameters, diffusion schedule)
 - **Robot-specific directories**:
   - `JETBOT_CHECKPOINT_DIR = saved/checkpoints/jetbot/` - JetBot model checkpoints
   - `TOROIDAL_DOT_CHECKPOINT_DIR = saved/checkpoints/toroidal_dot/` - Toroidal dot model checkpoints
@@ -395,6 +407,12 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 
 # Reproducible training with fixed seed
 python staged_training.py --root-session saved/sessions/so101/my_session --seed 42
+
+# Train with DiT (latent diffusion) model using Stable Diffusion VAE
+python staged_training.py --root-session saved/sessions/so101/my_session --model-type dit --vae-type pretrained_sd
+
+# Limit parallel workers for LR sweeps
+python staged_training.py --root-session saved/sessions/so101/my_session --max-workers 2
 ```
 
 **Features:**
@@ -439,6 +457,9 @@ python staged_training.py --root-session saved/sessions/so101/my_session --seed 
 - `serial_runs` (default True): run multiple runs per stage serially instead of in parallel
 - `initial_sweep_enabled` (default True): run upfront LR sweep before each stage (orthogonal to `plateau_sweep.enabled`)
 - `seed` (default None): base random seed for reproducibility; None = non-deterministic
+- **Model/DiT fields** (None = use config.py defaults): `model_type`, `vae_type`, `vae_checkpoint`, `dit_embed_dim`, `dit_depth`, `dit_num_heads`, `dit_prediction_type`, `dit_num_train_timesteps`, `dit_num_inference_steps`, `dit_beta_schedule`
+- `max_workers` (None = auto): maximum parallel workers for LR sweeps
+- `apply_model_config(cfg)`: propagates model/VAE config from StagedTrainingConfig to global Config class; called in main process and in LR sweep workers (Windows workers start with fresh imports)
 - Supports YAML config files for reproducible experiments
 - **Deprecated fields**: `val_plateau_patience`, `val_plateau_min_delta`, `plateau_factor`, `plateau_patience` (replaced by plateau_sweep when enabled)
 
@@ -474,6 +495,7 @@ Required Python packages:
 - opencv-python (computer vision)
 - numpy, matplotlib (data processing and visualization)
 - torch, torchvision, timm (neural networks and vision transformers)
+- diffusers (pretrained VAE backends for DiT model, optional)
 - PIL (image processing)
 - ipywidgets, IPython (notebook compatibility)
 - tqdm (progress bars)
@@ -519,12 +541,16 @@ Required Python packages:
   - `_reconstruct_run_from_checkpoints()`: Reconstructs StageResult from checkpoint files when metrics.json is missing
   - Depth-growth-aware checkpoint loading via `world_model_utils.load_state_dict_with_depth_growth()`
   - Sweep trial checkpoint cleanup: deletes trial checkpoints after sweep, keeps only the winner
+  - `apply_model_config(cfg)`: Propagates model/VAE config from StagedTrainingConfig to global Config before session loading; called in main process and in LR sweep worker processes (needed because Windows workers start with fresh imports)
+  - CLI flags: `--model-type`, `--vae-type`, `--max-workers` for DiT experiments
 - `staged_training_config.py`: Dataclass configuration for staged training runs
   - All parameters match Gradio app defaults
   - `PlateauSweepConfig`: Plateau-triggered LR sweep configuration (enabled by default)
   - `LRSweepConfig`: Legacy upfront LR sweep configuration
   - Baseline config: `enable_baseline`, `baseline_runs_per_stage`
   - Reproducibility: `seed` field for deterministic training across all runs and workers
+  - Model/DiT fields (all Optional, None = use config.py defaults): `model_type`, `vae_type`, `vae_checkpoint`, `dit_embed_dim`, `dit_depth`, `dit_num_heads`, `dit_prediction_type`, `dit_num_train_timesteps`, `dit_num_inference_steps`, `dit_beta_schedule`
+  - `max_workers` (None = auto): controls parallel workers for LR sweeps
   - YAML serialization support for reproducible experiments
 - `lr_sweep.py`: Time-budgeted learning rate optimization module
   - Two-phase search: Phase A (broad exploration) and Phase B (deep validation)
@@ -569,6 +595,10 @@ Required Python packages:
 - `models/base_autoencoder.py`: Base class for autoencoder implementations
 - `models/vit_autoencoder.py`: MaskedAutoencoderViT with encoder-decoder transformer architecture
 - `models/vit_decoder_only.py`: DecoderOnlyViT with GPT-style single transformer stack (no separate encoder)
+- `models/vit_dit.py`: DiffusionViT with adaLN-Zero timestep conditioning for latent-space diffusion; supports conditional (mask_token inpainting) and unconditional (RePaint inference) modes
+- `models/noise_scheduler.py`: DDPM/DDIM noise schedule with precomputed alpha schedules, `add_noise()` for forward diffusion, and `step()` for DDIM denoising
+- `models/vae.py`: VAE/encoder backends factory with unified encode/decode interface: `CanvasVAE` (custom trainable CNN), `PretrainedSDVAE` (Stable Diffusion 4ch/8x), `PretrainedFluxVAE` (FLUX 16ch/8x), `DINOv2Encoder` (frozen ViT + trainable decoder, 14x); `create_vae()` factory function
+- `models/latent_diffusion.py`: `LatentDiffusionWrapper` combining frozen VAE + trainable DiT; implements `train_on_canvas()` for diffusion loss on masked latent patches and `forward_with_patch_mask()` for iterative DDIM denoising with RePaint-style inpainting; maps pixel-space patch masks to latent-space masks
 - `models/autoencoder_concat_predictor.py`: Canvas building utilities, `TargetedTrainingMixin`, `TargetedMAEWrapper`, `TargetedDecoderOnlyWrapper`, and GPU-accelerated mask generation
 - `models/canvas_dataset.py`: PyTorch Dataset and DataLoader utilities for high-performance batch training with pinned memory and CUDA streams
 - `models/perceptual_loss.py`: VGG16 perceptual loss module for sharper predictions (optional, controlled by `PERCEPTUAL_LOSS_WEIGHT`)
@@ -595,6 +625,9 @@ Required Python packages:
 
 ### Testing and Development
 - `test_concat_world_model.py`: Test script for AutoencoderConcatPredictorWorldModel
+- `test_dit.py`: Comprehensive tests for DiT stack (DiffusionViT, NoiseScheduler, VAE backends, LatentDiffusionWrapper, conditional/unconditional modes, checkpoint save/load)
+- `train_vae.py`: Standalone VAE training script for custom CanvasVAE or DINOv2 decoder on pre-built canvases; saves best checkpoint with metadata (latent channels, compression factor, canvas size)
+- `run_dit_comparison.py`: Benchmark script comparing DiT with different VAE backends (SD, FLUX) via sequential staged training runs
 - `test_jetbot_actions.ipynb`: Jupyter notebook for interactive JetBot action space testing
 - `test_toroidal_dot_actions.ipynb`: Jupyter notebook for interactive toroidal dot environment testing
 

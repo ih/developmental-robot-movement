@@ -19,6 +19,7 @@ from models.autoencoder_concat_predictor import (
     compute_patch_mask_for_last_slot,
     compute_randomized_patch_mask_for_last_slot,
 )
+from models.latent_diffusion import LatentDiffusionWrapper
 from config import AutoencoderConcatPredictorWorldModelConfig as Config
 import world_model_utils
 
@@ -78,7 +79,70 @@ class AutoencoderConcatPredictorWorldModel:
         canvas_height = frame_height
         canvas_width = Config.CANVAS_HISTORY_SIZE * frame_width + (Config.CANVAS_HISTORY_SIZE - 1) * Config.SEPARATOR_WIDTH
 
-        if Config.MODEL_TYPE == "decoder_only":
+        if Config.MODEL_TYPE == "dit":
+            from models.vit_dit import DiffusionViT
+            from models.noise_scheduler import NoiseScheduler
+            from models.vae import create_vae
+
+            # Create noise scheduler
+            noise_scheduler = NoiseScheduler(
+                num_train_timesteps=Config.DIT_NUM_TRAIN_TIMESTEPS,
+                beta_start=Config.DIT_BETA_START,
+                beta_end=Config.DIT_BETA_END,
+                beta_schedule=Config.DIT_BETA_SCHEDULE,
+                prediction_type=Config.DIT_PREDICTION_TYPE,
+            )
+
+            # Create or load VAE
+            vae_kwargs = {}
+            if Config.VAE_TYPE == "custom":
+                vae_kwargs = {
+                    'latent_channels': Config.VAE_LATENT_CHANNELS,
+                    'compression_factor': Config.VAE_COMPRESSION_FACTOR,
+                    'mode': Config.VAE_MODE,
+                }
+            elif Config.VAE_TYPE == "dinov2":
+                vae_kwargs = {
+                    'variant': Config.DINOV2_VARIANT,
+                    'target_h': canvas_height,
+                    'target_w': canvas_width,
+                }
+
+            vae = create_vae(
+                vae_type=Config.VAE_TYPE,
+                checkpoint_path=Config.VAE_CHECKPOINT,
+                device=str(self.device),
+                **vae_kwargs,
+            )
+
+            # Determine latent dimensions
+            latent_channels = vae.latent_channels
+            cf = vae.compression_factor
+            latent_h = canvas_height // cf
+            latent_w = canvas_width // cf
+
+            # Create DiT
+            dit = DiffusionViT(
+                img_height=latent_h,
+                img_width=latent_w,
+                in_channels=latent_channels,
+                patch_size=Config.DIT_LATENT_PATCH_SIZE,
+                embed_dim=Config.DIT_EMBED_DIM,
+                depth=Config.DIT_DEPTH,
+                num_heads=Config.DIT_NUM_HEADS,
+                prediction_type=Config.DIT_PREDICTION_TYPE,
+            ).to(self.device)
+
+            # Wrap in LatentDiffusionWrapper
+            self.autoencoder = LatentDiffusionWrapper(
+                vae=vae,
+                dit=dit,
+                noise_scheduler=noise_scheduler,
+                num_inference_steps=Config.DIT_NUM_INFERENCE_STEPS,
+                training_mode=Config.DIT_TRAINING_MODE,
+            ).to(self.device)
+
+        elif Config.MODEL_TYPE == "decoder_only":
             self.autoencoder = TargetedDecoderOnlyWrapper(
                 img_height=canvas_height,
                 img_width=canvas_width,
@@ -210,8 +274,9 @@ class AutoencoderConcatPredictorWorldModel:
         canvas_overlay = canvas.copy().astype(np.float32)
 
         # Get canvas dimensions and patch size
+        # Always use pixel patch size (16) since patch_mask is in pixel-patch space
         canvas_height, canvas_width = canvas.shape[:2]
-        patch_size = int(getattr(self.autoencoder, "patch_size", 16))
+        patch_size = 16
         num_patches_height = canvas_height // patch_size
         num_patches_width = canvas_width // patch_size
 
@@ -290,9 +355,9 @@ class AutoencoderConcatPredictorWorldModel:
             img_pred = self.autoencoder.unpatchify(pred_patches)  # [1, 3, H, W]
 
         # Create composite: original pixels where mask=False, predictions where mask=True
-        # Get canvas dimensions and patch size
+        # Always use pixel patch size (16) since patch_mask is in pixel-patch space
         _, _, canvas_height, canvas_width = canvas_tensor.shape
-        patch_size = int(getattr(self.autoencoder, "patch_size", 16))
+        patch_size = 16
         num_patches_height = canvas_height // patch_size
         num_patches_width = canvas_width // patch_size
 
@@ -349,8 +414,8 @@ class AutoencoderConcatPredictorWorldModel:
         # Convert to tensor
         canvas_tensor = canvas_to_tensor(prediction_canvas).to(self.device)
 
-        # Get patch size from the autoencoder model (don't hard-code)
-        patch_size = int(getattr(self.autoencoder, "patch_size", 16))
+        # Pixel-space patch size (always 16, independent of model's internal patch size)
+        patch_size = 16
 
         # Compute patch mask for last slot
         num_frames = (len(prediction_canvas_history) + 1) // 2 + 1  # +1 for blank frame

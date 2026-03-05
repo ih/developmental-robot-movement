@@ -139,7 +139,7 @@ def load_model_weights(checkpoint_name):
     # Handle fresh weights option - reinitialize model
     if checkpoint_name == FRESH_WEIGHTS_OPTION:
         try:
-            from models import TargetedMAEWrapper, TargetedDecoderOnlyWrapper
+            from models import TargetedMAEWrapper, TargetedDecoderOnlyWrapper, LatentDiffusionWrapper
 
             # Get current autoencoder dimensions
             old_ae = state.world_model.autoencoder
@@ -148,7 +148,37 @@ def load_model_weights(checkpoint_name):
             embed_dim = old_ae.embed_dim
 
             # Create fresh autoencoder with same architecture as current model
-            if isinstance(old_ae, TargetedDecoderOnlyWrapper):
+            if isinstance(old_ae, LatentDiffusionWrapper):
+                # DiT: recreate DiT with fresh weights, keep VAE frozen
+                from models.vit_dit import DiffusionViT
+                from models.noise_scheduler import NoiseScheduler
+                old_dit = old_ae.dit
+                Config = config.AutoencoderConcatPredictorWorldModelConfig
+                fresh_dit = DiffusionViT(
+                    img_height=old_dit.image_size[0],
+                    img_width=old_dit.image_size[1],
+                    in_channels=old_dit.in_channels,
+                    patch_size=old_dit.patch_size,
+                    embed_dim=old_dit.embed_dim,
+                    depth=len(old_dit.blocks),
+                    num_heads=old_dit.blocks[0].attn.num_heads,
+                    prediction_type=old_dit.prediction_type,
+                ).to(state.device)
+                fresh_scheduler = NoiseScheduler(
+                    num_train_timesteps=Config.DIT_NUM_TRAIN_TIMESTEPS,
+                    beta_start=Config.DIT_BETA_START,
+                    beta_end=Config.DIT_BETA_END,
+                    beta_schedule=Config.DIT_BETA_SCHEDULE,
+                    prediction_type=Config.DIT_PREDICTION_TYPE,
+                )
+                state.world_model.autoencoder = LatentDiffusionWrapper(
+                    vae=old_ae.vae,  # Reuse frozen VAE
+                    dit=fresh_dit,
+                    noise_scheduler=fresh_scheduler,
+                    num_inference_steps=Config.DIT_NUM_INFERENCE_STEPS,
+                    training_mode=Config.DIT_TRAINING_MODE,
+                ).to(state.device)
+            elif isinstance(old_ae, TargetedDecoderOnlyWrapper):
                 depth = len(old_ae.blocks)
                 num_heads = old_ae.blocks[0].attn.num_heads
                 state.world_model.autoencoder = TargetedDecoderOnlyWrapper(

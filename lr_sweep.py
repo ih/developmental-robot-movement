@@ -577,11 +577,15 @@ def run_lr_trial(
     from staged_training import (
         load_session_for_training,
         setup_world_model,
+        apply_model_config,
     )
     from concat_world_model_explorer import state, training
 
     # Reconstruct config with LR override (use from_dict to handle nested LRSweepConfig)
     cfg = StagedTrainingConfig.from_dict(cfg_dict)
+
+    # Propagate model/VAE config to global Config (workers start with fresh imports on Windows)
+    apply_model_config(cfg)
 
     # Set random seeds
     _set_all_seeds(seed, deterministic_cudnn=(cfg.seed is not None))
@@ -631,6 +635,7 @@ def run_lr_trial(
             current_observation_idx=cfg.selected_frame_offset,
             update_interval=cfg.update_interval,
             window_size=cfg.window_size,
+            num_random_obs=0,  # Skip observation canvas visualization in sweep trials
             custom_lr=lr,
             disable_lr_scaling=True,
             custom_warmup=cfg.custom_warmup,
@@ -663,7 +668,9 @@ def run_lr_trial(
             plateau_sweep_enabled=False,
         )
 
+        yield_count = 0
         for result in generator:
+            yield_count += 1
             if result is None:
                 continue
 
@@ -703,6 +710,9 @@ def run_lr_trial(
                     status = "diverged"
                 elif "nan" in status_msg.lower():
                     status = "nan"
+
+        print(f"[LR_TRIAL] Completed: {yield_count} yields, "
+              f"samples={samples_trained}, best_val={best_val_loss:.6f}, best_train={best_train_loss:.6f}")
 
     except Exception as e:
         status = f"error: {str(e)}"
@@ -1349,7 +1359,7 @@ def _run_main_training_worker(args: tuple):
      time_budget_min, seed) = args
 
     # Import here to avoid circular imports
-    from staged_training import run_stage_training, load_session_for_training
+    from staged_training import run_stage_training, load_session_for_training, apply_model_config
     from staged_training_config import StagedTrainingConfig
 
     worker_id = os.getpid()
@@ -1369,6 +1379,9 @@ def _run_main_training_worker(args: tuple):
 
     # Reconstruct config (use from_dict to handle nested LRSweepConfig)
     cfg = StagedTrainingConfig.from_dict(cfg_dict)
+
+    # Propagate model/VAE config to global Config (workers start with fresh imports on Windows)
+    apply_model_config(cfg)
 
     # Set seeds
     _set_all_seeds(seed, deterministic_cudnn=(cfg.seed is not None))

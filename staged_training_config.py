@@ -83,7 +83,7 @@ class PlateauSweepConfig:
     """
 
     # Enable/disable plateau-triggered sweeps
-    enabled: bool = True
+    enabled: bool = False
 
     # Plateau detection parameters
     plateau_ema_alpha: float = 0.85  # EMA smoothing for validation loss (higher = more responsive)
@@ -125,11 +125,11 @@ class StagedTrainingConfig:
     """Configuration for staged training runs."""
 
     # Core training (app defaults)
-    total_samples: int = 10000000  # App default (used when stage_samples_multiplier=0)
+    total_samples: int = 2000  # App default (used when stage_samples_multiplier=0)
     batch_size: int = 8  # Matches config.py BATCH_SIZE
 
     # Dynamic sample budget for staged training
-    stage_samples_multiplier: int = 100000000000  # total_samples = num_valid_frames * multiplier
+    stage_samples_multiplier: int = 10  # total_samples = num_valid_frames * multiplier
                                            # 0 = use fixed total_samples instead
     update_interval: int = 250  # Samples between validation evaluations (triggers checkpointing, divergence/plateau checks)
     window_size: int = 100  # App default
@@ -142,8 +142,8 @@ class StagedTrainingConfig:
 
     # Divergence stopping (app defaults)
     stop_on_divergence: bool = True  # App default
-    divergence_gap: float = 0.002  # App default
-    divergence_ratio: float = 1.5  # App default
+    divergence_gap: float = 0.02  # App default
+    divergence_ratio: float = 2  # App default
     divergence_patience: int = 50  # App default
     divergence_min_updates: int = 10  # App default
     val_spike_threshold: float = 2.0  # App default
@@ -155,7 +155,7 @@ class StagedTrainingConfig:
     val_plateau_min_delta: float = 0.0001  # Minimum improvement to count as "better"
 
     # Learning rate (app defaults)
-    custom_lr: float = 0.0001  # App default (0 = use config default)
+    custom_lr: float = 2e-4  # App default (0 = use config default)
     disable_lr_scaling: bool = True  # App default
     custom_warmup: int = -1  # App default (-1 = scaled default)
     lr_min_ratio: float = 0.001  # App default
@@ -173,7 +173,7 @@ class StagedTrainingConfig:
     selected_frame_offset: int = 3  # App default for frame selection
 
     # Stage settings
-    runs_per_stage: int = 5  # CLI parameter
+    runs_per_stage: int = 1  # CLI parameter
     serial_runs: bool = True  # Run runs_per_stage serially instead of in parallel
     clean_old_checkpoints: bool = True  # Clean old auto-saved checkpoints before starting
 
@@ -203,6 +203,21 @@ class StagedTrainingConfig:
     # Stage-level time budget in minutes (0 = unlimited)
     # Applies to main training only; sweeps use lr_sweep.phase_a/b_time_budget_min
     stage_time_budget_min: float = 180
+
+    # Parallelism
+    max_workers: Optional[int] = None  # Max parallel workers for LR sweeps (None = auto based on GPU memory)
+
+    # --- Model / DiT / Latent Diffusion fields (None = use config.py defaults) ---
+    model_type: Optional[str] = None    # "encoder_decoder", "decoder_only", "dit"
+    vae_type: Optional[str] = None      # "custom", "pretrained_sd", "pretrained_flux", "dinov2"
+    vae_checkpoint: Optional[str] = None  # Path to trained VAE/decoder checkpoint
+    dit_embed_dim: Optional[int] = None
+    dit_depth: Optional[int] = None
+    dit_num_heads: Optional[int] = None
+    dit_prediction_type: Optional[str] = None
+    dit_num_train_timesteps: Optional[int] = None
+    dit_num_inference_steps: Optional[int] = None
+    dit_beta_schedule: Optional[str] = None
 
     def __post_init__(self):
         """Validate configuration and emit deprecation warnings."""

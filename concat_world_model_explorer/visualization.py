@@ -333,33 +333,42 @@ def generate_multiple_observation_canvases(observation_indices):
         canvas_height, canvas_width = canvas_tensor.shape[-2:]
         num_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
 
-        patch_mask = compute_randomized_patch_mask_for_last_slot(
-            img_size=(canvas_height, canvas_width),
-            patch_size=config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
-            num_frame_slots=num_frames,
-            sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
-            mask_ratio_min=config.MASK_RATIO_MIN,
-            mask_ratio_max=config.MASK_RATIO_MAX,
-        ).to(state.device)
+        try:
+            patch_mask = compute_randomized_patch_mask_for_last_slot(
+                img_size=(canvas_height, canvas_width),
+                patch_size=config.AutoencoderConcatPredictorWorldModelConfig.PATCH_SIZE,
+                num_frame_slots=num_frames,
+                sep_width=config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
+                mask_ratio_min=config.MASK_RATIO_MIN,
+                mask_ratio_max=config.MASK_RATIO_MAX,
+            ).to(state.device)
 
-        # Run inference
-        state.world_model.autoencoder.eval()
-        with torch.no_grad():
-            pred_patches, _ = state.world_model.autoencoder.forward_with_patch_mask(
-                canvas_tensor, patch_mask
-            )
+            # Run inference
+            state.world_model.autoencoder.eval()
+            with torch.no_grad():
+                pred_patches, _ = state.world_model.autoencoder.forward_with_patch_mask(
+                    canvas_tensor, patch_mask
+                )
 
-        # Get composite
-        composite = state.world_model.get_canvas_inpainting_composite(training_canvas, patch_mask)
+            # Get composite
+            composite = state.world_model.get_canvas_inpainting_composite(training_canvas, patch_mask)
+        except Exception as vis_err:
+            # DiT/latent diffusion models may not support pixel-space composite visualization
+            composite = None
+            print(f"[VIS WARNING] Could not generate composite for obs {obs_idx}: {vis_err}")
 
         # Plot original canvas
         axes[i, 0].imshow(training_canvas)
         axes[i, 0].set_title(f"Obs {obs_idx}: Original Canvas", fontsize=10, fontweight='bold')
         axes[i, 0].axis('off')
 
-        # Plot composite
-        axes[i, 1].imshow(composite)
-        axes[i, 1].set_title(f"Obs {obs_idx}: Composite", fontsize=10, fontweight='bold')
+        # Plot composite (or placeholder if unavailable)
+        if composite is not None:
+            axes[i, 1].imshow(composite)
+            axes[i, 1].set_title(f"Obs {obs_idx}: Composite", fontsize=10, fontweight='bold')
+        else:
+            axes[i, 1].text(0.5, 0.5, "N/A (latent space model)", ha='center', va='center', fontsize=9)
+            axes[i, 1].set_title(f"Obs {obs_idx}: Composite", fontsize=10, fontweight='bold')
         axes[i, 1].axis('off')
 
     plt.tight_layout()

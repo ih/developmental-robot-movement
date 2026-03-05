@@ -398,6 +398,42 @@ def discover_staged_splits(root_session_path: str) -> list[tuple[int, str, str]]
     return stages
 
 
+def apply_model_config(cfg: StagedTrainingConfig) -> None:
+    """
+    Propagate model/VAE config from StagedTrainingConfig to global Config class.
+
+    Only overrides Config values when the corresponding cfg field is not None,
+    so existing config.py defaults are preserved for unspecified fields.
+    Must be called before load_session_for_training() since canvas building
+    depends on Config.SEPARATOR_WIDTH.
+    """
+    WMConfig = config.AutoencoderConcatPredictorWorldModelConfig
+    if cfg.model_type is not None:
+        WMConfig.MODEL_TYPE = cfg.model_type
+    if cfg.vae_type is not None:
+        WMConfig.VAE_TYPE = cfg.vae_type
+    if cfg.vae_checkpoint is not None:
+        WMConfig.VAE_CHECKPOINT = cfg.vae_checkpoint
+    if cfg.dit_embed_dim is not None:
+        WMConfig.DIT_EMBED_DIM = cfg.dit_embed_dim
+    if cfg.dit_depth is not None:
+        WMConfig.DIT_DEPTH = cfg.dit_depth
+    if cfg.dit_num_heads is not None:
+        WMConfig.DIT_NUM_HEADS = cfg.dit_num_heads
+    if cfg.dit_prediction_type is not None:
+        WMConfig.DIT_PREDICTION_TYPE = cfg.dit_prediction_type
+    if cfg.dit_num_train_timesteps is not None:
+        WMConfig.DIT_NUM_TRAIN_TIMESTEPS = cfg.dit_num_train_timesteps
+    if cfg.dit_num_inference_steps is not None:
+        WMConfig.DIT_NUM_INFERENCE_STEPS = cfg.dit_num_inference_steps
+    if cfg.dit_beta_schedule is not None:
+        WMConfig.DIT_BETA_SCHEDULE = cfg.dit_beta_schedule
+
+    # Auto-adjust separator width for DINOv2 (14x compression requires divisible-by-14 canvas)
+    if WMConfig.MODEL_TYPE == "dit" and WMConfig.VAE_TYPE == "dinov2":
+        WMConfig.SEPARATOR_WIDTH = 14
+
+
 def load_session_for_training(session_path: str) -> dict:
     """
     Load a session and pre-build all canvases for training.
@@ -756,6 +792,7 @@ def run_stage_training(
                         cfg_dict=cfg.to_dict(),
                         output_dir=output_dir,
                         run_id=run_id,
+                        max_workers=cfg.max_workers,
                     )
                     sweep_elapsed = time.time() - sweep_start_time
 
@@ -2745,9 +2782,15 @@ def run_staged_training(
         original_session_path: Path to original session for evaluation (optional)
         starting_checkpoint: Path to starting checkpoint (optional)
     """
+    # Propagate model/VAE config to global Config before any session loading
+    apply_model_config(cfg)
+
     # Set instance_id for checkpoint naming (prevents collisions with concurrent runs)
     state.instance_id = run_id
     print(f"Run ID: {run_id}")
+    if cfg.model_type is not None or cfg.vae_type is not None:
+        WMConfig = config.AutoencoderConcatPredictorWorldModelConfig
+        print(f"Model: {WMConfig.MODEL_TYPE}, VAE: {WMConfig.VAE_TYPE}")
     if cfg.seed is not None:
         print(f"Reproducibility seed: {cfg.seed}")
 
@@ -2878,9 +2921,18 @@ def run_staged_training(
         sweep_result = None
         sweep_elapsed = 0.0
 
-        if not cfg.plateau_sweep.enabled or cfg.initial_sweep_enabled:
+        if cfg.initial_sweep_enabled:
             sweep_start = time.time()
             print(f"\n--- LR Sweep for Stage {stage_num} ---")
+
+            # Free main process model to give GPU memory to sweep workers
+            if state.world_model is not None:
+                print("Freeing main process model for sweep...")
+                del state.world_model
+                state.world_model = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Allocate time budget for sweep if stage has total budget
             sweep_budget = 0  # Unlimited by default
@@ -2907,6 +2959,7 @@ def run_staged_training(
                 ranking_metric=cfg.lr_sweep.ranking_metric,
                 save_state=cfg.lr_sweep.save_sweep_state,
                 time_budget_min=sweep_budget,
+                max_workers=cfg.max_workers,
             )
 
             selected_lr = sweep_result.selected_lr
@@ -2950,6 +3003,7 @@ def run_staged_training(
                 run_id=run_id,
                 is_baseline=False,
                 time_budget_min=per_run_budget,
+                max_workers=cfg.max_workers,
             )
             for result in stage_results:
                 save_run_metrics(result, output_path / f"stage{stage_num}_run{result.run_num}")
@@ -3134,6 +3188,7 @@ def run_staged_training(
                     ranking_metric=cfg.lr_sweep.ranking_metric,
                     save_state=cfg.lr_sweep.save_sweep_state,
                     time_budget_min=sweep_budget,
+                    max_workers=cfg.max_workers,
                 )
 
                 baseline_selected_lr = baseline_sweep_result.selected_lr
@@ -3176,6 +3231,7 @@ def run_staged_training(
                     run_id=run_id,
                     is_baseline=True,
                     time_budget_min=baseline_per_run_budget,
+                    max_workers=cfg.max_workers,
                 )
                 for result in baseline_stage_results:
                     save_run_metrics(result, output_path / f"stage{stage_num}_baseline_run{result.run_num}")
@@ -3663,6 +3719,21 @@ def main():
         "--regenerate-report",
         help="Regenerate final report from a completed run's output directory",
     )
+    # Model architecture arguments
+    parser.add_argument(
+        "--model-type",
+        choices=["encoder_decoder", "decoder_only", "dit"],
+        help="Model architecture type (default: from config.py)",
+    )
+    parser.add_argument(
+        "--vae-type",
+        choices=["custom", "pretrained_sd", "pretrained_flux", "dinov2"],
+        help="VAE/encoder backend for DiT model type (default: from config.py)",
+    )
+    parser.add_argument(
+        "--max-workers", type=int, default=None,
+        help="Max parallel workers for LR sweeps (default: auto based on GPU memory)",
+    )
 
     args = parser.parse_args()
 
@@ -3738,6 +3809,13 @@ def main():
         cfg.enable_baseline = False
     if args.seed is not None:
         cfg.seed = args.seed
+    # Model architecture overrides
+    if args.model_type:
+        cfg.model_type = args.model_type
+    if args.vae_type:
+        cfg.vae_type = args.vae_type
+    if args.max_workers is not None:
+        cfg.max_workers = args.max_workers
 
     # Determine output directory (include run_id to prevent conflicts between concurrent runs)
     if args.output_dir:

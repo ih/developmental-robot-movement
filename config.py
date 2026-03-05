@@ -56,7 +56,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
 
     # Model architecture
-    MODEL_TYPE = "encoder_decoder" # "encoder_decoder" (MAE) or "decoder_only" (GPT-style single stack)
+    MODEL_TYPE = "dit" # "encoder_decoder" (MAE), "decoder_only" (GPT-style), or "dit" (latent diffusion)
     PATCH_SIZE = 16                # Size of patches for Vision Transformer (WARNING: changing requires retraining)
     BATCH_SIZE = 1                 # Training batch size (1=online learning, >1=mini-batch)
 
@@ -82,6 +82,29 @@ class AutoencoderConcatPredictorWorldModelConfig:
 
     # Perceptual loss (VGG feature space loss for sharper predictions)
     PERCEPTUAL_LOSS_WEIGHT = 0    # Weight for perceptual loss (0.0 = disabled, no VGG loaded)
+
+    # --- VAE/Encoder configuration (used when MODEL_TYPE == "dit") ---
+    VAE_TYPE = "pretrained_sd"               # "custom", "pretrained_sd", "pretrained_flux", "dinov2"
+    VAE_CHECKPOINT = None             # Path to trained VAE/decoder checkpoint (None = download pretrained)
+    VAE_LATENT_CHANNELS = 4           # Latent channels (auto-set for pretrained: SD=4, FLUX=16, DINOv2=768)
+    VAE_COMPRESSION_FACTOR = 8        # Spatial downsampling (auto-set for pretrained: SD/FLUX=8, DINOv2=14)
+    VAE_MODE = "vae"                  # "vae" (KL divergence) or "rae" (L2 regularization) - custom only
+    DINOV2_VARIANT = "vitb14"         # DINOv2 model variant: vits14, vitb14, vitl14, vitg14
+
+    # --- DiT architecture (used when MODEL_TYPE == "dit") ---
+    DIT_EMBED_DIM = 256               # Token embedding dimension
+    DIT_DEPTH = 12                    # Number of DiT blocks
+    DIT_NUM_HEADS = 4                 # Number of attention heads
+    DIT_LATENT_PATCH_SIZE = 2         # Patch size in latent space
+    DIT_PREDICTION_TYPE = "epsilon"   # "epsilon" (predict noise) or "sample" (predict clean)
+    DIT_TRAINING_MODE = "conditional" # "conditional" (noise on masked patches only) or "unconditional" (noise on all, RePaint inference)
+
+    # --- Diffusion schedule (used when MODEL_TYPE == "dit") ---
+    DIT_NUM_TRAIN_TIMESTEPS = 1000    # Number of diffusion timesteps during training
+    DIT_NUM_INFERENCE_STEPS = 50      # Number of DDIM denoising steps at inference
+    DIT_BETA_START = 0.0001           # Start of beta schedule
+    DIT_BETA_END = 0.02               # End of beta schedule
+    DIT_BETA_SCHEDULE = "linear"      # "linear" or "cosine"
 
     # Gradio UI parameters
     GRADIO_UPDATE_INTERVAL = 1      # Update visualization every N iterations during training

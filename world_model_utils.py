@@ -230,11 +230,12 @@ def load_state_dict_with_depth_growth(model, state_dict, zero_init_new_blocks=Tr
     get zero-init residual paths so they approximate identity initially,
     preserving the prediction head's trained input distribution.
 
-    Works for both decoder-only (single 'blocks' stack) and encoder-decoder
-    (separate 'blocks' encoder + 'decoder_blocks' decoder).
+    Works for decoder-only (single 'blocks' stack), encoder-decoder
+    (separate 'blocks' encoder + 'decoder_blocks' decoder), and DiT
+    (single 'blocks' stack with adaLN_modulation parameters).
 
     Args:
-        model: The target model (DecoderOnlyViT or MaskedAutoencoderViT)
+        model: The target model (DecoderOnlyViT, MaskedAutoencoderViT, or DiffusionViT)
         state_dict: The saved state dict to load from
         zero_init_new_blocks: If True, zero-init residual paths of new blocks
 
@@ -296,6 +297,12 @@ def load_state_dict_with_depth_growth(model, state_dict, zero_init_new_blocks=Tr
         current_blocks_depth != saved_blocks_depth
         or (has_separate_decoder and current_decoder_depth != saved_decoder_depth)
     )
+
+    # Log DiT-specific parameters for clarity
+    dit_keys = [k for k in skipped if any(p in k for p in ['adaLN_modulation', 'time_embed', 'final_modulation'])]
+    if dit_keys:
+        print(f"  DiT-specific parameters not in checkpoint ({len(dit_keys)} keys): "
+              f"{', '.join(dit_keys[:5])}{'...' if len(dit_keys) > 5 else ''}")
 
     return {
         'depth_changed': depth_changed,

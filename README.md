@@ -23,9 +23,15 @@ This repository contains research code for a canvas-based world model that learn
 The concat world model uses a unique approach to visual prediction:
 
 - **Frame concatenation**: History frames are concatenated horizontally with colored action separators
-- **Two model architectures** (`MODEL_TYPE` in config, default `"encoder_decoder"`):
+- **Three model architectures** (`MODEL_TYPE` in config):
   - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `ENCODER_EMBED_DIM`, `ENCODER_DEPTH`, `ENCODER_NUM_HEADS`, `DECODER_EMBED_DIM`, `DECODER_DEPTH`, `DECODER_NUM_HEADS`
   - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `DECODER_EMBED_DIM`, `DECODER_DEPTH`, `DECODER_NUM_HEADS`
+  - **Latent diffusion / DiT** (`"dit"`): Diffusion Transformer operating in VAE latent space with adaLN-Zero conditioning, configurable via `DIT_EMBED_DIM`, `DIT_DEPTH`, `DIT_NUM_HEADS`, and VAE backend selection
+- **VAE/encoder backends** (for DiT model type):
+  - **Custom CanvasVAE** (`"custom"`): Trainable CNN encoder-decoder with configurable latent channels and compression
+  - **Pretrained SD VAE** (`"pretrained_sd"`): Stable Diffusion VAE (4-channel latent, 8x compression)
+  - **Pretrained FLUX VAE** (`"pretrained_flux"`): FLUX VAE (16-channel latent, 8x compression)
+  - **DINOv2 encoder** (`"dinov2"`): Frozen DINOv2 ViT encoder with trainable CNN decoder (14x compression)
 - **Configurable model capacity**: Encoder and decoder dimensions are independently configurable in `config.py` (defaults: encoder `ENCODER_EMBED_DIM=256`, `ENCODER_NUM_HEADS=4`, `ENCODER_DEPTH=5`; decoder `DECODER_EMBED_DIM=128`, `DECODER_NUM_HEADS=4`, `DECODER_DEPTH=5`)
 - **Depth growth**: Checkpoints from shallower models can be loaded into deeper models — new blocks are zero-initialized for identity pass-through, preserving the prediction head's trained input distribution
 - **Weight initialization**: MAE-convention zero-init on prediction head, normal-init (std=0.02) on learnable tokens for stable training at any embed_dim
@@ -288,6 +294,12 @@ python staged_training.py --root-session saved/sessions/so101/my_session --confi
 # Reproducible training with fixed seed
 python staged_training.py --root-session saved/sessions/so101/my_session --seed 42
 
+# Train with DiT (latent diffusion) model using Stable Diffusion VAE
+python staged_training.py --root-session saved/sessions/so101/my_session --model-type dit --vae-type pretrained_sd
+
+# Limit parallel workers for LR sweeps (e.g., on low-memory GPUs)
+python staged_training.py --root-session saved/sessions/so101/my_session --max-workers 2
+
 # Regenerate final report from saved artifacts (after crash or error)
 python staged_training.py --regenerate-report saved/staged_training_reports/{session}/{run_id} --root-session saved/sessions/so101/{session}
 ```
@@ -330,6 +342,8 @@ python staged_training.py --regenerate-report saved/staged_training_reports/{ses
 - `initial_sweep_enabled` (default True): upfront LR sweep before each stage (orthogonal to `plateau_sweep.enabled`)
 - `seed` (default None): base random seed for reproducibility; None = non-deterministic
 - Stage time budget: `stage_time_budget_min` (0 = unlimited)
+- Model architecture fields: `model_type`, `vae_type`, `vae_checkpoint`, `dit_embed_dim`, `dit_depth`, `dit_num_heads`, `dit_prediction_type`, `dit_num_train_timesteps`, `dit_num_inference_steps`, `dit_beta_schedule`
+- `max_workers` (None = auto): maximum parallel workers for LR sweeps
 - Supports YAML config files for reproducible experiments
 
 **Reports:**
@@ -351,6 +365,7 @@ Required Python packages:
 - opencv-python (computer vision)
 - numpy, matplotlib (data processing and visualization)
 - torch, torchvision, timm (neural networks and vision transformers)
+- diffusers (pretrained VAE backends for DiT model, optional)
 - PIL (image processing)
 - ipywidgets, IPython (notebook compatibility)
 - tqdm (progress bars)
@@ -420,6 +435,10 @@ Required Python packages:
 - `models/base_autoencoder.py`: Base class for autoencoders
 - `models/vit_autoencoder.py`: MaskedAutoencoderViT with encoder-decoder transformer architecture
 - `models/vit_decoder_only.py`: DecoderOnlyViT with GPT-style single transformer stack
+- `models/vit_dit.py`: DiffusionViT with adaLN-Zero timestep conditioning for latent-space diffusion
+- `models/noise_scheduler.py`: DDPM/DDIM noise schedule with forward diffusion and DDIM denoising steps
+- `models/vae.py`: VAE/encoder backends (CanvasVAE, PretrainedSDVAE, PretrainedFluxVAE, DINOv2Encoder)
+- `models/latent_diffusion.py`: LatentDiffusionWrapper combining frozen VAE + trainable DiT with RePaint-style inpainting
 - `models/autoencoder_concat_predictor.py`: Canvas building, `TargetedTrainingMixin`, `TargetedMAEWrapper`, `TargetedDecoderOnlyWrapper`, and GPU-accelerated mask generation
 - `models/canvas_dataset.py`: PyTorch Dataset and DataLoader for high-performance batch training
 - `models/perceptual_loss.py`: VGG16 perceptual loss module for sharper predictions (optional, controlled by `PERCEPTUAL_LOSS_WEIGHT`)
@@ -443,6 +462,9 @@ Required Python packages:
 
 ### Testing and Development
 - `test_concat_world_model.py`: Test script for concat world model
+- `test_dit.py`: Comprehensive tests for the DiT stack (DiffusionViT, NoiseScheduler, VAE backends, LatentDiffusionWrapper)
+- `train_vae.py`: Standalone VAE training script for custom CanvasVAE or DINOv2 decoder
+- `run_dit_comparison.py`: Benchmark script comparing DiT with different VAE backends via staged training
 - `test_jetbot_actions.ipynb`: Interactive JetBot testing notebook
 - `test_toroidal_dot_actions.ipynb`: Interactive toroidal dot testing notebook
 
@@ -518,7 +540,7 @@ Use this to understand how specific patches (like those containing the dot) atte
 
 The `config.py` file contains:
 
-- **AutoencoderConcatPredictorWorldModelConfig**: Canvas size, separator width, history size, training thresholds
+- **AutoencoderConcatPredictorWorldModelConfig**: Canvas size, separator width, history size, training thresholds, model architecture (`MODEL_TYPE`), DiT/VAE parameters, diffusion schedule
 - **ToroidalDotConfig**: Simulated environment parameters (dot size, movement speed, image dimensions)
 - **SO101Config**: Configuration for SO-101 follower arm (joint names, action parameters, dual-camera frame size)
 - **Robot-specific directories**: Separate checkpoint and recording directories for JetBot, toroidal dot, and SO-101

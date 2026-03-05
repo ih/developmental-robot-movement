@@ -1480,12 +1480,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         # Compute gradient norm from diagnostics
                         grad_norm = 0.0
                         if grad_diagnostics:
-                            grad_norm = sum([
-                                grad_diagnostics.get('head_weight_norm', 0),
-                                grad_diagnostics.get('head_bias_norm', 0),
-                                grad_diagnostics.get('mask_token_norm', 0),
-                                grad_diagnostics.get('qkv_weight_norm', 0),
-                            ])
+                            grad_norm = sum(v for v in [
+                                grad_diagnostics.get('head_weight_norm'),
+                                grad_diagnostics.get('head_bias_norm'),
+                                grad_diagnostics.get('mask_token_norm'),
+                                grad_diagnostics.get('qkv_weight_norm'),
+                            ] if v is not None)
 
                         log_metrics = {
                             'batch': batch_count,
@@ -1872,12 +1872,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
                         # Compute gradient norm from diagnostics
                         grad_norm = 0.0
                         if grad_diagnostics:
-                            grad_norm = sum([
-                                grad_diagnostics.get('head_weight_norm', 0),
-                                grad_diagnostics.get('head_bias_norm', 0),
-                                grad_diagnostics.get('mask_token_norm', 0),
-                                grad_diagnostics.get('qkv_weight_norm', 0),
-                            ])
+                            grad_norm = sum(v for v in [
+                                grad_diagnostics.get('head_weight_norm'),
+                                grad_diagnostics.get('head_bias_norm'),
+                                grad_diagnostics.get('mask_token_norm'),
+                                grad_diagnostics.get('qkv_weight_norm'),
+                            ] if v is not None)
 
                         log_metrics = {
                             'batch': batch_count,
@@ -2650,12 +2650,12 @@ def run_batch_comparison(batch_sizes_str, total_samples):
                             # Compute gradient norm from diagnostics
                             grad_norm = 0.0
                             if grad_diagnostics:
-                                grad_norm = sum([
-                                    grad_diagnostics.get('head_weight_norm', 0),
-                                    grad_diagnostics.get('head_bias_norm', 0),
-                                    grad_diagnostics.get('mask_token_norm', 0),
-                                    grad_diagnostics.get('qkv_weight_norm', 0),
-                                ])
+                                grad_norm = sum(v for v in [
+                                    grad_diagnostics.get('head_weight_norm'),
+                                    grad_diagnostics.get('head_bias_norm'),
+                                    grad_diagnostics.get('mask_token_norm'),
+                                    grad_diagnostics.get('qkv_weight_norm'),
+                                ] if v is not None)
 
                             logger.log_batch({
                                 'batch': batch_num + 1,
