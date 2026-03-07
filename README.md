@@ -32,7 +32,7 @@ The concat world model uses a unique approach to visual prediction:
   - **Pretrained SD VAE** (`"pretrained_sd"`): Stable Diffusion VAE (4-channel latent, 8x compression)
   - **Pretrained FLUX VAE** (`"pretrained_flux"`): FLUX VAE (16-channel latent, 8x compression)
   - **DINOv2 encoder** (`"dinov2"`): Frozen DINOv2 ViT encoder with trainable CNN decoder (14x compression)
-- **Configurable model capacity**: Encoder and decoder dimensions are independently configurable in `config.py` (defaults: encoder `ENCODER_EMBED_DIM=512`, `ENCODER_NUM_HEADS=8`, `ENCODER_DEPTH=5`; decoder `DECODER_EMBED_DIM=256`, `DECODER_NUM_HEADS=8`, `DECODER_DEPTH=5`)
+- **Configurable model capacity**: Encoder and decoder dimensions are independently configurable in `config.py` (defaults: encoder `ENCODER_EMBED_DIM=512`, `ENCODER_NUM_HEADS=8`, `ENCODER_DEPTH=5`; decoder `DECODER_EMBED_DIM=256`, `DECODER_NUM_HEADS=8`, `DECODER_DEPTH=12`)
 - **Depth growth**: Checkpoints from shallower models can be loaded into deeper models — new blocks are zero-initialized for identity pass-through, preserving the prediction head's trained input distribution
 - **Weight initialization**: MAE-convention zero-init on prediction head, normal-init (std=0.02) on learnable tokens for stable training at any embed_dim
 - **Full masking**: Both training and eval/inference use full masking (`MASK_RATIO = 1.0`)
@@ -361,7 +361,8 @@ python staged_training.py --regenerate-report saved/staged_training_reports/{ses
 - Baseline reports: `saved/staged_training_reports/{session}/{run_id}/stage{N}_baseline_run{M}/report.html`
 - Final summary: `saved/staged_training_reports/{session}/{run_id}/final_report_{date}.html` (short name; run_id in directory path)
 - Also copied to: `docs/final_report_{run_id}_{date}.html` for easy access (full name for identification)
-- Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, world model architecture config, multi-run statistics (when `runs_per_stage > 1`), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
+- **Counterfactual divergence metrics**: Quantitative measurement of action conditioning — measures pairwise pixel differences between predictions under different actions (same observation), aggregated across 30 sampled observations. Saved to metrics.json
+- Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, world model architecture config, multi-run statistics (when `runs_per_stage > 1`), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics, counterfactual divergence metrics
 
 ## Dependencies
 

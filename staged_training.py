@@ -1512,6 +1512,94 @@ def generate_counterfactual_images(
     return results
 
 
+def compute_aggregate_counterfactual_metrics(
+    session: dict,
+    num_samples: int = 30,
+) -> dict:
+    """
+    Compute counterfactual divergence metrics across sampled observations.
+
+    For each sampled observation, runs prediction with every possible action
+    and measures how much predictions differ. High divergence = model uses
+    action information (good action conditioning).
+
+    Returns dict with pairwise stats, per-action loss stats, and overall score.
+    """
+    available_actions = get_available_actions(session)
+    if len(available_actions) < 2:
+        return {}
+
+    min_frames = config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE
+    num_obs = len(session.get("observations", []))
+    valid_indices = list(range(min_frames - 1, num_obs))
+    if not valid_indices:
+        return {}
+
+    sample_indices = random.sample(valid_indices, min(num_samples, len(valid_indices)))
+
+    # Collect per-observation results
+    all_pairwise = {}  # pair_key -> list of metric dicts
+    all_action_losses = {}  # action -> list of losses
+    successful = 0
+
+    for idx in sample_indices:
+        result = inference.compute_counterfactual_divergence(idx, available_actions)
+        if result is None:
+            continue
+        successful += 1
+
+        for pair_key, pair_metrics in result["pairwise_divergence"].items():
+            if pair_key not in all_pairwise:
+                all_pairwise[pair_key] = []
+            all_pairwise[pair_key].append(pair_metrics)
+
+        for action, loss in result["per_action_loss"].items():
+            if action not in all_action_losses:
+                all_action_losses[action] = []
+            all_action_losses[action].append(loss)
+
+    if successful == 0:
+        return {}
+
+    # Aggregate pairwise divergence
+    pairwise_summary = {}
+    all_mean_diffs = []
+    for pair_key, metrics_list in all_pairwise.items():
+        mean_diffs = [m["mean_pixel_diff"] for m in metrics_list]
+        changed_gt5 = [m["changed_pixels_gt5"] for m in metrics_list]
+        changed_gt1 = [m["changed_pixels_gt1"] for m in metrics_list]
+        total_px = metrics_list[0]["total_pixels"] if metrics_list else 0
+        all_mean_diffs.extend(mean_diffs)
+        pairwise_summary[pair_key] = {
+            "mean_pixel_diff_avg": float(np.mean(mean_diffs)),
+            "mean_pixel_diff_std": float(np.std(mean_diffs)),
+            "mean_pixel_diff_max": float(np.max(mean_diffs)),
+            "changed_pixels_gt5_avg": float(np.mean(changed_gt5)),
+            "changed_pixels_gt1_avg": float(np.mean(changed_gt1)),
+            "total_pixels": total_px,
+            "pct_changed_gt1": float(np.mean(changed_gt1)) / total_px * 100 if total_px > 0 else 0,
+        }
+
+    # Aggregate per-action losses
+    action_loss_summary = {}
+    for action, losses in all_action_losses.items():
+        action_loss_summary[str(action)] = {
+            "mean": float(np.mean(losses)),
+            "std": float(np.std(losses)),
+            "median": float(np.median(losses)),
+        }
+
+    # Overall divergence score (higher = more action conditioning)
+    overall_mean_divergence = float(np.mean(all_mean_diffs)) if all_mean_diffs else 0.0
+
+    return {
+        "num_observations_sampled": successful,
+        "pairwise_divergence": pairwise_summary,
+        "per_action_loss": action_loss_summary,
+        "overall_mean_divergence": overall_mean_divergence,
+    }
+
+
 def evaluate_session_with_checkpoint(
     checkpoint_path: str,
     session: dict,
@@ -1674,6 +1762,17 @@ def generate_stage_report(
         save_fig_to_file(fig_orig_loss, assets_dir / "hybrid_loss_original.png")
         images["loss_original"] = fig_to_base64(fig_orig_loss)
 
+    # Compute counterfactual divergence metrics (action conditioning measurement)
+    print("  Computing counterfactual divergence metrics...")
+    cf_metrics = compute_aggregate_counterfactual_metrics(train_session, num_samples=30)
+    if cf_metrics:
+        overall_div = cf_metrics.get("overall_mean_divergence", 0)
+        print(f"    Overall mean divergence: {overall_div:.3f} (higher = more action conditioning)")
+        for pair_key, pair_stats in cf_metrics.get("pairwise_divergence", {}).items():
+            pct = pair_stats.get("pct_changed_gt1", 0)
+            print(f"    {pair_key}: mean_diff={pair_stats['mean_pixel_diff_avg']:.3f}, "
+                  f"pct_changed(>1)={pct:.1f}%")
+
     # Save metrics.json (enriched version with eval stats, overwrites minimal save)
     metrics = {
         "stage_num": result.stage_num,
@@ -1693,6 +1792,7 @@ def generate_stage_report(
         "train_eval_stats": train_stats,
         "val_eval_stats": val_stats,
         "original_eval_stats": orig_stats,
+        "counterfactual_metrics": cf_metrics,
     }
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2, default=str)

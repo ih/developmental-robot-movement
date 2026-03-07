@@ -229,3 +229,102 @@ should result in different predictions for the masked region (last frame).*
     status_msg += f"Comparing: Actual={actual_action_desc} vs Counterfactual={cf_action_desc}"
 
     return status_msg, fig_true_canvas, fig_cf_canvas, fig_true_inference, fig_cf_inference, fig_diff_heatmap, stats_md
+
+
+def compute_counterfactual_divergence(frame_idx, available_actions):
+    """
+    Compute pairwise divergence between predictions for different actions at a given frame.
+
+    Runs inference with each action in the last separator and compares predicted
+    last-frame pixels across all action pairs. No matplotlib figures are generated.
+
+    Args:
+        frame_idx: The frame index to test
+        available_actions: List of action values (e.g. [0, 1, 2])
+
+    Returns:
+        Dict with per-action losses, pairwise pixel diffs, and extracted last-frame
+        predictions, or None on error.
+    """
+    if state.world_model is None or not state.session_state.get("observations"):
+        return None
+
+    cfg = config.AutoencoderConcatPredictorWorldModelConfig
+    frame_width = cfg.FRAME_SIZE[1]
+    sep_width = cfg.SEPARATOR_WIDTH
+    patch_size = cfg.PATCH_SIZE
+    num_frames = cfg.CANVAS_HISTORY_SIZE
+
+    # Compute last-frame pixel boundaries in the canvas
+    last_frame_x_start = (num_frames - 1) * (frame_width + sep_width)
+    last_frame_x_end = last_frame_x_start + frame_width
+
+    composites = {}   # action -> composite numpy array (HxWx3)
+    last_frames = {}  # action -> last-frame crop numpy array (HxFWx3)
+    losses = {}       # action -> hybrid loss float
+
+    for action in available_actions:
+        try:
+            # Build canvas with this action in the last separator
+            _, cf_canvas, error, _, _ = build_counterfactual_canvas(frame_idx, action)
+            if error or cf_canvas is None:
+                return None
+
+            # Run inference
+            cf_tensor = canvas_to_tensor(cf_canvas).to(state.device)
+            canvas_height, canvas_width = cf_tensor.shape[-2:]
+
+            patch_mask = compute_randomized_patch_mask_for_last_slot(
+                img_size=(canvas_height, canvas_width),
+                patch_size=patch_size,
+                num_frame_slots=num_frames,
+                sep_width=sep_width,
+                mask_ratio_min=config.MASK_RATIO_MIN,
+                mask_ratio_max=config.MASK_RATIO_MAX,
+            ).to(state.device)
+
+            state.world_model.autoencoder.eval()
+            with torch.no_grad():
+                pred_patches, _ = state.world_model.autoencoder.forward_with_patch_mask(cf_tensor, patch_mask)
+                cf_target_patches = state.world_model.autoencoder.patchify(cf_tensor)
+                masked_pred = pred_patches[patch_mask]
+                masked_target = cf_target_patches[patch_mask]
+
+                loss_dict = compute_hybrid_loss_on_masked_patches(
+                    masked_pred, masked_target,
+                    focal_alpha=cfg.FOCAL_LOSS_ALPHA,
+                    focal_beta=cfg.FOCAL_BETA,
+                )
+                loss_val = loss_dict['loss_hybrid']
+                losses[action] = loss_val.item() if torch.is_tensor(loss_val) else loss_val
+
+            # Get composite and extract last frame region
+            composite = state.world_model.get_canvas_inpainting_composite(cf_canvas, patch_mask)
+            composites[action] = composite
+            last_frames[action] = composite[:, last_frame_x_start:last_frame_x_end, :]
+
+        except Exception:
+            return None
+
+    # Compute pairwise divergence on the last-frame crops only
+    pairwise = {}
+    sorted_actions = sorted(available_actions)
+    for i in range(len(sorted_actions)):
+        for j in range(i + 1, len(sorted_actions)):
+            a1, a2 = sorted_actions[i], sorted_actions[j]
+            lf1 = last_frames[a1].astype(float)
+            lf2 = last_frames[a2].astype(float)
+            diff = np.abs(lf1 - lf2)
+            diff_gray = np.mean(diff, axis=2)
+            pairwise[f"action_{a1}_vs_{a2}"] = {
+                "mean_pixel_diff": float(np.mean(diff)),
+                "max_pixel_diff": float(np.max(diff)),
+                "changed_pixels_gt5": int(np.sum(diff_gray > 5)),
+                "changed_pixels_gt1": int(np.sum(diff_gray > 1)),
+                "total_pixels": int(diff_gray.size),
+            }
+
+    return {
+        "per_action_loss": {int(a): float(v) for a, v in losses.items()},
+        "pairwise_divergence": pairwise,
+    }

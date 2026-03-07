@@ -52,11 +52,11 @@ class ToroidalDotConfig:
 class AutoencoderConcatPredictorWorldModelConfig:
     # Canvas construction
     FRAME_SIZE = (224, 224)        # Size of each frame in canvas
-    SEPARATOR_WIDTH = 16            # Width of action-colored separator between frames
+    SEPARATOR_WIDTH = 32            # Width of action-colored separator between frames
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
 
     # Model architecture
-    MODEL_TYPE = "encoder_decoder" # "encoder_decoder" (MAE), "decoder_only" (GPT-style), or "dit" (latent diffusion)
+    MODEL_TYPE = "decoder_only" # "encoder_decoder" (MAE), "decoder_only" (GPT-style), or "dit" (latent diffusion)
     PATCH_SIZE = 16                # Size of patches for Vision Transformer (WARNING: changing requires retraining)
     BATCH_SIZE = 1                 # Training batch size (1=online learning, >1=mini-batch)
 
@@ -68,11 +68,11 @@ class AutoencoderConcatPredictorWorldModelConfig:
     # Model capacity - decoder (encoder-decoder decoder, or decoder-only single stack)
     DECODER_EMBED_DIM = 256        # Embedding dimension for decoder
     DECODER_NUM_HEADS = 8          # Number of attention heads in decoder
-    DECODER_DEPTH = 5              # Number of transformer blocks in decoder
+    DECODER_DEPTH = 12             # Number of transformer blocks in decoder
 
     # Optimizer parameters
     AUTOENCODER_LR = 3e-4          # Learning rate for autoencoder training
-    WEIGHT_DECAY = 0.0             # AdamW weight decay
+    WEIGHT_DECAY = 0.01            # AdamW weight decay
     WARMUP_STEPS = 1000             # Warmup steps for learning rate scheduler
     LR_MIN_RATIO = 0.001           # Minimum LR as ratio of base LR
 
@@ -143,5 +143,5 @@ class SO101Config:
     # Canvas dimensions with stacked frames
     # 3 frames (each 448x224) + 2 separators (16px) = 448 x 720
     CANVAS_HEIGHT = 448
-    CANVAS_WIDTH = 720               # 224*3 + 16*2
+    CANVAS_WIDTH = 736               # 224*3 + 32*2
 

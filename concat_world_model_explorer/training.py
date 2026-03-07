@@ -443,7 +443,7 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
         auto_saved_checkpoints.append((current_loss, checkpoint_path))
 
         # If we exceed the limit, delete the worst checkpoint
-        message = f"🏆 **New Best Model Saved!**\n- Loss: {current_loss:.6f}\n- Checkpoint: {checkpoint_name}"
+        message = f"New Best Model Saved!\n- Loss: {current_loss:.6f}\n- Checkpoint: {checkpoint_name}"
 
         if len(auto_saved_checkpoints) > num_best_models_to_keep:
             # Sort by loss (ascending) and remove the worst one (highest loss)
@@ -1063,7 +1063,14 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     global_min_lr = peak_lr * lr_min_ratio
 
     # Compute starting LR based on global schedule position
-    if resume_mode and starting_samples > 0:
+    if stop_on_divergence and not plateau_sweep_enabled and resume_mode and starting_samples > 0:
+        # Divergence mode + resume: ReduceLROnPlateau handles LR adaptation, not cosine
+        # Use peak_lr directly - the per-chunk cosine progress is meaningless here
+        # since training runs indefinitely until divergence
+        target_lr = peak_lr
+        checkpoint_lr = state.loaded_checkpoint_metadata.get('learning_rate') or target_lr
+        print(f"[DEBUG] Divergence mode resume: using peak_lr={peak_lr:.6e} directly (skipping cosine schedule)")
+    elif resume_mode and starting_samples > 0:
         # Resume: compute where we are in the global cosine schedule
         global_progress = starting_samples / imaginary_total
         # Cosine annealing formula: lr = min + 0.5 * (max - min) * (1 + cos(π * progress))
@@ -1093,8 +1100,12 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         print(f"[DEBUG] Warmup scaling: base_warmup={base_warmup_steps} steps -> scaled_warmup={scaled_warmup_steps} steps (BS={batch_size})")
 
     # Resume warmup: additional warmup steps to ramp from checkpoint LR to target LR (proportional to session steps)
-    resume_warmup_steps = int(num_gradient_updates * resume_warmup_ratio) if resume_mode and starting_samples > 0 else 0
-    resume_warmup_steps = min(resume_warmup_steps, num_gradient_updates // 4)  # Cap at 25% to leave room for decay
+    # Skip resume warmup in divergence mode - ReduceLROnPlateau doesn't support warmup
+    if stop_on_divergence and not plateau_sweep_enabled:
+        resume_warmup_steps = 0
+    else:
+        resume_warmup_steps = int(num_gradient_updates * resume_warmup_ratio) if resume_mode and starting_samples > 0 else 0
+        resume_warmup_steps = min(resume_warmup_steps, num_gradient_updates // 4)  # Cap at 25% to leave room for decay
 
     # Handle optimizer state
     import torch.optim as optim
@@ -2461,6 +2472,7 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     except Exception as e:
         import traceback
         error_msg = f"Error during training: {str(e)}\n\n{traceback.format_exc()}"
+        print(f"[TRAINING ERROR] {error_msg}")
 
         # Finish wandb run on error
         if enable_wandb:

@@ -158,8 +158,8 @@ This repository contains research code for developmental robot movement with a c
 
 ### Neural Vision System
 - **Three model architectures** (`MODEL_TYPE` in config):
-  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `ENCODER_EMBED_DIM` (512), `ENCODER_DEPTH` (5), `ENCODER_NUM_HEADS` (8), `DECODER_EMBED_DIM` (256), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (8)
-  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `DECODER_EMBED_DIM` (256), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (8)
+  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `ENCODER_EMBED_DIM` (512), `ENCODER_DEPTH` (5), `ENCODER_NUM_HEADS` (8), `DECODER_EMBED_DIM` (256), `DECODER_DEPTH` (12), `DECODER_NUM_HEADS` (8)
+  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `DECODER_EMBED_DIM` (256), `DECODER_DEPTH` (12), `DECODER_NUM_HEADS` (8)
   - **Latent diffusion / DiT** (`"dit"`): DiffusionViT operating in VAE latent space with adaLN-Zero timestep conditioning, configurable via `DIT_EMBED_DIM` (256), `DIT_DEPTH` (12), `DIT_NUM_HEADS` (4), `DIT_LATENT_PATCH_SIZE` (2)
 - **VAE/encoder backends** (for DiT model type, `VAE_TYPE` in config):
   - **Custom CanvasVAE** (`"custom"`): Trainable CNN encoder-decoder, configurable latent channels (`VAE_LATENT_CHANNELS=4`) and compression (`VAE_COMPRESSION_FACTOR=8`), supports VAE (KL) or RAE (L2) modes
@@ -439,7 +439,8 @@ python staged_training.py --root-session saved/sessions/so101/my_session --max-w
 - **Depth growth support**: Checkpoints from shallower models are loaded into deeper models via `load_state_dict_with_depth_growth()` — new blocks get zero-init residual (identity pass-through); optimizer state mismatches are handled gracefully
 - **Progressive saves**: `save_run_metrics()` saves per-run metrics.json immediately after each training run; `save_progressive_summary()` updates summary.json after each stage for crash resilience
 - **Interrupt/crash recovery**: Catches `KeyboardInterrupt` and exceptions, recovers the interrupted stage from auto-saved checkpoints on disk, and generates a partial report with all completed stages
-- **HTML reports**: Generates comprehensive reports with training progress, inference visualizations, staged vs baseline comparison, LR sweep results (including plateau sweep history), config diff vs last commit, full training loss timeline, multi-run statistics, and evaluation metrics
+- **Counterfactual divergence metrics**: Quantitative measurement of action conditioning saved to metrics.json. `compute_counterfactual_divergence()` in `inference.py` runs prediction for all actions at a given frame and measures pairwise pixel differences. `compute_aggregate_counterfactual_metrics()` in `staged_training.py` aggregates across 30 sampled observations. Metrics include per-action-pair mean pixel diff, percentage of changed pixels, per-action loss, and overall divergence score (higher = more action conditioning)
+- **HTML reports**: Generates comprehensive reports with training progress, inference visualizations, staged vs baseline comparison, LR sweep results (including plateau sweep history), config diff vs last commit, full training loss timeline, multi-run statistics, evaluation metrics, and counterfactual divergence metrics
 - **Progressive reporting**: Final report is updated after each stage for real-time progress visibility
 - **Best checkpoint selection**: Selects best checkpoint based on hybrid loss over original (full) session
 - **W&B integration**: Optional Weights & Biases logging with run_id in run names and baseline config tracking
@@ -473,7 +474,7 @@ python staged_training.py --regenerate-report saved/staged_training_reports/{ses
 - Baseline reports: `saved/staged_training_reports/{session}/{run_id}/stage{N}_baseline_run{M}/report.html`
 - Final summary: `saved/staged_training_reports/{session}/{run_id}/final_report_{date}.html` (short name; run_id is in directory path)
 - Also copied to: `docs/final_report_{run_id}_{date}.html` for easy access (full name for identification)
-- Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, world model architecture config, multi-run statistics (when runs_per_stage > 1), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
+- Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, world model architecture config, multi-run statistics (when runs_per_stage > 1), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics, counterfactual divergence metrics
 
 ### Overfit Test
 
