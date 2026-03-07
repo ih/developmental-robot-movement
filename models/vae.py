@@ -242,7 +242,7 @@ class PretrainedSDVAE(nn.Module):
         x = imgs * 2.0 - 1.0
         with torch.no_grad():
             posterior = self.vae.encode(x)
-            z = posterior.latent_dist.sample()
+            z = posterior.latent_dist.mode()  # deterministic (no reparameterization noise)
         return z * self._scaling_factor
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
@@ -291,7 +291,7 @@ class PretrainedFluxVAE(nn.Module):
         x = x.to(torch.bfloat16)
         with torch.no_grad():
             posterior = self.vae.encode(x)
-            z = posterior.latent_dist.sample()
+            z = posterior.latent_dist.mode()  # deterministic (no reparameterization noise)
         z = z.to(orig_dtype)
         return (z - self._shift) * self._scale
 

@@ -56,29 +56,29 @@ class AutoencoderConcatPredictorWorldModelConfig:
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
 
     # Model architecture
-    MODEL_TYPE = "dit" # "encoder_decoder" (MAE), "decoder_only" (GPT-style), or "dit" (latent diffusion)
+    MODEL_TYPE = "encoder_decoder" # "encoder_decoder" (MAE), "decoder_only" (GPT-style), or "dit" (latent diffusion)
     PATCH_SIZE = 16                # Size of patches for Vision Transformer (WARNING: changing requires retraining)
     BATCH_SIZE = 1                 # Training batch size (1=online learning, >1=mini-batch)
 
     # Model capacity - encoder (encoder-decoder only)
-    ENCODER_EMBED_DIM = 256        # Embedding dimension for encoder
-    ENCODER_NUM_HEADS = 4          # Number of attention heads for encoder
+    ENCODER_EMBED_DIM = 512        # Embedding dimension for encoder
+    ENCODER_NUM_HEADS = 8          # Number of attention heads for encoder
     ENCODER_DEPTH = 5              # Number of transformer blocks in encoder
 
     # Model capacity - decoder (encoder-decoder decoder, or decoder-only single stack)
-    DECODER_EMBED_DIM = 128        # Embedding dimension for decoder
-    DECODER_NUM_HEADS = 4          # Number of attention heads in decoder
+    DECODER_EMBED_DIM = 256        # Embedding dimension for decoder
+    DECODER_NUM_HEADS = 8          # Number of attention heads in decoder
     DECODER_DEPTH = 5              # Number of transformer blocks in decoder
 
     # Optimizer parameters
-    AUTOENCODER_LR = 2e-4          # Learning rate for autoencoder training
-    WEIGHT_DECAY = 0.01            # AdamW weight decay
+    AUTOENCODER_LR = 3e-4          # Learning rate for autoencoder training
+    WEIGHT_DECAY = 0.0             # AdamW weight decay
     WARMUP_STEPS = 1000             # Warmup steps for learning rate scheduler
     LR_MIN_RATIO = 0.001           # Minimum LR as ratio of base LR
 
     # Focal loss parameters (for loss dilution)
     FOCAL_BETA = 5             # Temperature for exponential weighting (try 5-15)
-    FOCAL_LOSS_ALPHA = 0.1          # Blend ratio: alpha * plain_mse + (1-alpha) * focal_mse
+    FOCAL_LOSS_ALPHA = 1.0          # Blend ratio: alpha * plain_mse + (1-alpha) * focal_mse (1.0 = pure MSE)
 
     # Perceptual loss (VGG feature space loss for sharper predictions)
     PERCEPTUAL_LOSS_WEIGHT = 0    # Weight for perceptual loss (0.0 = disabled, no VGG loaded)
@@ -97,7 +97,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
     DIT_NUM_HEADS = 4                 # Number of attention heads
     DIT_LATENT_PATCH_SIZE = 2         # Patch size in latent space
     DIT_PREDICTION_TYPE = "epsilon"   # "epsilon" (predict noise) or "sample" (predict clean)
-    DIT_TRAINING_MODE = "conditional" # "conditional" (noise on masked patches only) or "unconditional" (noise on all, RePaint inference)
+    DIT_TRAINING_MODE = "unconditional" # "conditional" (noise on masked patches only) or "unconditional" (noise on all, RePaint inference)
 
     # --- Diffusion schedule (used when MODEL_TYPE == "dit") ---
     DIT_NUM_TRAIN_TIMESTEPS = 1000    # Number of diffusion timesteps during training

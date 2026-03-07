@@ -492,6 +492,35 @@ class TestLatentDiffusionWrapperTraining(unittest.TestCase):
             f"Loss should decrease: first 3 avg={avg_first_3:.4f}, last 3 avg={avg_last_3:.4f}"
         )
 
+    def test_conditional_can_overfit_single_example(self):
+        """Conditional mode with epsilon prediction must be able to overfit one example.
+
+        This catches the bug where mask_token replaces noisy patch embeddings,
+        destroying the noise information and making epsilon prediction impossible.
+        With the fix (no mask_token in conditional mode), loss should drop well
+        below 0.9 (the theoretical floor when predicting zero noise).
+        """
+        torch.manual_seed(42)
+        # Use higher LR for faster convergence in test
+        optimizer = optim.AdamW(
+            [p for p in self.wrapper.parameters() if p.requires_grad],
+            lr=5e-4,
+        )
+        losses = []
+        for _ in range(100):
+            loss, _ = self.wrapper.train_on_canvas(
+                self.canvas, self.pixel_mask, optimizer
+            )
+            losses.append(loss)
+
+        best_loss = min(losses)
+        self.assertLess(
+            best_loss, 0.85,
+            f"Conditional mode should overfit below 0.85 in 100 steps, "
+            f"got best={best_loss:.4f}. If stuck near 0.94-1.0, mask_token "
+            f"is likely destroying noise information."
+        )
+
     def test_vae_stays_frozen(self):
         """VAE parameters should not have gradients after training."""
         self.wrapper.train_on_canvas(self.canvas, self.pixel_mask, self.optimizer)

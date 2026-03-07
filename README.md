@@ -32,13 +32,13 @@ The concat world model uses a unique approach to visual prediction:
   - **Pretrained SD VAE** (`"pretrained_sd"`): Stable Diffusion VAE (4-channel latent, 8x compression)
   - **Pretrained FLUX VAE** (`"pretrained_flux"`): FLUX VAE (16-channel latent, 8x compression)
   - **DINOv2 encoder** (`"dinov2"`): Frozen DINOv2 ViT encoder with trainable CNN decoder (14x compression)
-- **Configurable model capacity**: Encoder and decoder dimensions are independently configurable in `config.py` (defaults: encoder `ENCODER_EMBED_DIM=256`, `ENCODER_NUM_HEADS=4`, `ENCODER_DEPTH=5`; decoder `DECODER_EMBED_DIM=128`, `DECODER_NUM_HEADS=4`, `DECODER_DEPTH=5`)
+- **Configurable model capacity**: Encoder and decoder dimensions are independently configurable in `config.py` (defaults: encoder `ENCODER_EMBED_DIM=512`, `ENCODER_NUM_HEADS=8`, `ENCODER_DEPTH=5`; decoder `DECODER_EMBED_DIM=256`, `DECODER_NUM_HEADS=8`, `DECODER_DEPTH=5`)
 - **Depth growth**: Checkpoints from shallower models can be loaded into deeper models — new blocks are zero-initialized for identity pass-through, preserving the prediction head's trained input distribution
 - **Weight initialization**: MAE-convention zero-init on prediction head, normal-init (std=0.02) on learnable tokens for stable training at any embed_dim
 - **Full masking**: Both training and eval/inference use full masking (`MASK_RATIO = 1.0`)
 - **Targeted masking**: Next-frame slot is fully masked for inpainting-based prediction
 - **MAE-native training**: Optimizes only masked patches
-- **Hybrid loss**: Combines plain MSE and focal MSE for edge-aware training
+- **Hybrid loss**: Combines plain MSE and focal MSE (`FOCAL_LOSS_ALPHA * plain + (1-alpha) * focal`); default `FOCAL_LOSS_ALPHA=1.0` uses pure MSE
 - **VGG perceptual loss**: Optional VGG16 feature-space loss for sharper predictions (`PERCEPTUAL_LOSS_WEIGHT` in config, 0.0 = disabled)
 - **Action encoding**: Actions encoded as thin colored separators between frames (e.g., red for stay, green for move)
 - **Non-square canvases**: Handles non-square concatenated images (e.g., 224x688 for 3 frames + 2 separators)
@@ -244,6 +244,16 @@ jupyter notebook test_toroidal_dot_actions.ipynb
 ```
 
 These notebooks provide interactive environments for testing robot interfaces and action spaces.
+
+### Overfit Test
+
+Tests whether the model architecture can memorize small subsets of examples:
+```bash
+python overfit_test.py --session saved/sessions/so101/my_session --batch-size 1 --max-subsets 1
+```
+- Uses overfitting-optimized defaults (zero weight decay, pure MSE, larger decoder)
+- Override architecture params via CLI: `--learning-rate`, `--weight-decay`, `--decoder-embed-dim`, etc.
+- Reports with loss curves and counterfactual inference: `saved/overfit_reports/{session}/{run_id}/report.html`
 
 ### Staged Training
 
@@ -459,6 +469,10 @@ Required Python packages:
   - Automatic dot detection and manual patch selection
   - Quantile-based filtering and layer/head selection
 - `session_explorer_lib.py`: Session management, frame processing, and model operations
+
+### Overfit Testing
+- `overfit_test.py`: Tests whether a model can overfit small subsets of examples from a session; generates HTML reports with loss curves, convergence stats, and counterfactual inference visualizations
+- `overfit_test_config.py`: Configuration with overfitting-optimized defaults (`learning_rate=3e-4`, `weight_decay=0.0`, `focal_alpha=1.0`, `decoder_embed_dim=256`, `decoder_num_heads=8`)
 
 ### Testing and Development
 - `test_concat_world_model.py`: Test script for concat world model

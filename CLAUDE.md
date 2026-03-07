@@ -158,8 +158,8 @@ This repository contains research code for developmental robot movement with a c
 
 ### Neural Vision System
 - **Three model architectures** (`MODEL_TYPE` in config):
-  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `ENCODER_EMBED_DIM` (256), `ENCODER_DEPTH` (5), `ENCODER_NUM_HEADS` (4), `DECODER_EMBED_DIM` (128), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (4)
-  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `DECODER_EMBED_DIM` (128), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (4)
+  - **Encoder-decoder** (`"encoder_decoder"`): MaskedAutoencoderViT with separate encoder and decoder stacks, configurable via `ENCODER_EMBED_DIM` (512), `ENCODER_DEPTH` (5), `ENCODER_NUM_HEADS` (8), `DECODER_EMBED_DIM` (256), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (8)
+  - **Decoder-only** (`"decoder_only"`): DecoderOnlyViT (GPT-style single transformer stack), configurable via `DECODER_EMBED_DIM` (256), `DECODER_DEPTH` (5), `DECODER_NUM_HEADS` (8)
   - **Latent diffusion / DiT** (`"dit"`): DiffusionViT operating in VAE latent space with adaLN-Zero timestep conditioning, configurable via `DIT_EMBED_DIM` (256), `DIT_DEPTH` (12), `DIT_NUM_HEADS` (4), `DIT_LATENT_PATCH_SIZE` (2)
 - **VAE/encoder backends** (for DiT model type, `VAE_TYPE` in config):
   - **Custom CanvasVAE** (`"custom"`): Trainable CNN encoder-decoder, configurable latent channels (`VAE_LATENT_CHANNELS=4`) and compression (`VAE_COMPRESSION_FACTOR=8`), supports VAE (KL) or RAE (L2) modes
@@ -168,7 +168,7 @@ This repository contains research code for developmental robot movement with a c
   - **DINOv2 encoder** (`"dinov2"`): Frozen DINOv2 ViT encoder with trainable CNN decoder (768-channel features, 14x compression), auto-adjusts `SEPARATOR_WIDTH=14` for divisibility
   - Train custom VAEs with `train_vae.py`, compare DiT backends with `run_dit_comparison.py`
 - **Diffusion training modes** (`DIT_TRAINING_MODE`):
-  - **Conditional** (`"conditional"`): Noise added only to masked latent patches; unmasked patches passed clean as conditioning context. Mask token used for masked patches.
+  - **Conditional** (`"conditional"`): Noise added only to masked latent patches; unmasked patches passed clean as conditioning context. No mask token replacement during forward pass (noisy patches must remain visible for epsilon prediction).
   - **Unconditional** (`"unconditional"`): Noise added to all latent patches; at inference uses RePaint-style harmonization (replace unmasked patches with known values at each denoising step). No mask token needed.
 - **Diffusion schedule**: `DIT_NUM_TRAIN_TIMESTEPS=1000`, `DIT_NUM_INFERENCE_STEPS=50` (DDIM), `DIT_BETA_START=0.0001`, `DIT_BETA_END=0.02`, `DIT_BETA_SCHEDULE="linear"` (or `"cosine"`)
 - **LatentDiffusionWrapper** (`models/latent_diffusion.py`): Wraps frozen VAE + trainable DiT, implements `train_on_canvas()` (diffusion loss on masked latent patches) and `forward_with_patch_mask()` (iterative DDIM denoising with RePaint inpainting). Maps pixel-space patch masks to latent-space masks accounting for VAE compression factor.
@@ -178,7 +178,7 @@ This repository contains research code for developmental robot movement with a c
 - **Full masking for training**: `TRAIN_MASK_RATIO_MIN` (1.0) and `TRAIN_MASK_RATIO_MAX` (1.0) for both training and eval/inference
 - **Targeted masking for prediction**: Full masking (MASK_RATIO = 1.0) of next-frame slot for inpainting-based prediction
 - **MAE-native optimization**: Trains only on masked patches for efficient learning
-- **Hybrid loss**: Combines plain MSE and focal MSE (`FOCAL_LOSS_ALPHA * plain + (1-alpha) * focal`) for edge-aware training
+- **Hybrid loss**: Combines plain MSE and focal MSE (`FOCAL_LOSS_ALPHA * plain + (1-alpha) * focal`); default `FOCAL_LOSS_ALPHA=1.0` uses pure MSE
 - **VGG perceptual loss**: Optional VGG16 feature-space loss for sharper predictions (`PERCEPTUAL_LOSS_WEIGHT` in config, 0.0 = disabled)
   - Lazily loads pretrained VGG16 on first use (no overhead when disabled)
   - Computes L1 loss on relu1_2, relu2_2, relu3_3 features of the predicted vs target last frame
@@ -475,6 +475,27 @@ python staged_training.py --regenerate-report saved/staged_training_reports/{ses
 - Also copied to: `docs/final_report_{run_id}_{date}.html` for easy access (full name for identification)
 - Includes: training progress graphs, hybrid loss over session graphs, full training loss timeline across all stages, config diff vs last commit, world model architecture config, multi-run statistics (when runs_per_stage > 1), staged vs baseline comparison (winner, per-stage metrics), inference visualizations, evaluation statistics
 
+### Overfit Test
+
+Tests whether the model architecture can memorize small subsets of examples.
+
+```bash
+# Basic usage (uses overfitting-optimized defaults from overfit_test_config.py)
+python overfit_test.py --session saved/sessions/so101/my_session --batch-size 1 --max-subsets 1
+
+# With specific seed for reproducibility
+python overfit_test.py --session saved/sessions/so101/my_session --batch-size 1 --max-subsets 1 --seed 42
+
+# Override architecture params via CLI
+python overfit_test.py --session saved/sessions/so101/my_session --batch-size 1 \
+    --learning-rate 3e-4 --weight-decay 0 --focal-alpha 1.0 \
+    --decoder-embed-dim 256 --decoder-num-heads 8
+```
+
+- Trains a fresh model per subset, reports convergence behavior
+- CLI args override config defaults (only when explicitly provided)
+- Reports saved to `saved/overfit_reports/{session}/{run_id}/report.html`
+
 ### Recording Sessions
 To create new sessions for exploration:
 1. Set `RECORDING_MODE = True` in `config.py`
@@ -622,6 +643,16 @@ Required Python packages:
   - Quantile-based filtering for focusing on strongest connections
   - Layer and head selection for fine-grained analysis
 - `session_explorer_lib.py`: Shared library of utilities for session management, frame processing, model operations, and canvas pre-building for batch training optimization
+
+### Overfit Testing
+- `overfit_test.py`: Tests whether a model can overfit small subsets of examples from a session
+  - Trains a fresh model per subset until it reaches target loss or plateaus
+  - Generates HTML report with loss curves, convergence statistics, and counterfactual inference visualizations
+  - Supports runtime overrides for all model architecture params (encoder/decoder dims, weight decay, focal loss)
+  - Reports saved to `saved/overfit_reports/{session}/{run_id}/`
+- `overfit_test_config.py`: Configuration dataclass with YAML serialization
+  - Overfitting-optimized defaults: `learning_rate=3e-4`, `weight_decay=0.0`, `focal_alpha=1.0` (pure MSE), `decoder_embed_dim=256`, `decoder_num_heads=8`
+  - Test params: `batch_size=1`, `max_subsets=10`, `max_iterations=20000`, `target_loss=0.0001`, `plateau_patience=3000`
 
 ### Testing and Development
 - `test_concat_world_model.py`: Test script for AutoencoderConcatPredictorWorldModel

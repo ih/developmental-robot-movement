@@ -155,7 +155,7 @@ class StagedTrainingConfig:
     val_plateau_min_delta: float = 0.0001  # Minimum improvement to count as "better"
 
     # Learning rate (app defaults)
-    custom_lr: float = 2e-4  # App default (0 = use config default)
+    custom_lr: float = 3e-4  # App default (0 = use config default)
     disable_lr_scaling: bool = True  # App default
     custom_warmup: int = -1  # App default (-1 = scaled default)
     lr_min_ratio: float = 0.001  # App default

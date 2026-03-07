@@ -257,10 +257,13 @@ class LatentDiffusionWrapper(nn.Module):
             )
             noisy_latent = self.dit.unpatchify(composite_patches)
 
-            # DiT forward pass with mask (mask_token replaces masked patches)
+            # DiT forward pass WITHOUT mask_token replacement.
+            # The model must see the actual noisy patches to predict the noise
+            # (epsilon prediction). Passing latent_mask would replace noisy
+            # embeddings with mask_token, destroying the noise information.
             self.dit.train()
             pred_patches, _ = self.dit.forward_with_patch_mask(
-                noisy_latent, latent_mask, timestep=timesteps
+                noisy_latent, None, timestep=timesteps
             )
 
             # Loss target
@@ -491,9 +494,9 @@ class LatentDiffusionWrapper(nn.Module):
                     # Reconstruct latent image from patches
                     current_latent = self.dit.unpatchify(current_patches)
 
-                    # DiT forward pass with mask (mask_token for masked patches)
+                    # DiT forward pass WITHOUT mask_token (consistent with training)
                     pred_patches, _ = self.dit.forward_with_patch_mask(
-                        current_latent, latent_mask, timestep=timestep
+                        current_latent, None, timestep=timestep
                     )
 
                     # DDIM step on masked patches only
