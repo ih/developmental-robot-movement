@@ -1,0 +1,57 @@
+# Run 11: DiT latent diffusion model from scratch
+# Hypothesis: MSE-based models (runs 5-10) produce blurry mean predictions.
+# Diffusion models produce sharp outputs via iterative denoising.
+# DiT with pretrained Stable Diffusion VAE operates in compressed latent space.
+# Config.py changes:
+#   - MODEL_TYPE = "dit"
+#   - DIT_EMBED_DIM = 256, DIT_DEPTH = 12, DIT_NUM_HEADS = 4
+#   - VAE_TYPE = "pretrained_sd" (frozen encoder+decoder, 4ch latent, 8x compression)
+#   - DIT_TRAINING_MODE = "unconditional" (RePaint-style inference)
+#   - PERCEPTUAL_LOSS_WEIGHT = 0.01 (applied to decoded predictions)
+# Kept from proven runs:
+#   - SEPARATOR_WIDTH = 32
+#   - WEIGHT_DECAY = 0.01
+
+# Sample budget: effectively unlimited - let divergence stop training
+stage_samples_multiplier: 100000000000
+total_samples: 10000000
+
+# Time budget
+stage_time_budget_min: 180
+
+# Divergence stopping
+stop_on_divergence: true
+divergence_gap: 0.002
+divergence_ratio: 1.5
+divergence_patience: 30
+divergence_min_updates: 10
+val_spike_threshold: 2.0
+val_spike_window: 15
+val_spike_frequency: 0.75
+
+# Learning rate: standard for fresh training
+custom_lr: 0.0003
+disable_lr_scaling: true
+custom_warmup: -1
+lr_min_ratio: 0.001
+
+# NO LR sweeps
+initial_sweep_enabled: false
+plateau_sweep:
+  enabled: false
+
+# Training
+batch_size: 8
+update_interval: 250
+sampling_mode: "Loss-weighted"
+loss_weight_temperature: 0.5
+loss_weight_refresh_interval: 50
+
+# Single run for fast iteration
+runs_per_stage: 1
+serial_runs: true
+
+# W&B and reproducibility
+enable_wandb: true
+wandb_project: "developmental-robot-movement"
+seed: 42

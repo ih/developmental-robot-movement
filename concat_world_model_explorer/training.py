@@ -1066,10 +1066,11 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
     global_min_lr = peak_lr * lr_min_ratio
 
     # Compute starting LR based on global schedule position
-    if stop_on_divergence and not plateau_sweep_enabled and resume_mode and starting_samples > 0:
-        # Divergence mode + resume: ReduceLROnPlateau handles LR adaptation, not cosine
+    if stop_on_divergence and resume_mode and starting_samples > 0:
+        # Divergence mode + resume (both with and without plateau sweep):
         # Use peak_lr directly - the per-chunk cosine progress is meaningless here
-        # since training runs indefinitely until divergence
+        # since training runs indefinitely until divergence. Without this, the cosine
+        # schedule sees starting_samples/chunk_size ≈ 99.9% progress and sets LR to ~0.
         target_lr = peak_lr
         checkpoint_lr = state.loaded_checkpoint_metadata.get('learning_rate') or target_lr
         print(f"[DEBUG] Divergence mode resume: using peak_lr={peak_lr:.6e} directly (skipping cosine schedule)")
@@ -1103,8 +1104,8 @@ def run_world_model_batch(total_samples, batch_size, current_observation_idx, up
         print(f"[DEBUG] Warmup scaling: base_warmup={base_warmup_steps} steps -> scaled_warmup={scaled_warmup_steps} steps (BS={batch_size})")
 
     # Resume warmup: additional warmup steps to ramp from checkpoint LR to target LR (proportional to session steps)
-    # Skip resume warmup in divergence mode - ReduceLROnPlateau doesn't support warmup
-    if stop_on_divergence and not plateau_sweep_enabled:
+    # Skip resume warmup in divergence mode - neither ReduceLROnPlateau nor constant LR supports warmup
+    if stop_on_divergence:
         resume_warmup_steps = 0
     else:
         resume_warmup_steps = int(num_gradient_updates * resume_warmup_ratio) if resume_mode and starting_samples > 0 else 0

@@ -733,7 +733,7 @@ def run_stage_training(
                 plateau_sweep_patience=cfg.plateau_sweep.plateau_patience if plateau_sweep_enabled else 10,
                 plateau_sweep_cooldown_updates=cfg.plateau_sweep.cooldown_updates if plateau_sweep_enabled else 10,
                 plateau_sweep_max_sweeps=cfg.plateau_sweep.max_sweeps_per_stage if plateau_sweep_enabled else 3,
-                plateau_sweep_count=consecutive_sweep_count,
+                plateau_sweep_count=sweep_count,  # Use total sweep count (never resets) for hard max limit
                 prior_auto_saved_checkpoints=carried_checkpoints,
             )
 
@@ -866,7 +866,7 @@ def run_stage_training(
                     starting_samples = samples_at_sweep
                     post_sweep = True
 
-                    print(f"[STAGED TRAINING] Continuing training with LR={new_lr:.2e}, starting_samples={starting_samples}, consecutive={consecutive_sweep_count}/{cfg.plateau_sweep.max_sweeps_per_stage}")
+                    print(f"[STAGED TRAINING] Continuing training with LR={new_lr:.2e}, starting_samples={starting_samples}, sweeps={sweep_count}/{cfg.plateau_sweep.max_sweeps_per_stage}")
                     # Clean up old generator to free DataLoader pinned memory buffers
                     del generator
                     gc.collect()

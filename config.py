@@ -81,7 +81,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
     FOCAL_LOSS_ALPHA = 1.0          # Blend ratio: alpha * plain_mse + (1-alpha) * focal_mse (1.0 = pure MSE)
 
     # Perceptual loss (VGG feature space loss for sharper predictions)
-    PERCEPTUAL_LOSS_WEIGHT = 0.02   # Weight for perceptual loss (0.0 = disabled, no VGG loaded)
+    PERCEPTUAL_LOSS_WEIGHT = 0.01   # Weight for perceptual loss (0.0 = disabled, no VGG loaded)
 
     # --- VAE/Encoder configuration (used when MODEL_TYPE == "dit") ---
     VAE_TYPE = "pretrained_sd"               # "custom", "pretrained_sd", "pretrained_flux", "dinov2"

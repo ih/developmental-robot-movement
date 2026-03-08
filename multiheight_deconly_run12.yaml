@@ -1,0 +1,63 @@
+# Run 12: Proven architecture from scratch with plateau sweeps + 2x time
+# Hypothesis: Runs 9/10 were close to Run 7 baseline (0.0102/0.0114 vs 0.0092).
+# The gap might close with smarter LR scheduling (plateau sweeps auto-optimize LR
+# when stuck) and 2x more training time (360 min vs 180 min).
+# Architecture: identical to Run 7 (decoder-only d12 e256).
+# Changes from runs 9/10:
+#   - MODEL_TYPE = "decoder_only", DECODER_DEPTH=12, DECODER_EMBED_DIM=256 in config.py
+#   - plateau_sweep enabled (auto LR optimization when model plateaus)
+#   - stage_time_budget_min: 360 (2x longer)
+#   - No checkpoint resume (training from scratch)
+# Kept from run 7:
+#   - SEPARATOR_WIDTH = 32 in config.py
+#   - WEIGHT_DECAY = 0.01 in config.py
+#   - PERCEPTUAL_LOSS_WEIGHT = 0.01 in config.py
+
+# Sample budget: effectively unlimited - let divergence/time stop training
+stage_samples_multiplier: 100000000000
+total_samples: 10000000
+
+# Time budget: 2x previous runs
+stage_time_budget_min: 360
+
+# Divergence stopping
+stop_on_divergence: true
+divergence_gap: 0.002
+divergence_ratio: 1.5
+divergence_patience: 30
+divergence_min_updates: 10
+val_spike_threshold: 2.0
+val_spike_window: 15
+val_spike_frequency: 0.75
+
+# Learning rate: standard for fresh training
+custom_lr: 0.0003
+disable_lr_scaling: true
+custom_warmup: -1
+lr_min_ratio: 0.001
+
+# NO upfront sweep, but YES plateau sweeps
+initial_sweep_enabled: false
+plateau_sweep:
+  enabled: true
+  plateau_patience: 25
+  plateau_improvement_threshold: 0.005
+  cooldown_updates: 5
+  max_sweeps_per_stage: 3
+  min_sweep_improvement: 0.0
+
+# Training
+batch_size: 8
+update_interval: 250
+sampling_mode: "Loss-weighted"
+loss_weight_temperature: 0.5
+loss_weight_refresh_interval: 50
+
+# Single run for fast iteration
+runs_per_stage: 1
+serial_runs: true
+
+# W&B and reproducibility
+enable_wandb: true
+wandb_project: "developmental-robot-movement"
+seed: 42
