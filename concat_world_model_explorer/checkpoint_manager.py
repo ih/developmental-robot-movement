@@ -244,16 +244,77 @@ def load_model_weights(checkpoint_name):
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=state.device, weights_only=False)
 
-        # Load model state (supports depth growth: loading shallower checkpoint into deeper model)
+        # Validate architecture compatibility before loading
         model_sd = checkpoint.get('model_state_dict', checkpoint)
+        saved_model_type = checkpoint.get('model_type', 'unknown')
+        current_model_type = config.AutoencoderConcatPredictorWorldModelConfig.MODEL_TYPE
+
+        # Detect current model class for comparison
+        from models import TargetedMAEWrapper, TargetedDecoderOnlyWrapper
+        current_ae = state.world_model.autoencoder
+        if hasattr(current_ae, '__class__'):
+            current_class = current_ae.__class__.__name__
+        else:
+            current_class = 'unknown'
+
+        # Check for model type mismatch
+        architecture_mismatch = False
+        if saved_model_type != 'unknown' and saved_model_type != current_model_type:
+            architecture_mismatch = True
+            print(f"[LOAD WARNING] MODEL TYPE MISMATCH: checkpoint={saved_model_type}, explorer={current_model_type}")
+            print(f"[LOAD WARNING] The explorer was likely started before config.py was changed.")
+            print(f"[LOAD WARNING] Restart the explorer to use the correct model architecture.")
+
+        # Load model state (supports depth growth: loading shallower checkpoint into deeper model)
         growth_info = world_model_utils.load_state_dict_with_depth_growth(
             state.world_model.autoencoder, model_sd
         )
+
+        # Check for excessive skipped keys (architecture mismatch indicator)
+        total_checkpoint_keys = len(model_sd)
+        loaded_keys = growth_info['loaded_keys']
+        skipped_keys = growth_info['skipped_keys']
+        load_ratio = loaded_keys / total_checkpoint_keys if total_checkpoint_keys > 0 else 0
+        print(f"[LOAD] Keys loaded: {loaded_keys}/{total_checkpoint_keys} ({load_ratio:.1%})")
+        if skipped_keys:
+            print(f"[LOAD] Skipped keys ({len(skipped_keys)}): {skipped_keys[:5]}{'...' if len(skipped_keys) > 5 else ''}")
 
         # Track which components were loaded
         optimizer_loaded = False
         scheduler_loaded = False
         warnings = []
+
+        # Warn about architecture mismatch
+        if architecture_mismatch:
+            warnings.append(
+                f"**ARCHITECTURE MISMATCH: Checkpoint is '{saved_model_type}' but explorer model is "
+                f"'{current_model_type}' ({current_class}). "
+                f"Restart the explorer after changing config.py to fix this.**"
+            )
+
+        # Warn about low key load ratio (strong indicator of mismatch)
+        if load_ratio < 0.9 and total_checkpoint_keys > 10:
+            warnings.append(
+                f"**LOW KEY LOAD RATIO: Only {loaded_keys}/{total_checkpoint_keys} keys loaded "
+                f"({load_ratio:.1%}). This usually means the model architecture doesn't match the "
+                f"checkpoint. Restart the explorer after verifying config.py settings.**"
+            )
+
+        # Check embed_dim / depth from checkpoint config vs running model
+        ckpt_config = checkpoint.get('config', {})
+        if ckpt_config:
+            ckpt_depth = ckpt_config.get('depth')
+            ckpt_embed = ckpt_config.get('embed_dim')
+            model_depth = len(current_ae.blocks) if hasattr(current_ae, 'blocks') else None
+            model_embed = current_ae.embed_dim if hasattr(current_ae, 'embed_dim') else None
+            if ckpt_depth and model_depth and ckpt_depth != model_depth and not growth_info['depth_changed']:
+                warnings.append(
+                    f"**DEPTH MISMATCH: Checkpoint depth={ckpt_depth}, model depth={model_depth}**"
+                )
+            if ckpt_embed and model_embed and ckpt_embed != model_embed:
+                warnings.append(
+                    f"**EMBED DIM MISMATCH: Checkpoint embed_dim={ckpt_embed}, model embed_dim={model_embed}**"
+                )
 
         # Try to load optimizer state if available (may fail if parameter groups differ)
         if 'optimizer_state_dict' in checkpoint:
@@ -354,13 +415,28 @@ def load_model_weights(checkpoint_name):
               f"loss={state.loaded_checkpoint_metadata['loss']}, lr={state.loaded_checkpoint_metadata['learning_rate']}")
         print(f"[CHECKPOINT] Loaded original_peak_lr: {state.loaded_checkpoint_metadata['original_peak_lr']}")
 
-        status_msg = f"✅ **Model weights loaded successfully!**\n\n"
+        # Use warning prefix if there are architecture issues
+        if architecture_mismatch or load_ratio < 0.9:
+            status_msg = f"**Model weights loaded with issues (see warnings below)**\n\n"
+        else:
+            status_msg = f"**Model weights loaded successfully!**\n\n"
         status_msg += f"**Checkpoint:** {checkpoint_name}\n"
         status_msg += f"**Location:** {checkpoint_path}\n"
 
+        # Always show key loading statistics
+        status_msg += f"\n**Weight Loading:**\n"
+        status_msg += f"- Keys loaded: {loaded_keys}/{total_checkpoint_keys} ({load_ratio:.1%})\n"
+        if skipped_keys:
+            status_msg += f"- Skipped keys: {len(skipped_keys)}\n"
+
+        # Show architecture info
+        status_msg += f"\n**Architecture:**\n"
+        status_msg += f"- Checkpoint model type: {saved_model_type}\n"
+        status_msg += f"- Explorer model type: {current_model_type} ({current_class})\n"
+
         # Show what was loaded
         status_msg += f"\n**Loaded Components:**\n"
-        status_msg += f"- Model weights: ✅\n"
+        status_msg += f"- Model weights: {'✅' if load_ratio > 0.9 else '⚠️ partial'}\n"
         status_msg += f"- Optimizer state: {'✅' if optimizer_loaded else '❌ (skipped)'}\n"
         status_msg += f"- Scheduler state: {'✅' if scheduler_loaded else '❌ (skipped)'}\n"
 

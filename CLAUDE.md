@@ -105,7 +105,7 @@ This repository contains research code for developmental robot movement with a c
   - `inference.py`: Single-frame inference without training
   - `evaluation.py`: Full-session evaluation with comprehensive statistics
   - `training.py`: Batch training with 4-phase performance optimizations
-  - `checkpoint_manager.py`: Model checkpoint save/load with metadata and depth-growth-aware loading
+  - `checkpoint_manager.py`: Model checkpoint save/load with metadata, depth-growth-aware loading, and architecture validation
   - `attention.py`: Decoder attention visualization with multiple modes
   - `visualization.py`: Plotting and display utilities
   - `utils.py`: Shared helper functions
@@ -330,7 +330,8 @@ python -m concat_world_model_explorer --share
   - **Save weights**: Enter checkpoint name and click "💾 Save Weights" to save model, optimizer, and scheduler state
   - **Load weights**: Select checkpoint from dropdown and click "📂 Load Weights" to restore previous training state
   - **Checkpoint location**: All checkpoints saved to robot-specific directories (e.g., `saved/checkpoints/toroidal_dot/`)
-  - **Metadata tracking**: Each checkpoint includes timestamp, config parameters, and training metrics
+  - **Metadata tracking**: Each checkpoint includes timestamp, config parameters (frame_size, separator_width, canvas_history_size, embed_dim, depth), model_type, and training metrics
+  - **Architecture validation on load**: Detects model_type mismatch, low key load ratio (<90%), embed_dim/depth mismatch between checkpoint and running model; warns user to restart explorer after config.py changes
   - **Instance-aware naming**: Multiple instances running on different ports save checkpoints with unique names to prevent collisions
 - **Inference-only evaluation**:
   - **Single canvas inference**: Run inference without training on selected frame to see predictions

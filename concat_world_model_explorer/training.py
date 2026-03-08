@@ -430,10 +430,13 @@ def save_best_model_checkpoint(current_loss, samples_seen, world_model, auto_sav
             # Preserve original peak LR for global schedule calculation when resuming
             'original_peak_lr': state.loaded_checkpoint_metadata.get('original_peak_lr')
                                 or world_model.ae_optimizer.param_groups[0]['lr'],
+            'model_type': config.AutoencoderConcatPredictorWorldModelConfig.MODEL_TYPE,
             'config': {
                 'frame_size': world_model.frame_size,  # Use actual frame_size from model, not global config
                 'separator_width': config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
                 'canvas_history_size': config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+                'embed_dim': world_model.autoencoder.embed_dim,
+                'depth': len(world_model.autoencoder.blocks),
             }
         }
         torch.save(checkpoint, checkpoint_path)

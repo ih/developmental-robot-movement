@@ -1,0 +1,57 @@
+# Run 8: Continue refining from run 7 with slightly higher perceptual loss
+# Hypothesis: Run 7 (perceptual=0.01, LR=1e-5) achieved best val loss (0.00807)
+# and strong conditioning (19.71). Try slightly higher perceptual loss (0.02)
+# with very low LR (5e-6) for further sharpening without disrupting features.
+# Changes from run 7:
+#   - PERCEPTUAL_LOSS_WEIGHT 0.01 -> 0.02 in config.py
+#   - custom_lr 1e-5 -> 5e-6 (2x lower)
+#   - Resume from run 7 best checkpoint
+# Carried from run 7:
+#   - MODEL_TYPE = "decoder_only" in config.py
+#   - DECODER_DEPTH = 12 in config.py
+#   - SEPARATOR_WIDTH = 32 in config.py
+#   - WEIGHT_DECAY = 0.01 in config.py
+
+# Sample budget: effectively unlimited - let divergence stop training
+stage_samples_multiplier: 100000000000
+total_samples: 10000000
+
+# Time budget
+stage_time_budget_min: 180
+
+# Divergence stopping
+stop_on_divergence: true
+divergence_gap: 0.002
+divergence_ratio: 1.5
+divergence_patience: 30
+divergence_min_updates: 10
+val_spike_threshold: 2.0
+val_spike_window: 15
+val_spike_frequency: 0.75
+
+# Learning rate: very low for precise refinement
+custom_lr: 0.000005
+disable_lr_scaling: true
+custom_warmup: -1
+lr_min_ratio: 0.001
+
+# NO LR sweeps
+initial_sweep_enabled: false
+plateau_sweep:
+  enabled: false
+
+# Training
+batch_size: 8
+update_interval: 250
+sampling_mode: "Loss-weighted"
+loss_weight_temperature: 0.5
+loss_weight_refresh_interval: 50
+
+# Single run for fast iteration
+runs_per_stage: 1
+serial_runs: true
+
+# W&B and reproducibility
+enable_wandb: true
+wandb_project: "developmental-robot-movement"
+seed: 42

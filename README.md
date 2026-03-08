@@ -136,7 +136,8 @@ python -m concat_world_model_explorer
     - Automatic chunked epoch regeneration for memory efficiency
 - **Model checkpoint management**:
   - Save/load model weights, optimizer, and scheduler state
-  - Metadata tracking (timestamp, config, training metrics)
+  - Metadata tracking (timestamp, config, model_type, embed_dim, depth, training metrics)
+  - Architecture validation on load: detects model_type/depth/embed_dim mismatch, warns on low key load ratio
   - Checkpoint browser for easy model comparison
 - **Inference-only evaluation**:
   - Single canvas inference on selected frame (no training)

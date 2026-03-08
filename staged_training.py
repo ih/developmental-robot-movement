@@ -975,6 +975,8 @@ def run_stage_training(
                 "frame_size": state.world_model.frame_size,  # Critical for loading with correct dimensions
                 "separator_width": config.AutoencoderConcatPredictorWorldModelConfig.SEPARATOR_WIDTH,
                 "canvas_history_size": config.AutoencoderConcatPredictorWorldModelConfig.CANVAS_HISTORY_SIZE,
+                "embed_dim": state.world_model.autoencoder.embed_dim,
+                "depth": len(state.world_model.autoencoder.blocks),
             },
         }, best_checkpoint_path)
         print(f"Saved checkpoint: {checkpoint_name}")
