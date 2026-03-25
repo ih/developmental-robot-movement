@@ -1,0 +1,57 @@
+# Iteration 1: Reduce Inference Steps
+# Hypothesis: 50 DDIM steps might be averaging away details. Try 20 steps.
+
+model_type: "dit"
+vae_type: "pretrained_sd"
+dit_embed_dim: 256
+dit_depth: 12
+dit_num_heads: 4
+dit_prediction_type: "epsilon"
+dit_num_train_timesteps: 1000
+dit_num_inference_steps: 20  # REDUCED from 50
+dit_beta_schedule: "linear"
+
+# NO sweeps
+plateau_sweep:
+  enabled: false
+initial_sweep_enabled: false
+
+# Training hyperparameters
+custom_lr: 3.0e-4
+batch_size: 8
+loss_weight_temperature: 0.5
+
+# Sampling
+sampling_mode: "Loss-weighted"
+loss_weight_refresh_interval: 50
+
+# Early stopping on validation plateau (stop when loss stops improving)
+val_plateau_patience: 40  # Stop after 40 updates (~10K samples) without improvement
+val_plateau_min_delta: 0.0001  # Minimum improvement threshold
+
+# Stage control
+stage_time_budget_min: 180
+update_interval: 250
+stage_samples_multiplier: 100000000000
+total_samples: 10000000
+
+# Divergence stopping (unchanged as backup)
+stop_on_divergence: true
+divergence_gap: 0.002
+divergence_ratio: 1.5
+divergence_patience: 30
+divergence_min_updates: 10
+
+# Other settings
+disable_lr_scaling: true
+custom_warmup: -1
+lr_min_ratio: 0.001
+runs_per_stage: 1
+serial_runs: true
+clean_old_checkpoints: true
+enable_baseline: false
+enable_wandb: true
+wandb_project: "developmental-robot-movement"
+
+seed: 42
+max_workers: 2

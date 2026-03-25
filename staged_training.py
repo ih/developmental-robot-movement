@@ -428,6 +428,10 @@ def apply_model_config(cfg: StagedTrainingConfig) -> None:
         WMConfig.DIT_NUM_INFERENCE_STEPS = cfg.dit_num_inference_steps
     if cfg.dit_beta_schedule is not None:
         WMConfig.DIT_BETA_SCHEDULE = cfg.dit_beta_schedule
+    if cfg.dit_training_mode is not None:
+        WMConfig.DIT_TRAINING_MODE = cfg.dit_training_mode
+    if cfg.perceptual_loss_weight is not None:
+        WMConfig.PERCEPTUAL_LOSS_WEIGHT = cfg.perceptual_loss_weight
 
     # Auto-adjust separator width for DINOv2 (14x compression requires divisible-by-14 canvas)
     if WMConfig.MODEL_TYPE == "dit" and WMConfig.VAE_TYPE == "dinov2":

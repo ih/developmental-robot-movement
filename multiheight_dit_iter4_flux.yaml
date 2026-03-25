@@ -1,0 +1,61 @@
+# Iteration 4: FLUX VAE Backend
+# Hypothesis: FLUX VAE has 16-channel latent vs SD's 4-channel, providing richer
+# representation of robot arm frames. Cold start required (incompatible weights).
+
+model_type: "dit"
+vae_type: "pretrained_flux"  # 16-channel latent, 8x compression (vs SD's 4-channel)
+dit_embed_dim: 256
+dit_depth: 12
+dit_num_heads: 4
+dit_prediction_type: "epsilon"
+dit_num_train_timesteps: 1000
+dit_num_inference_steps: 50
+dit_beta_schedule: "linear"
+
+# NO sweeps - just train
+plateau_sweep:
+  enabled: false
+initial_sweep_enabled: false
+
+# Training hyperparameters - same as baseline
+custom_lr: 3.0e-4
+batch_size: 8  # May need to reduce to 4 if memory throttles
+loss_weight_temperature: 0.5
+
+# Sampling
+sampling_mode: "Loss-weighted"
+loss_weight_refresh_interval: 50
+
+# Early stopping on validation plateau
+val_plateau_patience: 40
+val_plateau_min_delta: 0.0001
+
+# Stage control
+stage_time_budget_min: 180
+update_interval: 250
+stage_samples_multiplier: 100000000000
+total_samples: 10000000
+
+# Divergence stopping
+stop_on_divergence: true
+divergence_gap: 0.002
+divergence_ratio: 1.5
+divergence_patience: 30
+divergence_min_updates: 10
+
+# Other settings
+disable_lr_scaling: true
+custom_warmup: -1
+lr_min_ratio: 0.001
+runs_per_stage: 1
+serial_runs: true
+clean_old_checkpoints: true
+enable_baseline: false
+enable_wandb: true
+wandb_project: "developmental-robot-movement"
+
+# Reproducibility
+seed: 42
+
+# Parallel workers
+max_workers: 2

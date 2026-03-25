@@ -1,0 +1,52 @@
+# Run 13: Smaller patch size (8) for sharper predictions
+# Training from scratch with manual LR=3e-4
+# Changes from Run 7:
+#   - PATCH_SIZE = 8 in config.py (4x finer granularity for sharper predictions)
+#   - batch_size = 4 (reduced from 8 due to 4x memory from more patches)
+#   - custom_lr = 3e-4 (standard from-scratch, no sweep overhead)
+#   - Training from scratch (no checkpoint to resume from)
+# Hypothesis: Smaller patches (8x8 instead of 16x16) should enable finer-grained
+# reconstruction and produce sharper predictions, at the cost of longer training time.
+
+# Sample budget: effectively unlimited - let divergence stop training
+stage_samples_multiplier: 100000000000
+total_samples: 10000000
+
+# Time budget
+stage_time_budget_min: 180
+
+# Divergence stopping (same as Run 7)
+stop_on_divergence: true
+divergence_gap: 0.002
+divergence_ratio: 1.5
+divergence_patience: 30
+divergence_min_updates: 10
+val_spike_threshold: 2.0
+val_spike_window: 15
+val_spike_frequency: 0.75
+
+# Learning rate: manual setting for faster iteration
+custom_lr: 0.0003
+disable_lr_scaling: true
+custom_warmup: -1
+lr_min_ratio: 0.001
+
+# NO sweeps (manual LR for speed)
+initial_sweep_enabled: false
+plateau_sweep:
+  enabled: false
+
+batch_size: 8
+update_interval: 250
+sampling_mode: "Loss-weighted"
+loss_weight_temperature: 0.5
+loss_weight_refresh_interval: 50
+
+# Single run for fast iteration
+runs_per_stage: 1
+serial_runs: true
+
+# W&B and reproducibility
+enable_wandb: true
+wandb_project: "developmental-robot-movement"
+seed: 42

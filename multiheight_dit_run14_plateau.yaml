@@ -1,0 +1,87 @@
+# Iteration 1: DiT with Plateau Sweeps and Reduced Inference Steps
+#
+# Key improvements over Run 11:
+# 1. Enable plateau sweeps (proven in Run 12b to improve 40-50%)
+# 2. Reduce inference steps: 50 -> 20 (faster, may be sufficient)
+# 3. Enable initial sweep for learning rate optimization
+# 4. Match Run 7's proven settings (perceptual loss, weight decay, batch size)
+
+# Model architecture
+model_type: "dit"
+vae_type: "pretrained_sd"
+dit_embed_dim: 256
+dit_depth: 12
+dit_num_heads: 4
+dit_prediction_type: "epsilon"
+dit_num_train_timesteps: 1000
+dit_num_inference_steps: 20  # Reduced from 50 in Run 11 (faster, may be sufficient)
+dit_beta_schedule: "linear"
+
+# Plateau-triggered LR sweeps (was disabled in Run 11)
+plateau_sweep:
+  enabled: true
+  plateau_ema_alpha: 0.85
+  plateau_improvement_threshold: 0.005  # 0.5% improvement threshold
+  plateau_patience: 25  # Updates without improvement before triggering sweep
+  cooldown_updates: 5
+  max_sweeps_per_stage: 2
+  min_sweep_improvement: 0.0
+
+# LR sweep configuration (used by both plateau and initial sweeps)
+lr_sweep:
+  lr_min: 0.0000001  # 1e-7 (explicit decimal to ensure float parsing)
+  lr_max: 0.01  # 1e-2
+  phase_a_num_candidates: 5
+  phase_a_seeds: 1
+  phase_a_time_budget_min: 3.0
+  phase_a_survivor_count: 2
+  phase_b_seeds: 3
+  phase_b_time_budget_min: 10.0
+  ranking_metric: "median_best_val"
+
+# Initial LR sweep before training (independent of plateau sweeps)
+initial_sweep_enabled: true
+
+# Training hyperparameters - Match Run 7's proven settings
+custom_lr: 3.0e-4  # Starting LR, will be optimized by sweeps
+batch_size: 8
+loss_weight_temperature: 0.5
+
+# Sampling
+sampling_mode: "Loss-weighted"
+loss_weight_refresh_interval: 50
+
+# Note: weight_decay and perceptual_loss_weight are set globally in config.py
+
+# Stage control
+stage_time_budget_min: 60  # 1 hour budget per stage
+update_interval: 250
+stage_samples_multiplier: 10
+
+# Divergence stopping
+stop_on_divergence: true
+divergence_gap: 0.02
+divergence_ratio: 2.0
+divergence_patience: 30  # Reduced from 50 to be more sensitive
+divergence_min_updates: 10
+
+# Early stopping
+val_plateau_patience: 250
+val_plateau_min_delta: 0.0001
+
+# Other settings
+disable_lr_scaling: true
+custom_warmup: -1
+lr_min_ratio: 0.001
+runs_per_stage: 1
+serial_runs: true
+clean_old_checkpoints: true
+enable_baseline: false
+enable_wandb: true
+wandb_project: "developmental-robot-movement"
+
+# Reproducibility
+seed: 42
+
+# Parallel workers (prevent GPU OOM during LR sweeps)
+max_workers: 2

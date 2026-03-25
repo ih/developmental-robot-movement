@@ -140,6 +140,9 @@ class StagedTrainingConfig:
     loss_weight_temperature: float = 0.5  # App default
     loss_weight_refresh_interval: int = 50  # App default
 
+    # Loss configuration
+    perceptual_loss_weight: Optional[float] = None  # None = use config.py default
+
     # Divergence stopping (app defaults)
     stop_on_divergence: bool = True  # App default
     divergence_gap: float = 0.02  # App default
@@ -218,6 +221,7 @@ class StagedTrainingConfig:
     dit_num_train_timesteps: Optional[int] = None
     dit_num_inference_steps: Optional[int] = None
     dit_beta_schedule: Optional[str] = None
+    dit_training_mode: Optional[str] = None  # "conditional" or "unconditional"
 
     def __post_init__(self):
         """Validate configuration and emit deprecation warnings."""

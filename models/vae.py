@@ -271,12 +271,14 @@ class PretrainedFluxVAE(nn.Module):
 
     def __init__(self, model_id: str = "black-forest-labs/FLUX.2-dev", subfolder: str = "vae"):
         super().__init__()
-        self.latent_channels = 16
         self.compression_factor = 8
         self.model_id = model_id
 
         from diffusers import AutoencoderKL
         self.vae = AutoencoderKL.from_pretrained(model_id, subfolder=subfolder, torch_dtype=torch.bfloat16)
+
+        # Detect actual latent channels from model config (FLUX.2-dev uses 32, not 16)
+        self.latent_channels = self.vae.config.latent_channels
         self.vae.eval()
         self.vae.requires_grad_(False)
 

@@ -299,6 +299,47 @@ class LatentDiffusionWrapper(nn.Module):
                         )
                         per_sample_losses.append(sample_loss_dict['loss_hybrid'].item())
 
+        # --- PERCEPTUAL LOSS (VGG feature space) ---
+        perceptual_loss_value = 0.0
+        if Config.PERCEPTUAL_LOSS_WEIGHT > 0:
+            from models.autoencoder_concat_predictor import _get_perceptual_loss
+
+            # Reconstruct x0 from epsilon prediction: x0 = (x_t - sqrt(1-ab)*eps) / sqrt(ab)
+            # Use first timestep as representative (all batch items have same timestep in DiT)
+            t = timesteps[0]
+            alpha_bar = self.noise_scheduler.alphas_cumprod[t]
+            sqrt_ab = alpha_bar.sqrt()
+            sqrt_1m_ab = (1.0 - alpha_bar).sqrt()
+
+            # x0_latent reconstruction (pred_patches is epsilon in epsilon prediction mode)
+            if self.dit.prediction_type == 'epsilon':
+                pred_x0_latent = (noisy_patches - sqrt_1m_ab * pred_patches) / sqrt_ab
+            else:
+                # If predicting x0 directly, use it as-is
+                pred_x0_latent = pred_patches
+
+            # Unpatchify and decode to pixel space
+            pred_x0_canvas = self.dit.unpatchify(pred_x0_latent)  # [B, C_latent, H_lat, W_lat]
+            with torch.no_grad():
+                pred_pixels = self.vae.decode(pred_x0_canvas)     # [B, 3, H_px, W_px]
+
+            # Extract last frame slot from predicted canvas
+            frame_w = Config.FRAME_SIZE[1]
+            sep_w = Config.SEPARATOR_WIDTH
+            last_frame_x = (Config.CANVAS_HISTORY_SIZE - 1) * (frame_w + sep_w)
+            pred_last_frame = pred_pixels[:, :, :, last_frame_x:last_frame_x + frame_w]
+
+            # Get target pixels (reconstruct from original canvas via VAE)
+            with torch.no_grad():
+                target_canvas_pixels = self.vae.decode(latent)  # [B, 3, H_px, W_px]
+                target_last_frame = target_canvas_pixels[:, :, :, last_frame_x:last_frame_x + frame_w]
+
+            # Compute VGG perceptual loss
+            perceptual_fn = _get_perceptual_loss(canvas_tensor.device)
+            p_loss = perceptual_fn(pred_last_frame, target_last_frame)
+            perceptual_loss_value = p_loss.item()
+            loss = loss + Config.PERCEPTUAL_LOSS_WEIGHT * p_loss
+
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
@@ -336,8 +377,8 @@ class LatentDiffusionWrapper(nn.Module):
             'focal_weight_max': loss_dict['focal_weight_max'],
             'focal_beta': Config.FOCAL_BETA,
             'focal_alpha': Config.FOCAL_LOSS_ALPHA,
-            'loss_perceptual': 0.0,
-            'perceptual_weight': 0.0,
+            'loss_perceptual': perceptual_loss_value,
+            'perceptual_weight': Config.PERCEPTUAL_LOSS_WEIGHT,
         }
 
         optimizer.step()

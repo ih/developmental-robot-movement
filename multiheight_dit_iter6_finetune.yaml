@@ -1,0 +1,60 @@
+# Iteration 6: Fine-tune from Iter 5 best checkpoint with lower LR
+# Hypothesis: Fine-tuning with lower LR produced the best decoder-only model (Run 7).
+# Applying same strategy to DiT conditional mode.
+
+model_type: "dit"
+vae_type: "pretrained_sd"
+dit_embed_dim: 256
+dit_depth: 12
+dit_num_heads: 4
+dit_prediction_type: "epsilon"
+dit_num_train_timesteps: 1000
+dit_num_inference_steps: 50
+dit_beta_schedule: "linear"
+dit_training_mode: "conditional"
+
+# NO sweeps - just train with low LR
+plateau_sweep:
+  enabled: false
+initial_sweep_enabled: false
+
+# Fine-tuning LR: 10x lower than pre-training (3e-4 -> 3e-5)
+custom_lr: 3.0e-5
+batch_size: 8
+loss_weight_temperature: 0.5
+
+# Sampling
+sampling_mode: "Loss-weighted"
+loss_weight_refresh_interval: 50
+
+# Early stopping on validation plateau
+val_plateau_patience: 40
+val_plateau_min_delta: 0.0001
+
+# Stage control - 6h budget
+stage_time_budget_min: 360
+update_interval: 250
+stage_samples_multiplier: 100000000000
+total_samples: 10000000
+
+# Divergence stopping
+stop_on_divergence: true
+divergence_gap: 0.002
+divergence_ratio: 1.5
+divergence_patience: 30
+divergence_min_updates: 10
+
+# Other settings
+disable_lr_scaling: true
+custom_warmup: -1
+lr_min_ratio: 0.001
+runs_per_stage: 1
+serial_runs: true
+clean_old_checkpoints: true
+enable_baseline: false
+enable_wandb: true
+wandb_project: "developmental-robot-movement"
+
+# Reproducibility
+seed: 42
+max_workers: 2

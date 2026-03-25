@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>March 6-7 Automated Experiment Summary</title>
+<style>
+body { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 1100px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+h2 { color: #34495e; margin-top: 30px; }
+h3 { color: #555; }
+table { border-collapse: collapse; width: 100%; margin: 15px 0; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: center; }
+th { background: #3498db; color: white; }
+tr:nth-child(even) { background: #f9f9f9; }
+td:first-child { text-align: left; }
+.best { background: #d4edda !important; font-weight: bold; }
+.worst { background: #f8d7da !important; }
+.insight { background: #e8f4fd; border-left: 4px solid #3498db; padding: 16px; margin: 15px 0; border-radius: 4px; }
+.section { background: white; border-radius: 8px; padding: 20px; margin: 15px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+a { color: #3498db; }
+a:hover { color: #2980b9; }
+</style>
+</head>
+<body>
+
+<h1>March 6-7 Automated Experiment Summary</h1>
+<p><strong>Date:</strong> March 6-7, 2026</p>
+<p><strong>Context:</strong> First overnight session using Claude Code as an automated research agent. Starting from the best manual decoder-only checkpoint, Claude explored architecture variants, hyperparameters, and loss functions across 14 experiment runs.</p>
+
+<h2>Overview</h2>
+<div class="section">
+<p>Two architecture families were explored:</p>
+<ul>
+<li><strong>Encoder-Decoder</strong> (Mar 6): 6 runs exploring the masked autoencoder approach with variable mask ratios</li>
+<li><strong>Decoder-Only</strong> (Mar 7): 8 runs systematically varying perceptual loss weight, model depth, and embedding dimension</li>
+</ul>
+<p>The decoder-only architecture consistently outperformed encoder-decoder, with the best run (run7) achieving a hybrid loss of <strong>0.009178</strong>.</p>
+</div>
+
+<h2>Encoder-Decoder Experiments (March 6)</h2>
+<div class="section">
+<p>These runs explored the encoder-decoder (masked autoencoder) architecture with depth=5, embed_dim=256. Most runs failed to converge well, with 3 out of 6 runs stuck at loss ~0.089.</p>
+
+<table>
+<tr>
+<th>Run</th>
+<th>Key Changes</th>
+<th>Best Loss</th>
+<th>Report</th>
+</tr>
+<tr>
+<td>encdec_debug</td>
+<td>Baseline encoder-decoder, sep_width=16, no weight decay</td>
+<td class="worst">0.089601</td>
+<td><a href="final_report_multiheight_encdec_debug_2026_mar_06.html">report</a></td>
+</tr>
+<tr>
+<td>encdec_run1</td>
+<td>Same as debug</td>
+<td class="worst">0.089601</td>
+<td><a href="final_report_multiheight_encdec_run1_2026_mar_06.html">report</a></td>
+</tr>
+<tr>
+<td>encdec_run1_2</td>
+<td>Re-run with fixes</td>
+<td>0.016448</td>
+<td><a href="final_report_multiheight_encdec_run1_2026_mar_06_2.html">report</a></td>
+</tr>
+<tr>
+<td>encdec_run2 (Mar 6)</td>
+<td>Further iteration</td>
+<td class="worst">0.089601</td>
+<td><a href="final_report_multiheight_encdec_run2_2026_mar_06.html">report</a></td>
+</tr>
+<tr>
+<td>encdec_run2 (Mar 7)</td>
+<td>sep_width=32, weight_decay=0.01</td>
+<td>0.018353</td>
+<td><a href="final_report_multiheight_encdec_run2_2026_mar_07.html">report</a></td>
+</tr>
+<tr>
+<td>encdec_run3</td>
+<td>focal_beta=10, focal_loss_alpha=0.3</td>
+<td>0.075089</td>
+<td><a href="final_report_multiheight_encdec_run3_2026_mar_07.html">report</a></td>
+</tr>
+</table>
+
+<div class="insight">
+<strong>Takeaway:</strong> The encoder-decoder architecture was unstable — half the runs failed to converge (stuck at ~0.089 loss). The best successful run (0.016) was still 1.7x worse than the decoder-only baseline. Claude pivoted to decoder-only after these results.
+</div>
+</div>
+
+<h2>Decoder-Only Experiments (March 7)</h2>
+<div class="section">
+<p>Starting from the successful decoder-only architecture (embed=256, depth=12), Claude systematically explored perceptual loss weighting, model scaling, and VGG loss.</p>
+
+<table>
+<tr>
+<th>Run</th>
+<th>Key Changes vs Baseline</th>
+<th>Best Loss</th>
+<th>Report</th>
+</tr>
+<tr>
+<td>run4</td>
+<td>Baseline (no perceptual loss)</td>
+<td>0.009492</td>
+<td><a href="final_report_multiheight_deconly_run4_2026_mar_07.html">report</a></td>
+</tr>
+<tr>
+<td>run5</td>
+<td>Continued training from run4</td>
+<td>0.009360</td>
+<td><a href="final_report_multiheight_deconly_run5_2026_mar_07.html">report</a></td>
+</tr>
+<tr>
+<td>run5_2</td>
+<td>Further continuation</td>
+<td>0.009239</td>
+<td><a href="final_report_multiheight_deconly_run5_2026_mar_07_2.html">report</a></td>
+</tr>
+<tr>
+<td>run6</td>
+<td>perceptual_loss_weight=<strong>0.1</strong> (high)</td>
+<td class="worst">0.012570</td>
+<td><a href="final_report_multiheight_deconly_run6_2026_mar_07.html">report</a></td>
+</tr>
+<tr>
+<td>run7</td>
+<td>perceptual_loss_weight=<strong>0.01</strong></td>
+<td class="best">0.009178</td>
+<td><a href="final_report_multiheight_deconly_run7_2026_mar_07.html">report</a></td>
+</tr>
+<tr>
+<td>run8</td>
+<td>perceptual_loss_weight=<strong>0.02</strong></td>
+<td>0.009435</td>
+<td><a href="final_report_multiheight_deconly_run8_2026_mar_07.html">report</a></td>
+</tr>
+<tr>
+<td>run9</td>
+<td>embed=<strong>512</strong>, depth=<strong>8</strong> (wider, shallower)</td>
+<td>0.010240</td>
+<td><a href="final_report_multiheight_deconly_run9_2026_mar_07.html">report</a></td>
+</tr>
+<tr>
+<td>run10</td>
+<td>depth=<strong>16</strong> (deeper)</td>
+<td>0.011437</td>
+<td><a href="final_report_multiheight_deconly_run10_2026_mar_07.html">report</a></td>
+</tr>
+</table>
+
+<div class="insight">
+<strong>Takeaways:</strong>
+<ul>
+<li><strong>Perceptual loss sweet spot:</strong> Weight of 0.01 gave the best result (run7). Too high (0.1) hurt performance significantly. Too low or zero was slightly worse.</li>
+<li><strong>Architecture scaling didn't help:</strong> Both wider (512 embed, depth 8) and deeper (depth 16) models performed worse than the baseline (256 embed, depth 12), suggesting the dataset size was the bottleneck, not model capacity.</li>
+<li><strong>Progressive training works:</strong> Runs 4→5→5_2 show incremental improvement from continued training on the same checkpoint.</li>
+</ul>
+</div>
+</div>
+
+<h2>Results Summary</h2>
+<div class="section">
+<table>
+<tr>
+<th>Rank</th>
+<th>Run</th>
+<th>Architecture</th>
+<th>Best Loss</th>
+<th>Key Config</th>
+</tr>
+<tr>
+<td>1</td>
+<td class="best">run7</td>
+<td>Decoder-Only</td>
+<td class="best">0.009178</td>
+<td>embed=256, depth=12, perceptual=0.01</td>
+</tr>
+<tr>
+<td>2</td>
+<td>run5_2</td>
+<td>Decoder-Only</td>
+<td>0.009239</td>
+<td>embed=256, depth=12, perceptual=0 (continued)</td>
+</tr>
+<tr>
+<td>3</td>
+<td>run5</td>
+<td>Decoder-Only</td>
+<td>0.009360</td>
+<td>embed=256, depth=12, perceptual=0 (continued)</td>
+</tr>
+<tr>
+<td>4</td>
+<td>run8</td>
+<td>Decoder-Only</td>
+<td>0.009435</td>
+<td>embed=256, depth=12, perceptual=0.02</td>
+</tr>
+<tr>
+<td>5</td>
+<td>run4</td>
+<td>Decoder-Only</td>
+<td>0.009492</td>
+<td>embed=256, depth=12, perceptual=0 (baseline)</td>
+</tr>
+<tr>
+<td>6</td>
+<td>run9</td>
+<td>Decoder-Only</td>
+<td>0.010240</td>
+<td>embed=512, depth=8, perceptual=0.01</td>
+</tr>
+<tr>
+<td>7</td>
+<td>run10</td>
+<td>Decoder-Only</td>
+<td>0.011437</td>
+<td>embed=256, depth=16, perceptual=0.01</td>
+</tr>
+<tr>
+<td>8</td>
+<td>run6</td>
+<td>Decoder-Only</td>
+<td>0.012570</td>
+<td>embed=256, depth=12, perceptual=0.1</td>
+</tr>
+<tr>
+<td>9</td>
+<td>encdec_run1_2</td>
+<td>Encoder-Decoder</td>
+<td>0.016448</td>
+<td>embed=256, depth=5</td>
+</tr>
+<tr>
+<td>10</td>
+<td>encdec_run2 (Mar 7)</td>
+<td>Encoder-Decoder</td>
+<td>0.018353</td>
+<td>embed=256, depth=5, sep_width=32</td>
+</tr>
+</table>
+</div>
+
+<h2>Conclusion</h2>
+<div class="section">
+<p>In a single overnight session, Claude Code explored 14 experiment variations across two architecture families — work that would have taken over a week manually. Key findings:</p>
+<ol>
+<li><strong>Decoder-only &gt; Encoder-decoder</strong> for this task and data scale</li>
+<li><strong>Small perceptual loss (0.01) helps</strong>, but too much (0.1) hurts</li>
+<li><strong>Model capacity is not the bottleneck</strong> — both wider and deeper models performed worse, pointing to data as the limiting factor</li>
+<li><strong>Progressive fine-tuning works</strong> — continued training from checkpoints yields incremental gains</li>
+</ol>
+<p>These results motivated collecting more data and creating the <a href="https://github.com/ih/canvas-world-model">canvas-world-model</a> repo for further experiments.</p>
+</div>
+
+</body>
+</html>

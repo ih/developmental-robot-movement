@@ -274,9 +274,9 @@ class AutoencoderConcatPredictorWorldModel:
         canvas_overlay = canvas.copy().astype(np.float32)
 
         # Get canvas dimensions and patch size
-        # Always use pixel patch size (16) since patch_mask is in pixel-patch space
+        # Use configured patch size (must match what model was trained with)
         canvas_height, canvas_width = canvas.shape[:2]
-        patch_size = 16
+        patch_size = Config.PATCH_SIZE
         num_patches_height = canvas_height // patch_size
         num_patches_width = canvas_width // patch_size
 
@@ -355,9 +355,9 @@ class AutoencoderConcatPredictorWorldModel:
             img_pred = self.autoencoder.unpatchify(pred_patches)  # [1, 3, H, W]
 
         # Create composite: original pixels where mask=False, predictions where mask=True
-        # Always use pixel patch size (16) since patch_mask is in pixel-patch space
+        # Use configured patch size (must match what model was trained with)
         _, _, canvas_height, canvas_width = canvas_tensor.shape
-        patch_size = 16
+        patch_size = Config.PATCH_SIZE
         num_patches_height = canvas_height // patch_size
         num_patches_width = canvas_width // patch_size
 

@@ -56,7 +56,7 @@ class AutoencoderConcatPredictorWorldModelConfig:
     CANVAS_HISTORY_SIZE = 3        # Number of frames to keep in history
 
     # Model architecture
-    MODEL_TYPE = "decoder_only" # "encoder_decoder" (MAE), "decoder_only" (GPT-style), or "dit" (latent diffusion)
+    MODEL_TYPE = "dit" # "encoder_decoder" (MAE), "decoder_only" (GPT-style), or "dit" (latent diffusion)
     PATCH_SIZE = 16                # Size of patches for Vision Transformer (WARNING: changing requires retraining)
     BATCH_SIZE = 1                 # Training batch size (1=online learning, >1=mini-batch)
 
